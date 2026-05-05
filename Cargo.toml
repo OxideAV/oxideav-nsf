@@ -31,3 +31,11 @@ default = ["registry"]
 # `oxideav` framework registry. Default-on; turn off for direct-API
 # use-cases that just want `parse_nsf` + `NsfPlayer`.
 registry = ["dep:oxideav-core"]
+
+[dev-dependencies]
+# `ureq` powers the URL-backed `real_rip` integration test
+# (`tests/real_rip.rs`), which fetches a real homebrew NSF rip from
+# `samples.oxideav.org` to exercise the player end-to-end. The fixture
+# is cached under `target/test-fixtures/` after the first fetch and
+# the test gracefully skips without `OXIDEAV_NETWORK_TESTS=1`.
+ureq = "3"

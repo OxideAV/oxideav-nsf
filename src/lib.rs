@@ -13,6 +13,7 @@
 pub mod apu;
 pub mod bus;
 pub mod cpu;
+pub mod expansion;
 pub mod header;
 pub mod player;
 

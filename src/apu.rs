@@ -397,15 +397,180 @@ impl NoiseChannel {
     }
 }
 
+/// DMC rate table (NTSC). Each entry is the number of CPU cycles per
+/// output bit. Index from `$4010` low nibble.
+const DMC_RATE_NTSC: [u16; 16] = [
+    428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
+];
+
+/// DMC rate table (PAL).
+const DMC_RATE_PAL: [u16; 16] = [
+    398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
+];
+
+/// Delta Modulation Channel.
+///
+/// nesdev.org/wiki/APU_DMC: a 1-bit delta sample stream that drives a
+/// 7-bit DAC. Sample bytes are fetched from main memory through the
+/// CPU bus by stalling the CPU for 4 cycles per fetch (round 2 omits
+/// the stall — it would change the player schedule but not the sample
+/// values for our music-only use case).
 #[derive(Default)]
 struct DmcChannel {
     enabled: bool,
-    /// 7-bit DAC value at $4011 (low 7 bits).
+    irq_enable: bool,
+    loop_flag: bool,
+    rate_index: u8,
+    /// 7-bit DAC value at $4011.
     dac: u8,
-    // Round 1: no sample fetcher; just expose the DAC.
+    sample_addr_seed: u16,
+    sample_len_seed: u16,
+
+    current_addr: u16,
+    bytes_remaining: u16,
+
+    sample_buffer: u8,
+    sample_buffer_filled: bool,
+
+    output_shift: u8,
+    output_bits: u8,
+    output_silence: bool,
+
+    timer: u16,
+    timer_period: u16,
+
+    /// Set true when a fetch is needed and `bytes_remaining > 0` and
+    /// the buffer isn't already full. The bus drains pending fetches
+    /// after each `tick_cpu_cycles` chunk.
+    pending_fetch: bool,
+    pending_fetch_addr: u16,
+
+    /// Reads to `$4015` should clear the IRQ flag — round 2 records the
+    /// flag for `$4015` reporting only.
+    irq_flag: bool,
 }
 
-/// 2A03 APU — five channels + frame counter + status / mixer.
+impl DmcChannel {
+    fn rate_for(rate_index: u8, pal: bool) -> u16 {
+        let idx = (rate_index & 0x0F) as usize;
+        if pal {
+            DMC_RATE_PAL[idx]
+        } else {
+            DMC_RATE_NTSC[idx]
+        }
+    }
+
+    fn write_control(&mut self, value: u8, pal: bool) {
+        self.irq_enable = value & 0x80 != 0;
+        self.loop_flag = value & 0x40 != 0;
+        self.rate_index = value & 0x0F;
+        self.timer_period = Self::rate_for(self.rate_index, pal);
+        if !self.irq_enable {
+            self.irq_flag = false;
+        }
+    }
+
+    fn write_dac(&mut self, value: u8) {
+        self.dac = value & 0x7F;
+    }
+
+    fn write_addr(&mut self, value: u8) {
+        self.sample_addr_seed = 0xC000 | ((value as u16) << 6);
+    }
+
+    fn write_len(&mut self, value: u8) {
+        self.sample_len_seed = ((value as u16) << 4) | 1;
+    }
+
+    fn restart_sample(&mut self) {
+        self.current_addr = self.sample_addr_seed;
+        self.bytes_remaining = self.sample_len_seed;
+    }
+
+    fn enable(&mut self, enable: bool) {
+        self.enabled = enable;
+        if !enable {
+            self.bytes_remaining = 0;
+        } else if self.bytes_remaining == 0 {
+            self.restart_sample();
+        }
+    }
+
+    /// Drain one CPU cycle's worth of DMC progress.
+    fn tick_one(&mut self) {
+        // Fetcher: re-fill the sample buffer if it's empty + bytes remain.
+        if !self.sample_buffer_filled && self.bytes_remaining > 0 && !self.pending_fetch {
+            self.pending_fetch = true;
+            self.pending_fetch_addr = self.current_addr;
+        }
+        // Output unit: counts down `timer_period` then shifts a bit out.
+        if self.timer == 0 {
+            self.timer = self.timer_period.saturating_sub(1);
+            self.shift_one_bit();
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    fn shift_one_bit(&mut self) {
+        if !self.output_silence {
+            let bit_set = self.output_shift & 0x01 != 0;
+            if bit_set && self.dac <= 125 {
+                self.dac += 2;
+            } else if !bit_set && self.dac >= 2 {
+                self.dac -= 2;
+            }
+        }
+        self.output_shift >>= 1;
+        if self.output_bits > 0 {
+            self.output_bits -= 1;
+        }
+        if self.output_bits == 0 {
+            self.output_bits = 8;
+            if !self.sample_buffer_filled {
+                self.output_silence = true;
+            } else {
+                self.output_silence = false;
+                self.output_shift = self.sample_buffer;
+                self.sample_buffer_filled = false;
+            }
+        }
+    }
+
+    /// Bus calls this to surface a pending fetch address to the CPU bus.
+    fn pending_fetch(&self) -> Option<u16> {
+        if self.pending_fetch {
+            Some(self.pending_fetch_addr)
+        } else {
+            None
+        }
+    }
+
+    /// Bus calls this to deliver the byte that was at `pending_fetch_addr`.
+    fn supply_byte(&mut self, byte: u8) {
+        self.pending_fetch = false;
+        self.sample_buffer = byte;
+        self.sample_buffer_filled = true;
+        self.current_addr = if self.current_addr == 0xFFFF {
+            0x8000
+        } else {
+            self.current_addr + 1
+        };
+        if self.bytes_remaining > 0 {
+            self.bytes_remaining -= 1;
+        }
+        if self.bytes_remaining == 0 {
+            if self.loop_flag {
+                self.restart_sample();
+            } else if self.irq_enable {
+                self.irq_flag = true;
+            }
+        }
+    }
+}
+
+/// 2A03 APU — five channels + frame counter + status / mixer + the
+/// expansion-chip aggregate.
 pub struct Apu2A03 {
     cpu_hz: u32,
     pulse1: PulseChannel,
@@ -420,6 +585,12 @@ pub struct Apu2A03 {
     frame_acc: u32,
     /// Step counter (0..=3 in 4-step mode; 0..=4 in 5-step mode).
     frame_step: u8,
+
+    /// PAL flag — toggles the DMC rate table.
+    pal: bool,
+
+    /// Aggregate of the active expansion chips.
+    pub expansion: crate::expansion::Expansion,
 }
 
 impl Default for Apu2A03 {
@@ -440,11 +611,38 @@ impl Apu2A03 {
             five_step: false,
             frame_acc: 0,
             frame_step: 0,
+            pal: false,
+            expansion: crate::expansion::Expansion::new(),
         }
     }
 
     pub fn set_cpu_hz(&mut self, hz: u32) {
         self.cpu_hz = hz;
+        self.pal = hz < 1_700_000;
+        // Refresh DMC timer period under the new rate table.
+        self.dmc.timer_period = DmcChannel::rate_for(self.dmc.rate_index, self.pal);
+    }
+
+    pub fn set_expansion(&mut self, flags: crate::header::ExpansionChips) {
+        self.expansion.set_flags(flags);
+    }
+
+    pub fn write_expansion(&mut self, addr: u16, value: u8) {
+        self.expansion.write(addr, value);
+    }
+
+    pub fn read_expansion(&self, addr: u16) -> u8 {
+        self.expansion.read(addr)
+    }
+
+    /// Bus pulls this every tick to see if a DMC sample byte is needed.
+    pub fn dmc_pending_fetch(&self) -> Option<u16> {
+        self.dmc.pending_fetch()
+    }
+
+    /// Bus calls this with the byte that was at the pending address.
+    pub fn dmc_supply_byte(&mut self, byte: u8) {
+        self.dmc.supply_byte(byte);
     }
 
     pub fn cpu_hz(&self) -> u32 {
@@ -468,9 +666,10 @@ impl Apu2A03 {
             0x400C => self.noise.write_main(value),
             0x400E => self.noise.write_period(value),
             0x400F => self.noise.write_length(value),
-            0x4010 => { /* DMC IRQ + loop + rate — recorded for round 2 */ }
-            0x4011 => self.dmc.dac = value & 0x7F,
-            0x4012 | 0x4013 => { /* DMC sample addr / length — round 2 */ }
+            0x4010 => self.dmc.write_control(value, self.pal),
+            0x4011 => self.dmc.write_dac(value),
+            0x4012 => self.dmc.write_addr(value),
+            0x4013 => self.dmc.write_len(value),
             _ => {}
         }
     }
@@ -481,7 +680,8 @@ impl Apu2A03 {
         self.pulse2.enabled = value & 0x02 != 0;
         self.triangle.enabled = value & 0x04 != 0;
         self.noise.enabled = value & 0x08 != 0;
-        self.dmc.enabled = value & 0x10 != 0;
+        let dmc_enable = value & 0x10 != 0;
+        self.dmc.enable(dmc_enable);
         self.pulse1.length.silence_if_disabled(self.pulse1.enabled);
         self.pulse2.length.silence_if_disabled(self.pulse2.enabled);
         self.triangle
@@ -490,8 +690,9 @@ impl Apu2A03 {
         self.noise.length.silence_if_disabled(self.noise.enabled);
     }
 
-    /// `$4015` read — status: which channel length counters are non-zero.
-    pub fn read_status(&self) -> u8 {
+    /// `$4015` read — status: which channel length counters are non-zero,
+    /// plus DMC bytes-remaining + DMC IRQ flag.
+    pub fn read_status(&mut self) -> u8 {
         let mut s = 0u8;
         if self.pulse1.length.active() {
             s |= 0x01;
@@ -505,6 +706,14 @@ impl Apu2A03 {
         if self.noise.length.active() {
             s |= 0x08;
         }
+        if self.dmc.bytes_remaining > 0 {
+            s |= 0x10;
+        }
+        if self.dmc.irq_flag {
+            s |= 0x80;
+        }
+        // Reads to $4015 acknowledge / clear the DMC IRQ flag.
+        self.dmc.irq_flag = false;
         s
     }
 
@@ -530,6 +739,14 @@ impl Apu2A03 {
         self.pulse2.tick_timer(pulse_cycles);
         self.noise.tick_timer(pulse_cycles);
         self.triangle.tick_timer(cycles);
+
+        // DMC ticks at the full CPU clock; one bit out per 'timer_period'.
+        for _ in 0..cycles {
+            self.dmc.tick_one();
+        }
+
+        // Expansion chips share the CPU clock.
+        self.expansion.tick(cycles);
 
         // Frame counter: NTSC has 4 evenly-spaced quarter-frame ticks
         // every 7457 CPU cycles (≈ 240 Hz). We don't model the actual
@@ -596,8 +813,9 @@ impl Apu2A03 {
         self.noise.clock_length();
     }
 
-    /// Closed-form non-linear mix per nesdev.org/wiki/APU_Mixer.
-    /// Output is in the range 0.0 .. ~1.0.
+    /// Closed-form non-linear mix per nesdev.org/wiki/APU_Mixer, plus
+    /// the linearly-mixed expansion-chip outputs.
+    /// Output is in the range 0.0 .. ~1.5 once expansion chips fire.
     pub fn output_sample(&self) -> f32 {
         let p1 = self.pulse1.output() as f32;
         let p2 = self.pulse2.output() as f32;
@@ -615,7 +833,7 @@ impl Apu2A03 {
         } else {
             159.79 / (1.0 / tnd_sum + 100.0)
         };
-        pulse_out + tnd_out
+        pulse_out + tnd_out + self.expansion.output()
     }
 }
 
@@ -677,5 +895,88 @@ mod tests {
     fn mixer_rests_at_zero() {
         let apu = Apu2A03::new();
         assert!(apu.output_sample().abs() < 1e-9);
+    }
+
+    #[test]
+    fn dmc_address_seeded_by_4012() {
+        // $4012 stores ((value << 6) | 0xC000). Value 0x10 → $C400.
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x4012, 0x10);
+        apu.write_register(0x4013, 0x01); // length = 17 bytes
+        apu.write_status(0x10); // enable DMC
+        assert_eq!(apu.dmc.sample_addr_seed, 0xC400);
+        assert_eq!(apu.dmc.sample_len_seed, (1 << 4) | 1);
+        assert_eq!(apu.dmc.current_addr, 0xC400);
+        assert_eq!(apu.dmc.bytes_remaining, (1 << 4) | 1);
+    }
+
+    #[test]
+    fn dmc_pending_fetch_drains_after_byte_supplied() {
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x4012, 0x00); // address = $C000
+        apu.write_register(0x4013, 0x01); // length = 17 bytes
+        apu.write_status(0x10); // enable DMC
+                                // Tick a few cycles; the channel should request a fetch.
+        for _ in 0..4 {
+            apu.tick_cpu_cycles(1);
+        }
+        let pending = apu.dmc_pending_fetch();
+        assert_eq!(pending, Some(0xC000));
+        apu.dmc_supply_byte(0xAB);
+        // Address advances; bytes remaining decrements.
+        assert_eq!(apu.dmc.current_addr, 0xC001);
+        assert_eq!(apu.dmc.bytes_remaining, 16);
+        assert!(apu.dmc.sample_buffer_filled);
+        assert!(apu.dmc_pending_fetch().is_none());
+    }
+
+    #[test]
+    fn dmc_status_bit_reflects_bytes_remaining() {
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x4010, 0x0F); // pick fastest rate index → shortest fetch interval
+        apu.write_register(0x4012, 0);
+        apu.write_register(0x4013, 0x02); // 33 bytes total
+        apu.write_status(0x10);
+        let s0 = apu.read_status();
+        assert_eq!(s0 & 0x10, 0x10);
+        // Drain by handing over a byte every time one is requested.
+        // 33 bytes × 8 bits × 54 cycles/bit (NTSC fastest) ≈ 14256 cycles.
+        for _ in 0..30_000 {
+            apu.tick_cpu_cycles(1);
+            if let Some(_addr) = apu.dmc_pending_fetch() {
+                apu.dmc_supply_byte(0);
+            }
+            if apu.dmc.bytes_remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(apu.dmc.bytes_remaining, 0, "DMC should be drained");
+        let s1 = apu.read_status();
+        assert_eq!(s1 & 0x10, 0);
+    }
+
+    #[test]
+    fn dmc_irq_flag_sets_on_end_of_sample_when_armed() {
+        let mut apu = Apu2A03::new();
+        // IRQ enable, no loop, fastest rate.
+        apu.write_register(0x4010, 0x80 | 0x0F);
+        apu.write_register(0x4012, 0);
+        apu.write_register(0x4013, 0); // 1 byte (length = 0 means 1 byte)
+        apu.write_status(0x10);
+        for _ in 0..2_000 {
+            apu.tick_cpu_cycles(1);
+            if let Some(_a) = apu.dmc_pending_fetch() {
+                apu.dmc_supply_byte(0);
+            }
+            if apu.dmc.bytes_remaining == 0 {
+                break;
+            }
+        }
+        assert!(apu.dmc.irq_flag, "DMC IRQ flag should be set");
+        let s = apu.read_status();
+        assert_eq!(s & 0x80, 0x80);
+        // Second read clears.
+        let s2 = apu.read_status();
+        assert_eq!(s2 & 0x80, 0);
     }
 }

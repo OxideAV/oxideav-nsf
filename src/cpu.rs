@@ -1,17 +1,30 @@
 //! Clean-room MOS 6502 CPU emulator (NES 2A03 variant — decimal mode
 //! disabled).
 //!
-//! Round 1 implements all 151 documented mnemonics × every legal
+//! Round 1 implemented all 151 documented mnemonics × every legal
 //! addressing-mode combination — covering all 256 official opcode bytes
-//! that nesdev.org/wiki/CPU enumerates. Unofficial / "illegal" opcodes
-//! (per nesdev.org/wiki/CPU_unofficial_opcodes) are reserved for round
-//! 2; the dispatcher handles them as `NOP` of the correct base length
-//! so undefined-byte programs do not deadlock the player.
+//! that nesdev.org/wiki/CPU enumerates.
+//!
+//! Round 2 fills in the unofficial / "illegal" opcodes per
+//! nesdev.org/wiki/CPU_unofficial_opcodes. Concretely:
+//!
+//! * **Stable**: LAX, SAX, DCP, ISB/ISC, SLO, RLA, SRE, RRA, ANC, ALR,
+//!   ARR, SBX (AXS), the duplicate SBC (`$EB`), and the multi-byte NOP
+//!   variants. KIL / JAM (`$02`, `$12`, `$22`, `$32`, `$42`, `$52`,
+//!   `$62`, `$72`, `$92`, `$B2`, `$D2`, `$F2`) latch the CPU `halted`
+//!   bit so the player loop short-circuits the rest of the period.
+//! * **Unstable / "magic-constant"**: SHA, SHX, SHY, TAS, LAS, ANE/XAA,
+//!   LXA. We pick the deterministic interpretation documented on the
+//!   wiki ("magic = 0xFF" branch) — sufficient for the music engines we
+//!   target. Anyone needing per-die-bug accuracy is in PPU territory.
 //!
 //! Cycle accounting is at instruction-completion granularity:
 //! [`Cpu6502::step`] returns the total cycles consumed by one
 //! instruction including the standard page-cross penalty on indexed
-//! reads and the branch-taken / branch-page-cross penalties.
+//! reads and the branch-taken / branch-page-cross penalties. Read-modify-
+//! write unofficial ops (DCP / ISB / SLO / RLA / SRE / RRA) follow the
+//! 6502's published RMW timing — abs,X / abs,Y / (zp),Y always pay the
+//! 7-cycle penalty even when no page crossing occurred.
 
 use crate::bus::NesBus;
 
@@ -1172,13 +1185,22 @@ impl Cpu6502 {
             }
             0xEA => 2,
 
-            // ---- Unofficial / undefined: treat as NOP of correct length ----
+            // ---- Unofficial NOPs (single-byte, no operand fetch) ----
             0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => 2,
-            0x80 | 0x82 | 0x89 | 0xC2 | 0xE2 | 0x04 | 0x44 | 0x64 | 0x14 | 0x34 | 0x54 | 0x74
-            | 0xD4 | 0xF4 => {
+            // ---- Unofficial NOPs (immediate / zero-page) ----
+            0x80 | 0x82 | 0x89 | 0xC2 | 0xE2 => {
+                let _ = self.fetch_byte(bus);
+                2
+            }
+            0x04 | 0x44 | 0x64 => {
                 let _ = self.fetch_byte(bus);
                 3
             }
+            0x14 | 0x34 | 0x54 | 0x74 | 0xD4 | 0xF4 => {
+                let _ = self.fetch_byte(bus);
+                4
+            }
+            // ---- Unofficial NOPs (absolute / absolute,X) ----
             0x0C => {
                 let _ = self.fetch_word(bus);
                 4
@@ -1187,8 +1209,474 @@ impl Cpu6502 {
                 let (_, c) = self.addr_abs_x(bus);
                 4 + c as u32
             }
-            _ => 2,
+
+            // ---- Duplicate SBC ----
+            0xEB => {
+                let m = self.fetch_byte(bus);
+                self.op_sbc(m);
+                2
+            }
+
+            // ---- LAX (LDA + LDX combined) ----
+            0xA7 => {
+                let addr = self.addr_zp(bus);
+                let m = bus.read(addr);
+                self.a = m;
+                self.x = m;
+                self.set_zn(m);
+                3
+            }
+            0xB7 => {
+                let addr = self.addr_zp_y(bus);
+                let m = bus.read(addr);
+                self.a = m;
+                self.x = m;
+                self.set_zn(m);
+                4
+            }
+            0xAF => {
+                let addr = self.addr_abs(bus);
+                let m = bus.read(addr);
+                self.a = m;
+                self.x = m;
+                self.set_zn(m);
+                4
+            }
+            0xBF => {
+                let (addr, c) = self.addr_abs_y(bus);
+                let m = bus.read(addr);
+                self.a = m;
+                self.x = m;
+                self.set_zn(m);
+                4 + c as u32
+            }
+            0xA3 => {
+                let addr = self.addr_ind_x(bus);
+                let m = bus.read(addr);
+                self.a = m;
+                self.x = m;
+                self.set_zn(m);
+                6
+            }
+            0xB3 => {
+                let (addr, c) = self.addr_ind_y(bus);
+                let m = bus.read(addr);
+                self.a = m;
+                self.x = m;
+                self.set_zn(m);
+                5 + c as u32
+            }
+
+            // ---- SAX (store A AND X — no flags affected) ----
+            0x87 => {
+                let addr = self.addr_zp(bus);
+                bus.write(addr, self.a & self.x);
+                3
+            }
+            0x97 => {
+                let addr = self.addr_zp_y(bus);
+                bus.write(addr, self.a & self.x);
+                4
+            }
+            0x8F => {
+                let addr = self.addr_abs(bus);
+                bus.write(addr, self.a & self.x);
+                4
+            }
+            0x83 => {
+                let addr = self.addr_ind_x(bus);
+                bus.write(addr, self.a & self.x);
+                6
+            }
+
+            // ---- DCP (DEC then CMP A,result) ----
+            0xC7 => {
+                let addr = self.addr_zp(bus);
+                self.rmw_dcp(bus, addr);
+                5
+            }
+            0xD7 => {
+                let addr = self.addr_zp_x(bus);
+                self.rmw_dcp(bus, addr);
+                6
+            }
+            0xCF => {
+                let addr = self.addr_abs(bus);
+                self.rmw_dcp(bus, addr);
+                6
+            }
+            0xDF => {
+                let (addr, _) = self.addr_abs_x(bus);
+                self.rmw_dcp(bus, addr);
+                7
+            }
+            0xDB => {
+                let (addr, _) = self.addr_abs_y(bus);
+                self.rmw_dcp(bus, addr);
+                7
+            }
+            0xC3 => {
+                let addr = self.addr_ind_x(bus);
+                self.rmw_dcp(bus, addr);
+                8
+            }
+            0xD3 => {
+                let (addr, _) = self.addr_ind_y(bus);
+                self.rmw_dcp(bus, addr);
+                8
+            }
+
+            // ---- ISB / ISC (INC then SBC) ----
+            0xE7 => {
+                let addr = self.addr_zp(bus);
+                self.rmw_isb(bus, addr);
+                5
+            }
+            0xF7 => {
+                let addr = self.addr_zp_x(bus);
+                self.rmw_isb(bus, addr);
+                6
+            }
+            0xEF => {
+                let addr = self.addr_abs(bus);
+                self.rmw_isb(bus, addr);
+                6
+            }
+            0xFF => {
+                let (addr, _) = self.addr_abs_x(bus);
+                self.rmw_isb(bus, addr);
+                7
+            }
+            0xFB => {
+                let (addr, _) = self.addr_abs_y(bus);
+                self.rmw_isb(bus, addr);
+                7
+            }
+            0xE3 => {
+                let addr = self.addr_ind_x(bus);
+                self.rmw_isb(bus, addr);
+                8
+            }
+            0xF3 => {
+                let (addr, _) = self.addr_ind_y(bus);
+                self.rmw_isb(bus, addr);
+                8
+            }
+
+            // ---- SLO (ASL then ORA) ----
+            0x07 => {
+                let addr = self.addr_zp(bus);
+                self.rmw_slo(bus, addr);
+                5
+            }
+            0x17 => {
+                let addr = self.addr_zp_x(bus);
+                self.rmw_slo(bus, addr);
+                6
+            }
+            0x0F => {
+                let addr = self.addr_abs(bus);
+                self.rmw_slo(bus, addr);
+                6
+            }
+            0x1F => {
+                let (addr, _) = self.addr_abs_x(bus);
+                self.rmw_slo(bus, addr);
+                7
+            }
+            0x1B => {
+                let (addr, _) = self.addr_abs_y(bus);
+                self.rmw_slo(bus, addr);
+                7
+            }
+            0x03 => {
+                let addr = self.addr_ind_x(bus);
+                self.rmw_slo(bus, addr);
+                8
+            }
+            0x13 => {
+                let (addr, _) = self.addr_ind_y(bus);
+                self.rmw_slo(bus, addr);
+                8
+            }
+
+            // ---- RLA (ROL then AND) ----
+            0x27 => {
+                let addr = self.addr_zp(bus);
+                self.rmw_rla(bus, addr);
+                5
+            }
+            0x37 => {
+                let addr = self.addr_zp_x(bus);
+                self.rmw_rla(bus, addr);
+                6
+            }
+            0x2F => {
+                let addr = self.addr_abs(bus);
+                self.rmw_rla(bus, addr);
+                6
+            }
+            0x3F => {
+                let (addr, _) = self.addr_abs_x(bus);
+                self.rmw_rla(bus, addr);
+                7
+            }
+            0x3B => {
+                let (addr, _) = self.addr_abs_y(bus);
+                self.rmw_rla(bus, addr);
+                7
+            }
+            0x23 => {
+                let addr = self.addr_ind_x(bus);
+                self.rmw_rla(bus, addr);
+                8
+            }
+            0x33 => {
+                let (addr, _) = self.addr_ind_y(bus);
+                self.rmw_rla(bus, addr);
+                8
+            }
+
+            // ---- SRE (LSR then EOR) ----
+            0x47 => {
+                let addr = self.addr_zp(bus);
+                self.rmw_sre(bus, addr);
+                5
+            }
+            0x57 => {
+                let addr = self.addr_zp_x(bus);
+                self.rmw_sre(bus, addr);
+                6
+            }
+            0x4F => {
+                let addr = self.addr_abs(bus);
+                self.rmw_sre(bus, addr);
+                6
+            }
+            0x5F => {
+                let (addr, _) = self.addr_abs_x(bus);
+                self.rmw_sre(bus, addr);
+                7
+            }
+            0x5B => {
+                let (addr, _) = self.addr_abs_y(bus);
+                self.rmw_sre(bus, addr);
+                7
+            }
+            0x43 => {
+                let addr = self.addr_ind_x(bus);
+                self.rmw_sre(bus, addr);
+                8
+            }
+            0x53 => {
+                let (addr, _) = self.addr_ind_y(bus);
+                self.rmw_sre(bus, addr);
+                8
+            }
+
+            // ---- RRA (ROR then ADC) ----
+            0x67 => {
+                let addr = self.addr_zp(bus);
+                self.rmw_rra(bus, addr);
+                5
+            }
+            0x77 => {
+                let addr = self.addr_zp_x(bus);
+                self.rmw_rra(bus, addr);
+                6
+            }
+            0x6F => {
+                let addr = self.addr_abs(bus);
+                self.rmw_rra(bus, addr);
+                6
+            }
+            0x7F => {
+                let (addr, _) = self.addr_abs_x(bus);
+                self.rmw_rra(bus, addr);
+                7
+            }
+            0x7B => {
+                let (addr, _) = self.addr_abs_y(bus);
+                self.rmw_rra(bus, addr);
+                7
+            }
+            0x63 => {
+                let addr = self.addr_ind_x(bus);
+                self.rmw_rra(bus, addr);
+                8
+            }
+            0x73 => {
+                let (addr, _) = self.addr_ind_y(bus);
+                self.rmw_rra(bus, addr);
+                8
+            }
+
+            // ---- ANC (AND #imm; carry copies bit 7) ----
+            0x0B | 0x2B => {
+                let m = self.fetch_byte(bus);
+                self.a &= m;
+                let a = self.a;
+                self.set_zn(a);
+                self.set_flag(FLAG_C, a & 0x80 != 0);
+                2
+            }
+
+            // ---- ALR (AND #imm then LSR A) ----
+            0x4B => {
+                let m = self.fetch_byte(bus);
+                self.a &= m;
+                let v = self.op_lsr_value(self.a);
+                self.a = v;
+                2
+            }
+
+            // ---- ARR (AND #imm then ROR A; flags peculiar) ----
+            0x6B => {
+                let m = self.fetch_byte(bus);
+                self.a &= m;
+                let old_c = self.p & FLAG_C != 0;
+                let r = (self.a >> 1) | ((old_c as u8) << 7);
+                self.a = r;
+                self.set_zn(r);
+                // C from bit 6 of result, V from bit 6 ^ bit 5.
+                self.set_flag(FLAG_C, r & 0x40 != 0);
+                self.set_flag(FLAG_V, ((r >> 6) ^ (r >> 5)) & 0x01 != 0);
+                2
+            }
+
+            // ---- SBX / AXS (X = (A & X) - imm; sets C like CMP) ----
+            0xCB => {
+                let m = self.fetch_byte(bus);
+                let lhs = self.a & self.x;
+                let r = lhs.wrapping_sub(m);
+                self.set_flag(FLAG_C, lhs >= m);
+                self.x = r;
+                self.set_zn(r);
+                2
+            }
+
+            // ---- LXA / ATX ($AB) — A,X = (A | magic) & imm. Use magic = 0xFF
+            //      (the most common literature value), reducing to A,X = imm.
+            0xAB => {
+                let m = self.fetch_byte(bus);
+                let r = m;
+                self.a = r;
+                self.x = r;
+                self.set_zn(r);
+                2
+            }
+
+            // ---- ANE / XAA ($8B) — A = (A | magic) & X & imm. Same magic
+            //      assumption as LXA.
+            0x8B => {
+                let m = self.fetch_byte(bus);
+                let r = self.x & m;
+                self.a = r;
+                self.set_zn(r);
+                2
+            }
+
+            // ---- LAS ($BB) — A,X,SP = mem(abs,Y) & SP. ----
+            0xBB => {
+                let (addr, c) = self.addr_abs_y(bus);
+                let m = bus.read(addr) & self.sp;
+                self.a = m;
+                self.x = m;
+                self.sp = m;
+                self.set_zn(m);
+                4 + c as u32
+            }
+
+            // ---- TAS ($9B) — SP = A & X; mem = SP & (high+1). ----
+            0x9B => {
+                let base = self.fetch_word(bus);
+                let addr = base.wrapping_add(self.y as u16);
+                self.sp = self.a & self.x;
+                let v = self.sp & ((base >> 8) as u8).wrapping_add(1);
+                bus.write(addr, v);
+                5
+            }
+
+            // ---- SHA / AHX ($93,$9F) — mem = A & X & (high+1). ----
+            0x9F => {
+                let base = self.fetch_word(bus);
+                let addr = base.wrapping_add(self.y as u16);
+                let v = self.a & self.x & ((base >> 8) as u8).wrapping_add(1);
+                bus.write(addr, v);
+                5
+            }
+            0x93 => {
+                let zp = self.fetch_byte(bus);
+                let lo = bus.read(zp as u16) as u16;
+                let hi = bus.read(zp.wrapping_add(1) as u16) as u16;
+                let base = (hi << 8) | lo;
+                let addr = base.wrapping_add(self.y as u16);
+                let v = self.a & self.x & ((base >> 8) as u8).wrapping_add(1);
+                bus.write(addr, v);
+                6
+            }
+
+            // ---- SHX ($9E) — mem(abs,Y) = X & (high+1). ----
+            0x9E => {
+                let base = self.fetch_word(bus);
+                let addr = base.wrapping_add(self.y as u16);
+                let v = self.x & ((base >> 8) as u8).wrapping_add(1);
+                bus.write(addr, v);
+                5
+            }
+
+            // ---- SHY ($9C) — mem(abs,X) = Y & (high+1). ----
+            0x9C => {
+                let base = self.fetch_word(bus);
+                let addr = base.wrapping_add(self.x as u16);
+                let v = self.y & ((base >> 8) as u8).wrapping_add(1);
+                bus.write(addr, v);
+                5
+            }
+
+            // ---- KIL / JAM (every $x2 except the legal $A2 LDX#imm) ----
+            0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 => {
+                self.halted = true;
+                2
+            }
         }
+    }
+
+    fn rmw_dcp(&mut self, bus: &mut NesBus, addr: u16) {
+        let v = bus.read(addr).wrapping_sub(1);
+        bus.write(addr, v);
+        let a = self.a;
+        self.op_cmp_value(a, v);
+    }
+
+    fn rmw_isb(&mut self, bus: &mut NesBus, addr: u16) {
+        let v = bus.read(addr).wrapping_add(1);
+        bus.write(addr, v);
+        self.op_sbc(v);
+    }
+
+    fn rmw_slo(&mut self, bus: &mut NesBus, addr: u16) {
+        let v = self.op_asl_value(bus.read(addr));
+        bus.write(addr, v);
+        self.op_ora(v);
+    }
+
+    fn rmw_rla(&mut self, bus: &mut NesBus, addr: u16) {
+        let v = self.op_rol_value(bus.read(addr));
+        bus.write(addr, v);
+        self.op_and(v);
+    }
+
+    fn rmw_sre(&mut self, bus: &mut NesBus, addr: u16) {
+        let v = self.op_lsr_value(bus.read(addr));
+        bus.write(addr, v);
+        self.op_eor(v);
+    }
+
+    fn rmw_rra(&mut self, bus: &mut NesBus, addr: u16) {
+        let v = self.op_ror_value(bus.read(addr));
+        bus.write(addr, v);
+        self.op_adc(v);
     }
 
     fn do_branch(&mut self, bus: &mut NesBus, take: bool) -> u32 {
@@ -1305,6 +1793,136 @@ mod tests {
         let mut cpu = Cpu6502::new();
         cpu.pc = 0x8000;
         cpu.p |= FLAG_Z; // Z=1 means BNE not taken.
+        let cy = cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0x8002);
+        assert_eq!(cy, 2);
+    }
+
+    // ---- Unofficial opcodes ----
+
+    #[test]
+    fn lax_loads_a_and_x() {
+        let (cpu, _) = run_one(&[0xA7, 0x10], |_, b| b.ram[0x10] = 0x77);
+        assert_eq!(cpu.a, 0x77);
+        assert_eq!(cpu.x, 0x77);
+    }
+
+    #[test]
+    fn sax_writes_a_and_x() {
+        let (_cpu, bus) = run_one(&[0x87, 0x10], |c, _| {
+            c.a = 0xF0;
+            c.x = 0x3F;
+        });
+        assert_eq!(bus.ram[0x10], 0x30);
+    }
+
+    #[test]
+    fn dcp_decrements_then_compares() {
+        let (cpu, bus) = run_one(&[0xC7, 0x20], |c, b| {
+            c.a = 0x09;
+            b.ram[0x20] = 0x0A;
+        });
+        assert_eq!(bus.ram[0x20], 0x09);
+        // 0x09 == 0x09 → Z=1, C=1
+        assert!(cpu.p & FLAG_Z != 0);
+        assert!(cpu.p & FLAG_C != 0);
+    }
+
+    #[test]
+    fn isb_increments_then_subtracts() {
+        let (cpu, bus) = run_one(&[0xE7, 0x20], |c, b| {
+            c.a = 0x10;
+            c.p |= FLAG_C;
+            b.ram[0x20] = 0x04;
+        });
+        assert_eq!(bus.ram[0x20], 0x05);
+        // 0x10 - 0x05 = 0x0B
+        assert_eq!(cpu.a, 0x0B);
+    }
+
+    #[test]
+    fn slo_shifts_then_ors() {
+        let (cpu, bus) = run_one(&[0x07, 0x20], |c, b| {
+            c.a = 0x01;
+            b.ram[0x20] = 0x40;
+        });
+        assert_eq!(bus.ram[0x20], 0x80);
+        assert_eq!(cpu.a, 0x81);
+    }
+
+    #[test]
+    fn rla_rotates_then_ands() {
+        let (cpu, bus) = run_one(&[0x27, 0x20], |c, b| {
+            c.a = 0xFF;
+            c.p |= FLAG_C;
+            b.ram[0x20] = 0x40;
+        });
+        // 0x40 ROL with C=1 → 0x81; A & 0x81 = 0x81
+        assert_eq!(bus.ram[0x20], 0x81);
+        assert_eq!(cpu.a, 0x81);
+    }
+
+    #[test]
+    fn anc_copies_n_to_c() {
+        let (cpu, _) = run_one(&[0x0B, 0x80], |c, _| c.a = 0xF0);
+        assert_eq!(cpu.a, 0x80);
+        assert!(cpu.p & FLAG_C != 0);
+        assert!(cpu.p & FLAG_N != 0);
+    }
+
+    #[test]
+    fn sbx_subtracts_from_a_and_x() {
+        let (cpu, _) = run_one(&[0xCB, 0x05], |c, _| {
+            c.a = 0xF0;
+            c.x = 0x0F;
+        });
+        // (0xF0 & 0x0F) = 0x00; 0x00 - 0x05 wraps; C=0
+        assert_eq!(cpu.x, 0xFB);
+        assert_eq!(cpu.p & FLAG_C, 0);
+
+        let (cpu, _) = run_one(&[0xCB, 0x05], |c, _| {
+            c.a = 0xFF;
+            c.x = 0x0F;
+        });
+        // (0xFF & 0x0F) = 0x0F; 0x0F - 0x05 = 0x0A; C=1
+        assert_eq!(cpu.x, 0x0A);
+        assert!(cpu.p & FLAG_C != 0);
+    }
+
+    #[test]
+    fn jam_halts_the_cpu() {
+        let mut bus = NesBus::new();
+        bus.load_program(0x8000, &[0x02]);
+        let mut cpu = Cpu6502::new();
+        cpu.pc = 0x8000;
+        cpu.step(&mut bus);
+        assert!(cpu.halted);
+        // Subsequent step is a 1-cycle no-op.
+        let cy = cpu.step(&mut bus);
+        assert_eq!(cy, 1);
+    }
+
+    #[test]
+    fn duplicate_sbc_eb_matches_e9() {
+        let (cpu1, _) = run_one(&[0xE9, 0x05], |c, _| {
+            c.a = 0x10;
+            c.p |= FLAG_C;
+        });
+        let (cpu2, _) = run_one(&[0xEB, 0x05], |c, _| {
+            c.a = 0x10;
+            c.p |= FLAG_C;
+        });
+        assert_eq!(cpu1.a, cpu2.a);
+        assert_eq!(cpu1.p, cpu2.p);
+    }
+
+    #[test]
+    fn unofficial_nops_advance_pc_correctly() {
+        // $80 #imm → 2 bytes, 2 cycles.
+        let mut bus = NesBus::new();
+        bus.load_program(0x8000, &[0x80, 0xAA, 0xEA]);
+        let mut cpu = Cpu6502::new();
+        cpu.pc = 0x8000;
         let cy = cpu.step(&mut bus);
         assert_eq!(cpu.pc, 0x8002);
         assert_eq!(cy, 2);

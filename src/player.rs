@@ -61,7 +61,7 @@ impl NsfPlayer {
         };
         let mut bus = NesBus::new();
         bus.apu.set_cpu_hz(cpu_hz);
-        bus.load_program(header.load_addr, &header.program);
+        bus.configure_from_header(&header);
 
         let play_us = match header.region {
             NsfRegion::Pal => header.pal_speed_us,
