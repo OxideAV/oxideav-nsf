@@ -287,3 +287,85 @@ impl NesBus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::{ExpansionChips, NsfHeader, NsfRegion};
+
+    fn fake_header(load: u16, prog: Vec<u8>, banks: [u8; 8]) -> NsfHeader {
+        NsfHeader {
+            version: 1,
+            total_songs: 1,
+            starting_song: 1,
+            load_addr: load,
+            init_addr: 0x8000,
+            play_addr: 0x8003,
+            song_name: String::new(),
+            artist: String::new(),
+            copyright: String::new(),
+            ntsc_speed_us: 16666,
+            pal_speed_us: 19997,
+            bankswitch_init: banks,
+            region: NsfRegion::Ntsc,
+            expansion: ExpansionChips(0),
+            program: prog,
+            track_labels: Vec::new(),
+            is_nsfe: false,
+        }
+    }
+
+    #[test]
+    fn flat_load_places_program_at_load_addr() {
+        let mut bus = NesBus::new();
+        let h = fake_header(0x8000, vec![0xAA, 0xBB, 0xCC], [0u8; 8]);
+        bus.configure_from_header(&h);
+        assert!(!bus.bankswitched);
+        assert_eq!(bus.read(0x8000), 0xAA);
+        assert_eq!(bus.read(0x8001), 0xBB);
+        assert_eq!(bus.read(0x8002), 0xCC);
+    }
+
+    #[test]
+    fn bankswitching_routes_through_bank_select() {
+        // Two 4 KiB banks: bank0 filled with 0x11, bank1 with 0x22.
+        let mut prog = vec![0x11; BANK_SIZE];
+        prog.extend(std::iter::repeat_n(0x22, BANK_SIZE));
+        // Header bank-select: window0 = bank0, window1 = bank1, rest zero.
+        let mut banks = [0u8; 8];
+        banks[1] = 1;
+        let h = fake_header(0x8000, prog, banks);
+        let mut bus = NesBus::new();
+        bus.configure_from_header(&h);
+        assert!(bus.bankswitched);
+        // $8000..=$8FFF reads bank 0.
+        assert_eq!(bus.read(0x8000), 0x11);
+        assert_eq!(bus.read(0x8FFF), 0x11);
+        // $9000..=$9FFF reads bank 1.
+        assert_eq!(bus.read(0x9000), 0x22);
+        assert_eq!(bus.read(0x9FFF), 0x22);
+        // Now hot-swap window 0 to bank 1.
+        bus.write(0x5FF8, 1);
+        assert_eq!(bus.read(0x8000), 0x22);
+    }
+
+    #[test]
+    fn writes_to_8000_window_are_dropped_without_fds() {
+        let mut bus = NesBus::new();
+        let h = fake_header(0x8000, vec![0x55], [0u8; 8]);
+        bus.configure_from_header(&h);
+        // Plain ROM: writes silently dropped; read still returns ROM.
+        bus.write(0x8000, 0xFF);
+        assert_eq!(bus.read(0x8000), 0x55);
+    }
+
+    #[test]
+    fn ram_mirrors_at_2k_boundary() {
+        let mut bus = NesBus::new();
+        bus.write(0x0010, 0x42);
+        // $0810 mirrors $0010.
+        assert_eq!(bus.read(0x0810), 0x42);
+        assert_eq!(bus.read(0x1010), 0x42);
+        assert_eq!(bus.read(0x1810), 0x42);
+    }
+}
