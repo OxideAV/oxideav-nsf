@@ -1,0 +1,33 @@
+[package]
+name = "oxideav-nsf"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-nsf"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust NSF (Nintendo Sound Format) player for oxideav — clean-room from nesdev.org wiki"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-nsf"
+keywords = ["multimedia", "audio", "nsf", "nes", "chiptune"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# audio-library consumers can depend on `oxideav-nsf` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes a free-standing
+# `parse_nsf` / `NsfPlayer` API plus local `NsfHeader` / `NsfError`
+# types and never references `oxideav-core`.
+oxideav-core = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+
+# Wires up the `Decoder` trait implementation, the NSF container
+# demuxer + probe, and the `register_codecs` / `register_containers`
+# entry points against `oxideav-core` so the crate can plug into the
+# `oxideav` framework registry. Default-on; turn off for direct-API
+# use-cases that just want `parse_nsf` + `NsfPlayer`.
+registry = ["dep:oxideav-core"]
