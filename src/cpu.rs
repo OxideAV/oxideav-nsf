@@ -82,10 +82,44 @@ impl Cpu6502 {
         if self.halted {
             return 1;
         }
+        // NMI is edge-triggered and ignores the I flag — service it
+        // before any pending IRQ check (the NSF2 non-returning-INIT
+        // path uses NMI to interrupt INIT and run PLAY).
+        if bus.take_nmi() {
+            let cy = self.service_interrupt(bus, 0xFFFA);
+            bus.tick_cycles(cy);
+            return cy;
+        }
+        // IRQ is level-triggered: serviced whenever the I flag is
+        // clear and the bus is asserting the IRQ line (NSF2 timer
+        // device — see `docs/audio/nsf/nsf2-nesdev-wiki.html` §IRQ
+        // Support).
+        if (self.p & FLAG_I) == 0 && bus.irq_line() {
+            let cy = self.service_interrupt(bus, 0xFFFE);
+            bus.tick_cycles(cy);
+            return cy;
+        }
         let opcode = self.fetch_byte(bus);
         let cycles = self.dispatch(bus, opcode);
         bus.tick_cycles(cycles);
         cycles
+    }
+
+    /// Push PC + processor flags (B=0, U=1), set I, then jump through
+    /// the 16-bit vector at `vector` / `vector+1`. Used for both
+    /// hardware IRQ (`$FFFE`) and NMI (`$FFFA`) entry — they differ
+    /// only in which vector is read; both push P with B clear.
+    fn service_interrupt(&mut self, bus: &mut NesBus, vector: u16) -> u32 {
+        let pc = self.pc;
+        self.push_word(bus, pc);
+        let p = (self.p & !FLAG_B) | FLAG_U;
+        self.push(bus, p);
+        self.p |= FLAG_I;
+        let lo = bus.read(vector) as u16;
+        let hi = bus.read(vector.wrapping_add(1)) as u16;
+        self.pc = (hi << 8) | lo;
+        // Hardware takes 7 cycles to dispatch IRQ/NMI on the 6502.
+        7
     }
 
     fn fetch_byte(&mut self, bus: &mut NesBus) -> u8 {
@@ -1926,5 +1960,143 @@ mod tests {
         let cy = cpu.step(&mut bus);
         assert_eq!(cpu.pc, 0x8002);
         assert_eq!(cy, 2);
+    }
+
+    // ---- NSF2 IRQ + NMI servicing ----
+
+    fn arm_irq_bus(handler: u16) -> NesBus {
+        // Fill PRG with NOPs and place the IRQ vector at 0xFFFE/0xFFFF
+        // by armed overlay. Header is faked with NSF2 IRQ-support
+        // enabled so the bus routes $401B-$401D into the timer.
+        let mut bus = NesBus::new();
+        let mut prog = vec![0xEAu8; crate::bus::PRG_ROM_SIZE];
+        // Stuff RTI ($40) somewhere reachable so a serviced IRQ can
+        // return cleanly if the test cares.
+        prog[0x100] = 0x40;
+        let h = crate::header::NsfHeader {
+            version: 2,
+            total_songs: 1,
+            starting_song: 1,
+            load_addr: 0x8000,
+            init_addr: 0x8000,
+            play_addr: 0x8001,
+            song_name: String::new(),
+            artist: String::new(),
+            copyright: String::new(),
+            ntsc_speed_us: 16666,
+            pal_speed_us: 19997,
+            bankswitch_init: [0u8; 8],
+            region: crate::header::NsfRegion::Ntsc,
+            expansion: crate::header::ExpansionChips(0),
+            program: prog,
+            track_labels: Vec::new(),
+            is_nsfe: false,
+            nsf2: crate::header::Nsf2Features(0x10),
+            nsf2_metadata: Vec::new(),
+        };
+        bus.configure_from_header(&h);
+        bus.arm_vector_overlay(0x4FFE, 0x4FFE);
+        bus.write(0xFFFE, handler as u8);
+        bus.write(0xFFFF, (handler >> 8) as u8);
+        bus
+    }
+
+    #[test]
+    fn cpu_services_irq_when_i_flag_clear_and_line_asserted() {
+        let mut bus = arm_irq_bus(0x9100);
+        let mut cpu = Cpu6502::new();
+        cpu.pc = 0x8000;
+        cpu.sp = 0xFD;
+        cpu.p = FLAG_U; // I=0
+                        // Arm the NSF2 timer with a tiny period so an IRQ is pending
+                        // by the time we step.
+        bus.write(0x401B, 1);
+        bus.write(0x401C, 0);
+        bus.write(0x401D, 1);
+        bus.tick_cycles(4);
+        assert!(bus.irq_line());
+        let cy = cpu.step(&mut bus);
+        assert_eq!(cy, 7, "IRQ dispatch should take 7 cycles");
+        assert_eq!(cpu.pc, 0x9100, "should have jumped through $FFFE/$FFFF");
+        assert!(cpu.p & FLAG_I != 0, "I should be set after IRQ service");
+        // The pushed P should have B clear and U set.
+        let pushed = bus.ram[0x0100 + cpu.sp as usize + 1];
+        assert_eq!(pushed & FLAG_B, 0);
+        assert_eq!(pushed & FLAG_U, FLAG_U);
+    }
+
+    #[test]
+    fn cpu_skips_irq_when_i_flag_set() {
+        let mut bus = arm_irq_bus(0x9100);
+        let mut cpu = Cpu6502::new();
+        cpu.pc = 0x8000;
+        cpu.p = FLAG_U | FLAG_I;
+        bus.write(0x401B, 1);
+        bus.write(0x401D, 1);
+        bus.tick_cycles(4);
+        assert!(bus.irq_line());
+        let _ = cpu.step(&mut bus);
+        // PC advanced past the NOP at $8000, not into the handler.
+        assert_eq!(cpu.pc, 0x8001);
+    }
+
+    fn arm_nmi_bus(nmi_handler: u16) -> NesBus {
+        let mut bus = NesBus::new();
+        let prog = vec![0xEAu8; crate::bus::PRG_ROM_SIZE];
+        let h = crate::header::NsfHeader {
+            version: 2,
+            total_songs: 1,
+            starting_song: 1,
+            load_addr: 0x8000,
+            init_addr: 0x8000,
+            play_addr: 0x8001,
+            song_name: String::new(),
+            artist: String::new(),
+            copyright: String::new(),
+            ntsc_speed_us: 16666,
+            pal_speed_us: 19997,
+            bankswitch_init: [0u8; 8],
+            region: crate::header::NsfRegion::Ntsc,
+            expansion: crate::header::ExpansionChips(0),
+            program: prog,
+            track_labels: Vec::new(),
+            is_nsfe: false,
+            nsf2: crate::header::Nsf2Features(0x20), // non-returning INIT
+            nsf2_metadata: Vec::new(),
+        };
+        bus.configure_from_header(&h);
+        // NMI slot is reserved to the player — install via arm.
+        bus.arm_vector_overlay(nmi_handler, 0x4FFE);
+        bus
+    }
+
+    #[test]
+    fn cpu_services_nmi_regardless_of_i_flag() {
+        let mut bus = arm_nmi_bus(0xA200);
+        let mut cpu = Cpu6502::new();
+        cpu.pc = 0x8000;
+        cpu.p = FLAG_U | FLAG_I; // I set — NMI must still fire
+        cpu.sp = 0xFD;
+        bus.request_nmi();
+        let cy = cpu.step(&mut bus);
+        assert_eq!(cy, 7);
+        assert_eq!(cpu.pc, 0xA200);
+        assert!(cpu.p & FLAG_I != 0);
+    }
+
+    #[test]
+    fn nmi_request_drains_once() {
+        let mut bus = arm_nmi_bus(0xA200);
+        let mut cpu = Cpu6502::new();
+        cpu.pc = 0x8000;
+        cpu.p = FLAG_U;
+        cpu.sp = 0xFD;
+        bus.request_nmi();
+        let _ = cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0xA200);
+        // Step again: no further NMI; $A200 is NOP-filled PRG, so PC
+        // advances past one NOP.
+        let _ = cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0xA201);
     }
 }

@@ -40,6 +40,109 @@
 use crate::apu::Apu2A03;
 use crate::header::NsfHeader;
 
+// =====================================================================
+// NSF2 IRQ timer device
+// =====================================================================
+//
+// Per `docs/audio/nsf/nsf2-nesdev-wiki.html` §IRQ Timer, a cycle-counting
+// timer hangs off three new player-side registers:
+//
+// | Reg    | Read                                      | Write                                |
+// | ------ | ----------------------------------------- | ------------------------------------ |
+// | $401B  | low 8 bits of counter reload              | low 8 bits of counter reload         |
+// | $401C  | high 8 bits of counter reload             | high 8 bits of counter reload        |
+// | $401D  | bit7=IRQ flag (clear-on-read), bit0=active| bit0: 1 = activate, 0 = deactivate   |
+//
+// When active, the counter decrements every CPU cycle. On underflow
+// (going below 0) the IRQ flag latches and the counter is reloaded with
+// `(reload_hi << 8) | reload_lo`. While the IRQ flag is set the IRQ line
+// is asserted; reading $401D clears the flag. When inactive the counter
+// is reloaded every cycle (held at `reload`).
+//
+// Reload value `N` ⇒ the IRQ repeats every `N+1` cycles.
+
+#[derive(Clone, Default)]
+pub struct Nsf2IrqTimer {
+    /// Currently-feature-gated on; off for v1 / NSF2 without the IRQ
+    /// support feature flag.
+    pub enabled: bool,
+    /// Latch for the next reload value (lo byte at $401B, hi at $401C).
+    pub reload: u16,
+    /// Live counter; decremented every cycle when `active`.
+    pub counter: i32,
+    /// Reflects bit 0 of writes to $401D.
+    pub active: bool,
+    /// Set on underflow, cleared on read of $401D. Drives the IRQ line.
+    pub irq_flag: bool,
+}
+
+impl Nsf2IrqTimer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn write(&mut self, addr: u16, value: u8) {
+        if !self.enabled {
+            return;
+        }
+        match addr {
+            0x401B => self.reload = (self.reload & 0xFF00) | value as u16,
+            0x401C => self.reload = (self.reload & 0x00FF) | ((value as u16) << 8),
+            0x401D => {
+                self.active = value & 0x01 != 0;
+                // Spec says reload happens automatically every cycle
+                // while inactive; mirror that by snapping the counter
+                // to the reload value when the toggle flips.
+                if !self.active {
+                    self.counter = self.reload as i32;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn read(&mut self, addr: u16) -> Option<u8> {
+        if !self.enabled {
+            return None;
+        }
+        match addr {
+            0x401B => Some(self.reload as u8),
+            0x401C => Some((self.reload >> 8) as u8),
+            0x401D => {
+                let v = (self.irq_flag as u8) << 7 | (self.active as u8);
+                // The read acknowledges and clears the IRQ flag per spec
+                // ("Bit 7 returns IRQ flag before clearing it").
+                self.irq_flag = false;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn tick(&mut self, cycles: u32) {
+        if !self.enabled {
+            return;
+        }
+        if !self.active {
+            // Held at reload while inactive.
+            self.counter = self.reload as i32;
+            return;
+        }
+        for _ in 0..cycles {
+            self.counter -= 1;
+            if self.counter < 0 {
+                self.irq_flag = true;
+                self.counter = self.reload as i32;
+            }
+        }
+    }
+
+    /// True iff the timer is currently asserting the CPU's IRQ line.
+    pub fn irq_line(&self) -> bool {
+        self.enabled && self.irq_flag
+    }
+}
+
 /// 2 KiB of work RAM.
 pub const RAM_SIZE: usize = 0x0800;
 
@@ -81,6 +184,27 @@ pub struct NesBus {
     /// FDS RAM image at `$8000..=$FFFF` — populated from the program
     /// blob and writable.
     pub fds_ram: Vec<u8>,
+
+    // ---- NSF2 IRQ / vector overlay ----
+    /// NSF2 IRQ timer device (`$401B..=$401D`). Inactive until the
+    /// header advertises the IRQ-support feature.
+    pub nsf2_timer: Nsf2IrqTimer,
+    /// True when the player has installed the `$FFFA..=$FFFF` vector
+    /// overlay (required by the NSF2 IRQ + non-returning-INIT
+    /// features). When set, reads of `$FFFA..=$FFFF` come from
+    /// `vector_overlay` regardless of the underlying ROM/RAM, and
+    /// writes to `$FFFE..=$FFFF` are captured into the overlay so the
+    /// NSF program can install its own IRQ vector.
+    pub vector_overlay_active: bool,
+    /// 6 bytes of vector overlay at `$FFFA..=$FFFF` — NMI lo/hi,
+    /// Reset lo/hi, IRQ lo/hi. NMI/Reset are reserved to the player;
+    /// IRQ is owned by the NSF program.
+    pub vector_overlay: [u8; 6],
+    /// Pending NMI request; set by the player when it wants to vector
+    /// the CPU through `$FFFA` (used to implement the NSF2
+    /// non-returning INIT / NMI-driven PLAY path). Drained by the CPU
+    /// on the next `step`.
+    pub nmi_pending: bool,
 }
 
 impl Default for NesBus {
@@ -102,7 +226,67 @@ impl NesBus {
             bankswitched: false,
             fds_enabled: false,
             fds_ram: Vec::new(),
+            nsf2_timer: Nsf2IrqTimer::new(),
+            vector_overlay_active: false,
+            vector_overlay: [0u8; 6],
+            nmi_pending: false,
         }
+    }
+
+    /// Arm the NSF2 vector overlay at `$FFFA..=$FFFF`. The IRQ vector
+    /// at `$FFFE..=$FFFF` is preloaded from whatever the underlying
+    /// memory map returns (per spec — "before INIT the host system
+    /// should initialize the IRQ vector RAM with the starting contents
+    /// of $FFFE-$FFFF"). NMI / Reset are reserved to the player and
+    /// initialised to a sentinel that lands inside our stop window.
+    pub fn arm_vector_overlay(&mut self, nmi_handler: u16, reset_handler: u16) {
+        // Preload the IRQ vector from whatever the underlying ROM
+        // already had at $FFFE/$FFFF.
+        let lo = self.read_raw_vector(0xFFFE);
+        let hi = self.read_raw_vector(0xFFFF);
+        self.vector_overlay[0] = nmi_handler as u8;
+        self.vector_overlay[1] = (nmi_handler >> 8) as u8;
+        self.vector_overlay[2] = reset_handler as u8;
+        self.vector_overlay[3] = (reset_handler >> 8) as u8;
+        self.vector_overlay[4] = lo;
+        self.vector_overlay[5] = hi;
+        self.vector_overlay_active = true;
+    }
+
+    fn read_raw_vector(&self, addr: u16) -> u8 {
+        // Use the ROM / bank-resolved value directly — bypasses the
+        // overlay so we can snapshot the "starting contents" cleanly.
+        match addr {
+            0x8000..=0xFFFF => {
+                if self.bankswitched {
+                    self.bank_read(addr)
+                } else {
+                    self.prg[(addr - 0x8000) as usize]
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Request an NMI on the next CPU step. Used by the NSF2
+    /// non-returning-INIT path: the player schedules an NMI at the
+    /// PLAY period; the NMI wrapper runs PLAY and RTI's back to INIT.
+    pub fn request_nmi(&mut self) {
+        self.nmi_pending = true;
+    }
+
+    /// Drain a pending NMI request (true exactly once per request).
+    pub fn take_nmi(&mut self) -> bool {
+        let p = self.nmi_pending;
+        self.nmi_pending = false;
+        p
+    }
+
+    /// True iff the bus is asserting the CPU's IRQ line. NSF2 timer
+    /// is currently the only source; APU/Frame-counter IRQs are not
+    /// wired into the player loop.
+    pub fn irq_line(&self) -> bool {
+        self.nsf2_timer.irq_line()
     }
 
     /// Configure the bus from the parsed NSF header. This sets up the
@@ -122,6 +306,12 @@ impl NesBus {
             self.bankswitched = false;
             self.load_program(header.load_addr, &header.program);
         }
+
+        // NSF2: arm IRQ timer + vector overlay if the feature byte
+        // requests it. The player layer drives `arm_vector_overlay`
+        // with concrete sentinel addresses; we just gate the
+        // timer-device address decode here.
+        self.nsf2_timer.enabled = header.nsf2.irq_support();
     }
 
     /// Build the 4 KiB-bank pool out of the NSF program blob. Per the
@@ -207,9 +397,21 @@ impl NesBus {
             0x4000..=0x4014 => 0xFF,
             0x4015 => self.apu.read_status(),
             0x4016 | 0x4017 => 0xFF,
+            // NSF2 IRQ-timer reads ($401B-$401D). Fall through to the
+            // expansion-chip read window if the timer is disabled.
+            0x401B..=0x401D => {
+                if let Some(v) = self.nsf2_timer.read(addr) {
+                    v
+                } else {
+                    self.apu.read_expansion(addr)
+                }
+            }
             // 5B / N163 / MMC5 status reads land here.
             0x4018..=0x5FFF => self.apu.read_expansion(addr),
             0x6000..=0x7FFF => self.cart_ram[(addr - 0x6000) as usize],
+            0xFFFA..=0xFFFF if self.vector_overlay_active => {
+                self.vector_overlay[(addr - 0xFFFA) as usize]
+            }
             0x8000..=0xFFFF => {
                 if self.bankswitched {
                     self.bank_read(addr)
@@ -229,6 +431,16 @@ impl NesBus {
             0x4015 => self.apu.write_status(value),
             0x4016 => {}
             0x4017 => self.apu.write_frame_counter(value),
+            // NSF2 IRQ-timer writes. When disabled, fall through to
+            // the expansion-chip router (preserves prior $401B-$401D
+            // open-bus semantics for v1 / non-IRQ NSF2 files).
+            0x401B..=0x401D => {
+                if self.nsf2_timer.enabled {
+                    self.nsf2_timer.write(addr, value);
+                } else {
+                    self.apu.write_expansion(addr, value);
+                }
+            }
             // NSF bank-select registers + expansion-chip writes.
             0x5FF6 | 0x5FF7 if self.fds_enabled => {
                 // FDS bank-select for the `$6000..=$7FFF` region: copy
@@ -251,6 +463,15 @@ impl NesBus {
             }
             0x4018..=0x5FF7 => self.apu.write_expansion(addr, value),
             0x6000..=0x7FFF => self.cart_ram[(addr - 0x6000) as usize] = value,
+            0xFFFE..=0xFFFF if self.vector_overlay_active => {
+                // NSF program installing its own IRQ vector. NMI /
+                // Reset slots (`$FFFA-$FFFD`) are reserved to the
+                // player per spec and ignore writes.
+                self.vector_overlay[(addr - 0xFFFA) as usize] = value;
+                if self.fds_enabled {
+                    self.fds_ram[(addr - 0x8000) as usize] = value;
+                }
+            }
             0x8000..=0xFFFF => {
                 // FDS treats this region as RAM; expansion chips like
                 // VRC6 / VRC7 / MMC5 / N163 / 5B map their registers in
@@ -278,6 +499,7 @@ impl NesBus {
         while remaining > 0 {
             let n = remaining.min(CHUNK);
             self.apu.tick_cpu_cycles(n);
+            self.nsf2_timer.tick(n);
             // Drain pending DMC fetches.
             while let Some(addr) = self.apu.dmc_pending_fetch() {
                 let byte = self.read(addr);
@@ -312,6 +534,8 @@ mod tests {
             program: prog,
             track_labels: Vec::new(),
             is_nsfe: false,
+            nsf2: crate::header::Nsf2Features(0),
+            nsf2_metadata: Vec::new(),
         }
     }
 
@@ -357,6 +581,102 @@ mod tests {
         // Plain ROM: writes silently dropped; read still returns ROM.
         bus.write(0x8000, 0xFF);
         assert_eq!(bus.read(0x8000), 0x55);
+    }
+
+    #[test]
+    fn nsf2_irq_timer_fires_after_n_plus_one_cycles() {
+        let mut t = Nsf2IrqTimer::new();
+        t.enabled = true;
+        // Reload = 3 → period 4 cycles per spec.
+        t.write(0x401B, 0x03);
+        t.write(0x401C, 0x00);
+        t.write(0x401D, 0x01); // activate
+        t.counter = t.reload as i32;
+        assert!(!t.irq_line());
+        t.tick(4); // exactly N+1 cycles → first underflow at cycle 4
+        assert!(t.irq_line(), "timer should assert IRQ after N+1 cycles");
+        // Reading $401D acknowledges.
+        let v = t.read(0x401D).unwrap();
+        assert_eq!(v & 0x80, 0x80, "bit7 should reflect the pending IRQ");
+        assert_eq!(v & 0x01, 0x01, "bit0 should reflect active status");
+        assert!(!t.irq_line(), "read of $401D should clear the IRQ flag");
+    }
+
+    #[test]
+    fn nsf2_irq_timer_inactive_holds_counter_at_reload() {
+        let mut t = Nsf2IrqTimer::new();
+        t.enabled = true;
+        t.write(0x401B, 0x10);
+        t.write(0x401C, 0x00);
+        // Activate then deactivate to set the counter.
+        t.write(0x401D, 0x01);
+        t.write(0x401D, 0x00);
+        t.tick(1000);
+        assert_eq!(t.counter, 0x10);
+        assert!(!t.irq_line());
+    }
+
+    #[test]
+    fn nsf2_irq_timer_disabled_when_gate_off() {
+        let mut t = Nsf2IrqTimer::new();
+        // Don't set enabled.
+        t.write(0x401B, 0xFF);
+        t.write(0x401D, 0x01);
+        t.tick(10);
+        assert!(!t.irq_line());
+        assert_eq!(t.read(0x401D), None);
+    }
+
+    #[test]
+    fn vector_overlay_intercepts_ffff_reads_and_writes() {
+        let mut bus = NesBus::new();
+        // Fill PRG with 0xAA so the IRQ vector preload is observable.
+        let prog = vec![0xAAu8; PRG_ROM_SIZE];
+        let h = fake_header(0x8000, prog, [0u8; 8]);
+        bus.configure_from_header(&h);
+        bus.arm_vector_overlay(0x4FFE, 0x4FFE);
+        // Reset & NMI slots preloaded from arm_vector_overlay.
+        assert_eq!(bus.read(0xFFFA), 0xFE);
+        assert_eq!(bus.read(0xFFFB), 0x4F);
+        assert_eq!(bus.read(0xFFFC), 0xFE);
+        assert_eq!(bus.read(0xFFFD), 0x4F);
+        // IRQ slot preloaded from the underlying ROM (0xAA padding).
+        assert_eq!(bus.read(0xFFFE), 0xAA);
+        // NSF program writes its own IRQ handler.
+        bus.write(0xFFFE, 0x34);
+        bus.write(0xFFFF, 0x12);
+        assert_eq!(bus.read(0xFFFE), 0x34);
+        assert_eq!(bus.read(0xFFFF), 0x12);
+    }
+
+    #[test]
+    fn vector_overlay_dropped_when_inactive() {
+        let mut bus = NesBus::new();
+        let prog = vec![0xCDu8; PRG_ROM_SIZE];
+        let h = fake_header(0x8000, prog, [0u8; 8]);
+        bus.configure_from_header(&h);
+        // No arm_vector_overlay call: reads pass through to the ROM.
+        assert_eq!(bus.read(0xFFFE), 0xCD);
+        // Writes also dropped — ROM stays put.
+        bus.write(0xFFFE, 0x77);
+        assert_eq!(bus.read(0xFFFE), 0xCD);
+    }
+
+    #[test]
+    fn nsf2_irq_timer_routed_through_bus_when_enabled() {
+        let mut bus = NesBus::new();
+        let mut h = fake_header(0x8000, vec![0x60], [0u8; 8]);
+        h.nsf2 = crate::header::Nsf2Features(0x10); // IRQ support
+        bus.configure_from_header(&h);
+        bus.write(0x401B, 5);
+        bus.write(0x401C, 0);
+        bus.write(0x401D, 1);
+        assert!(!bus.irq_line());
+        bus.tick_cycles(6); // 5 + 1 = N+1 → first underflow
+        assert!(bus.irq_line(), "bus should expose timer-driven IRQ line");
+        // $401D read acknowledges.
+        let _ = bus.read(0x401D);
+        assert!(!bus.irq_line());
     }
 
     #[test]

@@ -23,7 +23,7 @@ mod registry;
 pub use apu::Apu2A03;
 pub use bus::NesBus;
 pub use cpu::Cpu6502;
-pub use header::{parse_nsf, ExpansionChips, NsfError, NsfHeader, NsfRegion};
+pub use header::{parse_nsf, ExpansionChips, Nsf2Features, NsfError, NsfHeader, NsfRegion};
 pub use player::NsfPlayer;
 
 #[cfg(feature = "registry")]

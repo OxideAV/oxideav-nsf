@@ -10,6 +10,30 @@
 //!    player runs CPU cycles at a target NES clock rate, calls the
 //!    `play` routine once per `play_period_us`, and resamples the APU
 //!    output to the requested sample rate.
+//!
+//! ## NSF2 playback paradigms
+//!
+//! Per `docs/audio/nsf/nsf2-nesdev-wiki.html`:
+//!
+//! * **IRQ support** (`$7C` bit 4) — the NSF2 IRQ timer device at
+//!   `$401B/$401C/$401D` may assert the CPU IRQ line; the program owns
+//!   the IRQ vector at `$FFFE/$FFFF`. The bus arms the timer + vector
+//!   overlay; the CPU services `irq()` when the I flag is clear.
+//! * **Non-returning INIT** (`$7C` bit 5) — INIT is called twice. The
+//!   first call (Y=$80) must return. After that the player enables
+//!   NMI and calls INIT again with Y=$81; this call may run forever.
+//!   PLAY is then driven from an NMI wrapper that preserves A/X/Y and
+//!   ends with RTI back into the still-running INIT.
+//! * **Suppressed PLAY** (`$7C` bit 6) — PLAY is never invoked.
+//!   Combine with non-returning INIT to let INIT control output
+//!   without periodic interruption.
+//!
+//! Implementation: the player installs a small NMI wrapper in RAM at
+//! [`NMI_WRAPPER_ADDR`] (`$0200`) that does
+//! `PHA / TXA / PHA / TYA / PHA / JSR play_addr / PLA / TAY / PLA / TAX
+//! / PLA / RTI` and arms the bus's vector overlay so `$FFFA-$FFFB`
+//! points at it. The PLAY-period scheduler then calls
+//! [`crate::bus::NesBus::request_nmi`] every `play_period_cycles`.
 
 use crate::bus::NesBus;
 use crate::cpu::Cpu6502;
@@ -29,6 +53,11 @@ const STOP_SENTINEL: u16 = 0x4FFF;
 /// `play` invocation. NSF rips that get stuck (or never RTS) would
 /// otherwise hang the player indefinitely.
 const MAX_CYCLES_PER_CALL: u32 = 1_000_000;
+
+/// Where the NSF2 NMI wrapper lives in NES RAM (page 2 — safely below
+/// the cart-RAM region and clear of the zero-page / stack / NSF state
+/// that the music driver typically uses).
+pub const NMI_WRAPPER_ADDR: u16 = 0x0200;
 
 /// Player state machine.
 pub struct NsfPlayer {
@@ -50,6 +79,11 @@ pub struct NsfPlayer {
     song: u8,
     /// True after [`NsfPlayer::start_song`] succeeded.
     started: bool,
+    /// NSF2 non-returning INIT in effect — PLAY is delivered via NMI
+    /// instead of a JSR off the stop-sentinel.
+    nsf2_nmi_play: bool,
+    /// NSF2 suppressed-PLAY bit — never invoke the play routine.
+    nsf2_suppress_play: bool,
 }
 
 impl NsfPlayer {
@@ -77,6 +111,9 @@ impl NsfPlayer {
         };
         let play_period_cycles = ((play_us_eff as u64 * cpu_hz as u64) / 1_000_000) as u32;
 
+        let nsf2_nmi_play = header.nsf2.non_returning_init();
+        let nsf2_suppress_play = header.nsf2.suppressed_play();
+
         Self {
             cpu: Cpu6502::new(),
             bus,
@@ -89,30 +126,108 @@ impl NsfPlayer {
             sample_acc: 0.0,
             song: 0,
             started: false,
+            nsf2_nmi_play,
+            nsf2_suppress_play,
         }
+    }
+
+    /// Install the NSF2 NMI wrapper at [`NMI_WRAPPER_ADDR`] and arm
+    /// the bus's vector overlay. The wrapper runs at `$0200` and is
+    ///
+    /// ```text
+    ///   PHA TXA PHA TYA PHA          ; preserve A / X / Y (3 cycles each)
+    ///   JSR play_addr                ; PLAY may RTS naturally
+    ///   PLA TAY PLA TAX PLA          ; restore Y / X / A
+    ///   RTI                          ; return into the still-running INIT
+    /// ```
+    fn install_nmi_wrapper(&mut self) {
+        let play = self.header.play_addr;
+        let lo = play as u8;
+        let hi = (play >> 8) as u8;
+        let wrapper: [u8; 14] = [
+            0x48, // PHA
+            0x8A, // TXA
+            0x48, // PHA
+            0x98, // TYA
+            0x48, // PHA
+            0x20, lo, hi,   // JSR play_addr
+            0x68, // PLA
+            0xA8, // TAY
+            0x68, // PLA
+            0xAA, // TAX
+            0x68, // PLA
+            0x40, // RTI
+        ];
+        // bus.ram is 2KiB; $0200 maps to offset 0x0200.
+        for (i, b) in wrapper.iter().enumerate() {
+            self.bus.ram[NMI_WRAPPER_ADDR as usize + i] = *b;
+        }
+        // Vector overlay: NMI → NMI_WRAPPER_ADDR, Reset → stop sentinel
+        // (we never reset mid-playback). IRQ slot starts wherever the
+        // underlying ROM said it should — the NSF program will
+        // overwrite if needed.
+        self.bus.arm_vector_overlay(NMI_WRAPPER_ADDR, STOP_SENTINEL);
     }
 
     /// Choose `song` (1-based) and run its `init` routine to completion.
     pub fn start_song(&mut self, song: u8) {
         self.song = song;
-        self.cpu.a = song.saturating_sub(1);
-        self.cpu.x = match self.header.region {
+        let a = song.saturating_sub(1);
+        let x = match self.header.region {
             NsfRegion::Pal => 1,
             _ => 0,
         };
-        self.cpu.y = 0;
+
+        // NSF2 vector-overlay paradigms need the wrapper installed
+        // BEFORE the first INIT call so the program can poke its IRQ
+        // vector at $FFFE during INIT. Plain NSF v1 / NSF2-without-
+        // overlay just runs INIT directly.
+        if self.header.nsf2.needs_vector_overlay() {
+            self.install_nmi_wrapper();
+        }
+
+        // First-phase INIT. For NSF2 non-returning-INIT this is the
+        // "Y = $80" pre-pass that MUST return (spec).
+        let y_first = if self.nsf2_nmi_play { 0x80 } else { 0x00 };
+        self.invoke_init(a, x, y_first);
+
+        if self.nsf2_nmi_play {
+            // Second-phase INIT: Y = $81. Runs indefinitely; PLAY
+            // arrives as NMI. We push the same stop-sentinel so that
+            // *if* the program does happen to RTS the fallback infinite
+            // loop is our stop window (spec: "The second INIT is
+            // allowed to return, in which case the player should fall
+            // back to its own infinite loop").
+            let ret_minus1 = STOP_SENTINEL.wrapping_sub(1);
+            self.cpu.push_word_pub(&mut self.bus, ret_minus1);
+            self.cpu.a = a;
+            self.cpu.x = x;
+            self.cpu.y = 0x81;
+            self.cpu.pc = self.header.init_addr;
+            // We do NOT run-to-stop here: the second INIT may never
+            // return. The render loop will tick it cycle-by-cycle and
+            // schedule NMIs at the PLAY period.
+        }
+
+        self.started = true;
+        self.cycles_since_play = 0;
+        self.sample_acc = 0.0;
+    }
+
+    /// Push the stop sentinel, seed registers, and jump to INIT.
+    /// Run-to-stop is appropriate for any INIT call that must return
+    /// (v1 INIT, NSF2 first-phase Y=$80 INIT).
+    fn invoke_init(&mut self, a: u8, x: u8, y: u8) {
+        self.cpu.a = a;
+        self.cpu.x = x;
+        self.cpu.y = y;
         self.cpu.sp = 0xFD;
         self.cpu.p = 0x24; // I + U set
         self.cpu.halted = false;
-        // Push the sentinel return address so the init's RTS lands in
-        // our stop window.
         let ret_minus1 = STOP_SENTINEL.wrapping_sub(1);
         self.cpu.push_word_pub(&mut self.bus, ret_minus1);
         self.cpu.pc = self.header.init_addr;
         self.run_until_stop();
-        self.started = true;
-        self.cycles_since_play = 0;
-        self.sample_acc = 0.0;
     }
 
     /// Run the CPU until PC reaches the stop-sentinel window, the CPU
@@ -144,29 +259,48 @@ impl NsfPlayer {
         let mut spent = 0u32;
         let mut cpu_steps_this_sample = 0u32;
         while spent < target {
+            // Schedule the next PLAY/NMI event when its period elapses.
+            if !self.nsf2_suppress_play && self.cycles_since_play >= self.play_period_cycles {
+                self.cycles_since_play -= self.play_period_cycles;
+                if self.nsf2_nmi_play {
+                    // NMI wrapper runs PLAY and RTI's back to INIT.
+                    self.bus.request_nmi();
+                } else if self.cpu.pc == STOP_SENTINEL {
+                    // Classic JSR path: only re-arm PLAY when the
+                    // previous one has finished (PC parked at sentinel).
+                    self.invoke_play();
+                }
+                continue;
+            }
+
             // If we're idling at the sentinel and not yet ready for the
             // next play, just tick the APU clock — don't execute the
-            // open-bus garbage at $4FFF.
-            if self.cpu.pc == STOP_SENTINEL {
-                if self.cycles_since_play >= self.play_period_cycles {
-                    self.cycles_since_play -= self.play_period_cycles;
-                    self.invoke_play();
-                    continue;
-                }
-                let need = self
-                    .play_period_cycles
-                    .saturating_sub(self.cycles_since_play);
+            // open-bus garbage at $4FFF. EXCEPT: when the bus is
+            // asserting an IRQ (NSF2 timer device) we still need to
+            // step the CPU so it vectors through $FFFE.
+            if self.cpu.pc == STOP_SENTINEL
+                && !self.nsf2_nmi_play
+                && !self.bus.irq_line()
+                && !self.bus.nmi_pending
+            {
                 let leftover = target.saturating_sub(spent);
-                let chunk = need.min(leftover).max(1);
+                let need = if self.nsf2_suppress_play {
+                    leftover
+                } else {
+                    self.play_period_cycles
+                        .saturating_sub(self.cycles_since_play)
+                        .min(leftover)
+                };
+                let chunk = need.max(1);
                 self.bus.tick_cycles(chunk);
                 self.cycles_since_play = self.cycles_since_play.saturating_add(chunk);
                 spent = spent.saturating_add(chunk);
                 continue;
             }
 
-            // Inside an init / play subroutine: step the CPU. Cap the
-            // total steps so a runaway routine cannot freeze the
-            // sample loop.
+            // Inside an init / play subroutine (or the non-returning
+            // INIT body): step the CPU. Cap the total steps so a
+            // runaway routine cannot freeze the sample loop.
             let cy = self.cpu.step(&mut self.bus);
             spent = spent.saturating_add(cy);
             self.cycles_since_play = self.cycles_since_play.saturating_add(cy);
@@ -291,5 +425,137 @@ mod tests {
         let expected = ((16666u64 * 1_789_773) / 1_000_000) as u32;
         assert_eq!(player.play_period_cycles, expected);
         player.start_song(1);
+    }
+
+    /// Build an NSF2 file with the requested feature byte. Program is
+    /// always a stub: INIT increments `$00`, returns on Y=$80, then
+    /// loops on Y=$81. PLAY toggles `$01`. INIT_ADDR=$8000, PLAY=$8050.
+    fn fake_nsf2(features: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 0x80];
+        buf[..5].copy_from_slice(&crate::header::NSF_MAGIC);
+        buf[0x05] = 2;
+        buf[0x06] = 1;
+        buf[0x07] = 1;
+        buf[0x08..0x0a].copy_from_slice(&0x8000u16.to_le_bytes());
+        buf[0x0a..0x0c].copy_from_slice(&0x8000u16.to_le_bytes()); // init
+        buf[0x0c..0x0e].copy_from_slice(&0x8050u16.to_le_bytes()); // play
+        buf[0x6e..0x70].copy_from_slice(&16666u16.to_le_bytes());
+        buf[0x7c] = features;
+
+        // INIT at $8000:
+        //   E6 00       INC $00            ; bump init-call counter
+        //   C0 81       CPY #$81
+        //   F0 01       BEQ +1 → JMP at $8007 (skip the RTS)
+        //   60          RTS                ; Y != $81 → return
+        // loop ($8007):
+        //   4C 07 80    JMP loop
+        let init = [
+            0xE6, 0x00, // INC $00
+            0xC0, 0x81, // CPY #$81
+            0xF0, 0x01, // BEQ +1 → land at $8007 (JMP)
+            0x60, // RTS at $8006
+            0x4C, 0x07, 0x80, // JMP $8007 (spin) at $8007..=$8009
+        ];
+
+        // PLAY at $8050:
+        //   E6 01       INC $01            ; bump play-call counter
+        //   60          RTS
+        let play_at = 0x50usize;
+        let play = [0xE6, 0x01, 0x60];
+
+        let mut prog = vec![0xEAu8; play_at + play.len()];
+        prog[..init.len()].copy_from_slice(&init);
+        prog[play_at..play_at + play.len()].copy_from_slice(&play);
+
+        buf.extend_from_slice(&prog);
+        buf
+    }
+
+    #[test]
+    fn nsf2_non_returning_init_runs_init_twice_with_correct_y() {
+        let bytes = fake_nsf2(0x20); // non-returning INIT, no IRQ, no suppress
+        let header = parse_nsf(&bytes).unwrap();
+        assert!(header.nsf2.non_returning_init());
+        let mut player = NsfPlayer::new(header, 44_100);
+        player.start_song(1);
+        // After start_song the first-phase INIT has completed (Y=$80
+        // returning path) → `$00` = 1. The second-phase INIT (Y=$81)
+        // is staged but not yet stepped; render a few samples to let
+        // its `INC $00` execute (it will then enter the spin loop).
+        assert_eq!(player.bus.ram[0x00], 1);
+        let mut buf = vec![0i16; 512];
+        let _ = player.render(&mut buf);
+        assert_eq!(
+            player.bus.ram[0x00], 2,
+            "INIT must be called twice for non-returning paradigm"
+        );
+        // After the second INIT the CPU spins inside $8007..$800A.
+        assert!(
+            player.cpu.pc >= 0x8007 && player.cpu.pc <= 0x800A,
+            "second INIT should be spinning, got PC = ${:04X}",
+            player.cpu.pc
+        );
+    }
+
+    #[test]
+    fn nsf2_non_returning_init_drives_play_via_nmi() {
+        let bytes = fake_nsf2(0x20);
+        let header = parse_nsf(&bytes).unwrap();
+        let mut player = NsfPlayer::new(header, 44_100);
+        player.start_song(1);
+        let mut buf = vec![0i16; 8192]; // ~186 ms at 44.1 kHz
+        let _ = player.render(&mut buf);
+        let play_calls = player.bus.ram[0x01];
+        // 186 ms at 60 Hz → ~11 play calls expected. Tolerate jitter.
+        assert!(
+            play_calls >= 5,
+            "expected several NMI-driven PLAYs, got {play_calls}"
+        );
+    }
+
+    #[test]
+    fn nsf2_suppressed_play_skips_play_entirely() {
+        let bytes = fake_nsf2(0x20 | 0x40); // non-returning INIT + suppress PLAY
+        let header = parse_nsf(&bytes).unwrap();
+        let mut player = NsfPlayer::new(header, 44_100);
+        player.start_song(1);
+        let mut buf = vec![0i16; 8192];
+        let _ = player.render(&mut buf);
+        assert_eq!(
+            player.bus.ram[0x01], 0,
+            "suppressed PLAY must never invoke the play routine"
+        );
+    }
+
+    #[test]
+    fn nsf2_irq_feature_arms_timer_device() {
+        let bytes = fake_nsf2(0x10); // IRQ support only
+        let header = parse_nsf(&bytes).unwrap();
+        let mut player = NsfPlayer::new(header, 44_100);
+        player.start_song(1);
+        assert!(
+            player.bus.nsf2_timer.enabled,
+            "NSF2 IRQ feature must enable the timer device"
+        );
+        // Vector overlay should be armed.
+        assert!(player.bus.vector_overlay_active);
+        // NMI wrapper installed.
+        assert_eq!(
+            player.bus.ram[NMI_WRAPPER_ADDR as usize], 0x48,
+            "NMI wrapper should start with PHA ($48)"
+        );
+    }
+
+    #[test]
+    fn v1_player_does_not_arm_vector_overlay() {
+        let (hdr_bytes, prog) = _tiny_test_program();
+        let mut whole = hdr_bytes.to_vec();
+        whole.extend_from_slice(&prog);
+        let header = parse_nsf(&whole).unwrap();
+        assert!(!header.nsf2.needs_vector_overlay());
+        let mut player = NsfPlayer::new(header, 44_100);
+        player.start_song(1);
+        assert!(!player.bus.vector_overlay_active);
+        assert!(!player.bus.nsf2_timer.enabled);
     }
 }

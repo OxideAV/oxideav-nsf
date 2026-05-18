@@ -1,14 +1,30 @@
-//! NSF / NSFe header parser.
+//! NSF / NSFe / NSF2 header parser.
 //!
-//! Two on-disk shapes are accepted:
+//! Three on-disk shapes are accepted:
 //!
 //! * **NSF v1.x** — magic `b"NESM\x1a"`, fixed 128-byte header, then the
 //!   raw 6502 code blob loaded at `load_addr`.
+//! * **NSF v2** — same 128-byte header, version byte `0x02`. Repurposes
+//!   the previously-reserved byte `$7C` as a feature-flag bitfield
+//!   (IRQ support, non-returning INIT, suppressed PLAY, mandatory
+//!   metadata) and bytes `$7D-$7F` as a 24-bit little-endian length
+//!   of the program data — when non-zero, NSFe-style metadata chunks
+//!   are appended after the program (without the outer `NSFE` fourCC
+//!   and with no `INFO` / `DATA` / `BANK` / `NSF2` chunks).
 //! * **NSFe** — magic `b"NSFE"`, then a chain of 4-byte-length /
 //!   4-byte-fourCC / payload chunks. `INFO` and `DATA` are required;
 //!   `auth` (author / title / copyright / ripper), `tlbl` (per-track
 //!   labels) and many optional chunks may follow. Unknown chunks whose
 //!   first letter is uppercase are treated as mandatory and rejected.
+//!
+//! References (read-only):
+//!
+//! * `docs/audio/nsf/nsf-nesdev-wiki.html` (v1 layout).
+//! * `docs/audio/nsf/nsf-wiki-source.md` (wikitext reproduction).
+//! * `docs/audio/nsf/nsf2-nesdev-wiki.html` (v2 + feature-byte $7C +
+//!   24-bit data length + embedded metadata rules).
+//! * `docs/audio/nsf/nsfe-nesdev-wiki.html` (chunk format reused by
+//!   NSF2 metadata).
 
 use core::fmt;
 
@@ -66,6 +82,45 @@ impl ExpansionChips {
     pub fn s5b(self) -> bool {
         self.0 & 0x20 != 0
     }
+    /// NSF2 added a 7th expansion-chip flag for VT02+ audio (bit 6).
+    /// Untested on real hardware; surfaced so callers can detect it.
+    pub fn vt02(self) -> bool {
+        self.0 & 0x40 != 0
+    }
+}
+
+/// NSF2 feature-flag byte at offset `$7C`. Bits per
+/// `docs/audio/nsf/nsf2-nesdev-wiki.html`:
+///
+/// * bits 0..=3: reserved, must be 0.
+/// * bit 4: IRQ support (`$401B/C/D` timer + vector overlay).
+/// * bit 5: non-returning INIT (two-phase INIT + NMI-driven PLAY).
+/// * bit 6: suppressed PLAY (PLAY subroutine will never be called).
+/// * bit 7: appended NSFe metadata is mandatory (chunk-name-uppercase
+///   semantics — player must succeed at parsing).
+///
+/// On v1 files this byte MUST be ignored per the spec.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Nsf2Features(pub u8);
+
+impl Nsf2Features {
+    pub fn irq_support(self) -> bool {
+        self.0 & 0x10 != 0
+    }
+    pub fn non_returning_init(self) -> bool {
+        self.0 & 0x20 != 0
+    }
+    pub fn suppressed_play(self) -> bool {
+        self.0 & 0x40 != 0
+    }
+    pub fn mandatory_metadata(self) -> bool {
+        self.0 & 0x80 != 0
+    }
+    /// True iff a `$FFFA-$FFFF` vector overlay is required by the
+    /// player (IRQ or non-returning INIT feature is set).
+    pub fn needs_vector_overlay(self) -> bool {
+        self.irq_support() || self.non_returning_init()
+    }
 }
 
 /// Parsed NSF header + the raw program data tail.
@@ -88,6 +143,14 @@ pub struct NsfHeader {
     pub program: Vec<u8>,
     pub track_labels: Vec<String>,
     pub is_nsfe: bool,
+    /// NSF2 feature byte. Always `Nsf2Features(0)` on v1 files (the
+    /// spec says callers MUST ignore byte `$7C` when `version == 1`).
+    pub nsf2: Nsf2Features,
+    /// Raw NSFe-format metadata appended after the program (NSF2 only,
+    /// when bytes `$7D-$7F` are non-zero). Empty on v1 / NSFe inputs.
+    /// Stored verbatim; per spec it never starts with an `NSFE` fourCC
+    /// and never contains `INFO` / `DATA` / `BANK` / `NSF2` chunks.
+    pub nsf2_metadata: Vec<u8>,
 }
 
 impl NsfHeader {
@@ -115,7 +178,10 @@ impl NsfHeader {
 /// Failures from the on-disk header parser.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NsfError {
-    TooShort { needed: usize, got: usize },
+    TooShort {
+        needed: usize,
+        got: usize,
+    },
     BadMagic,
     BadVersion(u8),
     NoSongs,
@@ -123,6 +189,12 @@ pub enum NsfError {
     NsfeChunkOverflow,
     NsfeMissingRequired(&'static str),
     NsfeUnknownMandatory([u8; 4]),
+    /// NSF2 declared a 24-bit data length at `$7D-$7F` that runs past
+    /// the end of the file.
+    Nsf2DataLengthOverflow {
+        declared: usize,
+        available: usize,
+    },
 }
 
 impl fmt::Display for NsfError {
@@ -141,6 +213,13 @@ impl fmt::Display for NsfError {
                 f,
                 "NSFe: unknown mandatory chunk {:?}",
                 core::str::from_utf8(fcc).unwrap_or("????")
+            ),
+            NsfError::Nsf2DataLengthOverflow {
+                declared,
+                available,
+            } => write!(
+                f,
+                "NSF2: declared data length {declared} overflows available program bytes {available}"
             ),
         }
     }
@@ -187,7 +266,39 @@ fn parse_nsf_v1(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
     let pal_speed_us = u16::from_le_bytes([bytes[0x78], bytes[0x79]]);
     let region = NsfRegion::from_byte(bytes[0x7a]);
     let expansion = ExpansionChips(bytes[0x7b]);
-    let program = bytes[NSF_HEADER_LEN..].to_vec();
+
+    // Byte $7C: NSF2 feature flags. Per spec the byte MUST be ignored
+    // when version < 2 — this hands back `Nsf2Features(0)` so callers
+    // never accidentally honour stale data in a v1 file.
+    let nsf2 = if version >= 2 {
+        Nsf2Features(bytes[0x7c])
+    } else {
+        Nsf2Features(0)
+    };
+
+    // Bytes $7D-$7F: 24-bit little-endian length of program data.
+    // Defined for both v1 and v2; on v1 it merely allows the file to
+    // be padded with metadata that older players treat as ROM. On v2
+    // a non-zero length means appended NSFe-style metadata follows the
+    // program block.
+    let raw_tail = &bytes[NSF_HEADER_LEN..];
+    let declared_len =
+        (bytes[0x7d] as usize) | ((bytes[0x7e] as usize) << 8) | ((bytes[0x7f] as usize) << 16);
+
+    let (program, nsf2_metadata) = if declared_len == 0 {
+        (raw_tail.to_vec(), Vec::new())
+    } else {
+        if declared_len > raw_tail.len() {
+            return Err(NsfError::Nsf2DataLengthOverflow {
+                declared: declared_len,
+                available: raw_tail.len(),
+            });
+        }
+        (
+            raw_tail[..declared_len].to_vec(),
+            raw_tail[declared_len..].to_vec(),
+        )
+    };
 
     Ok(NsfHeader {
         version,
@@ -207,6 +318,8 @@ fn parse_nsf_v1(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         program,
         track_labels: Vec::new(),
         is_nsfe: false,
+        nsf2,
+        nsf2_metadata,
     })
 }
 
@@ -288,6 +401,8 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         program,
         track_labels,
         is_nsfe: true,
+        nsf2: Nsf2Features(0),
+        nsf2_metadata: Vec::new(),
     })
 }
 
@@ -442,5 +557,96 @@ mod tests {
         out.extend_from_slice(b"ZZZZ");
         let err = parse_nsf(&out).unwrap_err();
         assert!(matches!(err, NsfError::NsfeUnknownMandatory(_)));
+    }
+
+    fn fake_v2(feature_byte: u8, program: &[u8], appended_metadata: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; NSF_HEADER_LEN];
+        buf[..5].copy_from_slice(&NSF_MAGIC);
+        buf[0x05] = 2;
+        buf[0x06] = 1;
+        buf[0x07] = 1;
+        buf[0x08..0x0a].copy_from_slice(&0x8000u16.to_le_bytes());
+        buf[0x0a..0x0c].copy_from_slice(&0x8000u16.to_le_bytes());
+        buf[0x0c..0x0e].copy_from_slice(&0x8003u16.to_le_bytes());
+        buf[0x6e..0x70].copy_from_slice(&16666u16.to_le_bytes());
+        buf[0x78..0x7a].copy_from_slice(&19997u16.to_le_bytes());
+        buf[0x7b] = 0;
+        buf[0x7c] = feature_byte;
+        let len = if appended_metadata.is_empty() {
+            0
+        } else {
+            program.len()
+        };
+        buf[0x7d] = (len & 0xFF) as u8;
+        buf[0x7e] = ((len >> 8) & 0xFF) as u8;
+        buf[0x7f] = ((len >> 16) & 0xFF) as u8;
+        buf.extend_from_slice(program);
+        buf.extend_from_slice(appended_metadata);
+        buf
+    }
+
+    #[test]
+    fn parses_nsf2_feature_byte() {
+        // bits 4 (IRQ) + 5 (non-returning init) + 6 (suppressed play).
+        let bytes = fake_v2(0x10 | 0x20 | 0x40, &[0xea, 0x60], &[]);
+        let h = parse_nsf(&bytes).unwrap();
+        assert_eq!(h.version, 2);
+        assert!(h.nsf2.irq_support());
+        assert!(h.nsf2.non_returning_init());
+        assert!(h.nsf2.suppressed_play());
+        assert!(!h.nsf2.mandatory_metadata());
+        assert!(h.nsf2.needs_vector_overlay());
+        assert!(h.nsf2_metadata.is_empty());
+        assert_eq!(h.program, vec![0xea, 0x60]);
+    }
+
+    #[test]
+    fn v1_ignores_byte_7c_per_spec() {
+        let mut buf = fake_v1();
+        // Even with the byte set, v1 must surface Nsf2Features(0).
+        buf[0x7c] = 0xFF;
+        let h = parse_nsf(&buf).unwrap();
+        assert_eq!(h.nsf2, Nsf2Features(0));
+    }
+
+    #[test]
+    fn nsf2_splits_program_from_appended_metadata() {
+        let program: Vec<u8> = (0..16).collect();
+        let metadata: Vec<u8> = b"\x00\x00\x00\x00NEND".to_vec();
+        let bytes = fake_v2(0x00, &program, &metadata);
+        let h = parse_nsf(&bytes).unwrap();
+        assert_eq!(h.program, program);
+        assert_eq!(h.nsf2_metadata, metadata);
+    }
+
+    #[test]
+    fn nsf2_rejects_overdeclared_data_length() {
+        // Declare 0x123456 bytes but provide only 2.
+        let mut buf = fake_v2(0x00, &[0xea, 0x60], &[]);
+        buf[0x7d] = 0x56;
+        buf[0x7e] = 0x34;
+        buf[0x7f] = 0x12;
+        let err = parse_nsf(&buf).unwrap_err();
+        match err {
+            NsfError::Nsf2DataLengthOverflow { declared, .. } => {
+                assert_eq!(declared, 0x123456);
+            }
+            other => panic!("expected Nsf2DataLengthOverflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nsf2_features_bit_helpers_cover_individual_bits() {
+        assert!(Nsf2Features(0x10).irq_support());
+        assert!(!Nsf2Features(0x10).non_returning_init());
+        assert!(Nsf2Features(0x20).non_returning_init());
+        assert!(Nsf2Features(0x40).suppressed_play());
+        assert!(Nsf2Features(0x80).mandatory_metadata());
+        // Reserved low nibble: should not influence any helper.
+        assert!(!Nsf2Features(0x0F).irq_support());
+        assert!(!Nsf2Features(0x0F).non_returning_init());
+        assert!(!Nsf2Features(0x0F).suppressed_play());
+        assert!(!Nsf2Features(0x0F).mandatory_metadata());
+        assert!(!Nsf2Features(0x0F).needs_vector_overlay());
     }
 }

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NSF 2.x support** (round 3): header parser now accepts version
+  byte `0x02`, decodes the `$7C` feature-flag byte (IRQ support,
+  non-returning INIT, suppressed PLAY, mandatory metadata) into a
+  new `Nsf2Features` type, and splits the program block from
+  appended NSFe metadata using the 24-bit length field at `$7D-$7F`.
+  Returns a typed `Nsf2DataLengthOverflow` error when the declared
+  length runs past EOF.
+- **NSF 2.x IRQ timer device** (`$401B/$401C/$401D`) on the bus —
+  reload register, activate / acknowledge semantics, IRQ flag
+  clear-on-read of `$401D`, fires every `N+1` cycles per spec.
+- **`$FFFA-$FFFF` vector overlay**: the bus now installs RAM at the
+  6502 vector slots when the player arms NSF2 paradigms. NMI/Reset
+  vectors are owned by the player; the IRQ vector is preloaded from
+  the underlying ROM and writable by the NSF program.
+- **6502 IRQ + NMI servicing**: `Cpu6502::step` now checks the bus's
+  IRQ line (honouring the I flag) and pending NMI request before
+  fetching the next opcode; pushes PC + P (B=0, U=1), sets I, and
+  vectors through `$FFFE` (IRQ) or `$FFFA` (NMI). Both take 7 cycles.
+- **NSF2 non-returning INIT** paradigm in `NsfPlayer`: INIT is now
+  called twice — first with `Y=$80` (returning), then with `Y=$81`
+  (may run indefinitely). PLAY is delivered via a 14-byte NMI
+  wrapper installed at `$0200` that preserves A/X/Y, JSRs to the
+  play routine, and RTI's back into the still-running INIT.
+- **NSF2 suppressed-PLAY** bit honoured: the play scheduler skips
+  every PLAY/NMI dispatch when bit 6 of `$7C` is set.
+- 14 new unit + integration tests covering NSF2 header parsing, IRQ
+  timer semantics, vector-overlay routing, CPU IRQ + NMI dispatch,
+  two-phase INIT, and end-to-end IRQ-driven NSF2 playback.
+
 - 6502 CPU emulator now covers **all 256 opcodes** (round 2): real
   semantics for the unofficial / "illegal" opcodes per
   nesdev.org/wiki/CPU_unofficial_opcodes. Stable group: LAX, SAX,
