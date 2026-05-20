@@ -282,11 +282,19 @@ impl NesBus {
         p
     }
 
-    /// True iff the bus is asserting the CPU's IRQ line. NSF2 timer
-    /// is currently the only source; APU/Frame-counter IRQs are not
-    /// wired into the player loop.
+    /// True iff the bus is asserting the CPU's IRQ line. Three
+    /// sources, OR'd together per nesdev wiki §APU + §NSF2:
+    ///
+    /// * the NSF2 timer device (`$401B/C/D` underflow, gated on the
+    ///   header feature byte),
+    /// * the APU frame-counter IRQ ($4017 bit-6 inhibit clear,
+    ///   4-step mode end-of-frame),
+    /// * the APU DMC IRQ ($4010 bit 7 set, sample stream finished).
+    ///
+    /// Each source latches its own flag and is acknowledged by its
+    /// own register read (`$401D`, `$4015`, `$4015` respectively).
     pub fn irq_line(&self) -> bool {
-        self.nsf2_timer.irq_line()
+        self.nsf2_timer.irq_line() || self.apu.irq_line()
     }
 
     /// Configure the bus from the parsed NSF header. This sets up the
@@ -536,6 +544,7 @@ mod tests {
             is_nsfe: false,
             nsf2: crate::header::Nsf2Features(0),
             nsf2_metadata: Vec::new(),
+            metadata: crate::nsfe::NsfeMetadata::default(),
         }
     }
 

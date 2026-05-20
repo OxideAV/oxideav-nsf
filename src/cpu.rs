@@ -1993,6 +1993,7 @@ mod tests {
             is_nsfe: false,
             nsf2: crate::header::Nsf2Features(0x10),
             nsf2_metadata: Vec::new(),
+            metadata: crate::nsfe::NsfeMetadata::default(),
         };
         bus.configure_from_header(&h);
         bus.arm_vector_overlay(0x4FFE, 0x4FFE);
@@ -2063,6 +2064,7 @@ mod tests {
             is_nsfe: false,
             nsf2: crate::header::Nsf2Features(0x20), // non-returning INIT
             nsf2_metadata: Vec::new(),
+            metadata: crate::nsfe::NsfeMetadata::default(),
         };
         bus.configure_from_header(&h);
         // NMI slot is reserved to the player — install via arm.

@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NSFe extended-chunk metadata parser** (round 4): new `nsfe` module
+  decodes every documented optional chunk — `auth` (title/artist/
+  copyright/ripper), `tlbl` (per-track labels), `taut` (per-track
+  authors), `text` (free-form notes), `time` and `fade` (signed-ms
+  track timings), `plst` and `psfx` (music + sound-effect playlists),
+  `mixe` (per-device millibel mixer overrides), `regn` (region mask +
+  preferred), `RATE` (NTSC/PAL/Dendy playback periods), `VRC7` (device
+  selector + optional 128/152-byte patch table). Surfaces as a new
+  `NsfHeader::metadata: NsfeMetadata` field; legacy `song_name` /
+  `artist` / `copyright` / `track_labels` / `ntsc_speed_us` /
+  `pal_speed_us` / `region` fields now also lift from the matching
+  extended chunks. The same parser runs over the NSF 2 appended-
+  metadata blob (`$7D-$7F` length) so both shapes share one code path.
+- **BANK / NSF2 chunks** on the NSFe header path: `bankswitch_init`
+  and `Nsf2Features` are now populated from `BANK` / `NSF2` chunks in
+  NSFe files (previously zeroed).
+- **APU IRQ flags wired into the bus IRQ line** (round 4): `Apu2A03`
+  now models the `$4017` frame-counter IRQ inhibit + 4-step end-of-
+  frame flag set + `$4015` bit-6 acknowledge per nesdev wiki.
+  `NesBus::irq_line()` OR's the NSF2 timer, the frame-counter IRQ,
+  and the DMC IRQ — non-NSF2 NSFs that enable APU IRQs can now be
+  observed by the CPU through the same vector path. Unit + integration
+  tests cover the inhibit-clear, inhibit-set, 5-step (never sets), and
+  acknowledge paths.
+- 12 new unit tests in the new `nsfe` module + 7 new integration
+  tests covering: full NSFe extended-chunk round-trip, NSF 2 appended-
+  metadata blob parsing, unknown-uppercase-chunk rejection on the
+  header path, APU frame IRQ bus wiring with inhibit on/off, 5-step
+  mode never raising frame IRQ, and `$4015` acknowledge of frame +
+  DMC IRQs.
+
 - **NSF 2.x support** (round 3): header parser now accepts version
   byte `0x02`, decodes the `$7C` feature-flag byte (IRQ support,
   non-returning INIT, suppressed PLAY, mandatory metadata) into a

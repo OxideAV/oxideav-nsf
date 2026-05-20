@@ -8,9 +8,13 @@ under `docs/audio/nsf/`) plus Kevin Horton's original NSF v1.61 spec
 nes-rust / NSFPlay / etc.) was consulted, paraphrased, or
 cross-checked.
 
-Plays NSF v1, NSFe, and NSF v2 (round 3) — including the NSF2 IRQ
-timer device, vector overlay, non-returning INIT, and suppressed
-PLAY paradigms.
+Plays NSF v1, NSFe, and NSF v2 — including the NSF2 IRQ timer
+device, vector overlay, non-returning INIT, and suppressed PLAY
+paradigms. Round 4 adds: full NSFe extended-chunk metadata
+(`auth` / `tlbl` / `taut` / `text` / `time` / `fade` / `plst` /
+`psfx` / `mixe` / `regn` / `RATE` / `VRC7`) decoded for both NSFe
+and NSF2 appended-metadata blobs; APU frame-counter + DMC IRQs
+wired into the bus IRQ line.
 
 ## Round 2 scope
 
@@ -25,9 +29,14 @@ PLAY paradigms.
     block from appended NSFe-style metadata using the 24-bit length
     at `$7D-$7F`. `Nsf2DataLengthOverflow` is returned when the
     declared length runs past EOF.
-  * NSFe — chunk-based variant: parses `INFO` + `DATA` + `auth` +
-    `tlbl`. Unknown lower-case-initial chunks are silently skipped;
-    unknown upper-case-initial chunks are rejected as mandatory.
+  * NSFe — chunk-based variant: parses `INFO` + `DATA` + `BANK` +
+    `NSF2` at the header layer and feeds every other chunk into the
+    NSFe extended-metadata decoder (`auth` / `tlbl` / `taut` / `text`
+    / `time` / `fade` / `plst` / `psfx` / `mixe` / `regn` / `RATE`
+    / `VRC7`). Unknown lower-case-initial chunks are silently
+    skipped; unknown upper-case-initial chunks are rejected as
+    mandatory per spec. `RATE` overrides the default playback period;
+    `regn`'s `preferred` field overrides the INFO region byte.
 * **6502 CPU emulator** ([`Cpu6502`]) — **all 256 opcodes implemented**:
   * 151 documented mnemonics × every legal addressing mode.
   * Unofficial / "illegal" opcodes per
@@ -45,16 +54,23 @@ PLAY paradigms.
     line (gated on the I flag) and any pending NMI request before
     fetching the next opcode; pushes PC + P (B=0, U=1), sets I, and
     vectors through `$FFFE` (IRQ) or `$FFFA` (NMI) in 7 cycles each.
+    Round 4 hooks the APU's own IRQ sources (DMC end-of-sample +
+    frame-counter end-of-frame) into the same line so non-NSF2 NSFs
+    that enable APU IRQs can observe them.
 * **2A03 APU emulator** ([`Apu2A03`]):
   * Pulse 1 + Pulse 2 (sweep, envelope, length counter, duty).
   * Triangle (linear counter, length counter, 32-step sequencer).
   * Noise (LFSR with both tap modes).
   * **DMC fully wired** — sample-fetch DMA via the bus, NTSC + PAL
     rate tables, looping flag, IRQ flag surfaced through `$4015`
-    (cleared on read), 1-bit delta DAC. CPU-stall timing is omitted
-    (round-2 scope: music sample values, not cycle-perfect
-    OAM-stall behaviour).
-  * 4-step / 5-step frame counter.
+    (cleared on read) AND through `NesBus::irq_line()` (round 4),
+    1-bit delta DAC. CPU-stall timing is omitted (round-2 scope:
+    music sample values, not cycle-perfect OAM-stall behaviour).
+  * 4-step / 5-step frame counter. Round 4 honours `$4017` bit 6
+    (frame-interrupt inhibit) and latches the frame-counter IRQ at
+    the end of step 3 in 4-step mode per
+    `docs/audio/nsf/apu-frame-counter-wiki.html`; 5-step mode never
+    raises the flag. Acknowledged by `$4015` read.
   * Non-linear closed-form mixer per nesdev.org/wiki/APU_Mixer plus
     linearly-summed expansion-chip outputs.
 * **Bankswitching** ([`bus`]):
@@ -130,7 +146,7 @@ PLAY paradigms.
   Sunsoft 5B, FDS, and N163 — plus the routing logic in
   [`expansion::Expansion`].
 
-## Round 4+ followups
+## Round 5+ followups
 
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   read-cycle-stall behaviour, DMC CPU-stall halt-cycle accounting).
@@ -138,17 +154,22 @@ PLAY paradigms.
   chain (logarithmic sin / exp tables, 4-bit feedback, full envelope
   generator). Blocked on OPLL logsin/exp/EG-rate table sizes which
   are not in the in-tree `docs/audio/nsf/vrc7-audio-wiki.html` —
-  needs an OPLL operator-internals reference added to docs.
+  needs an OPLL operator-internals reference added to docs. (Round 4
+  added a typed `NsfeVrc7` patch-table container so the parser is
+  ready when the OPLL ops doc lands.)
 * N163: per-channel timer accumulators (currently the 8 channels share
   a coarse phase model).
 * FDS: amplitude envelope on the main volume + LFO-style modulator
   rebiasing.
-* NSF2 metadata parser (round 3 surfaces the appended blob as a
-  `Vec<u8>` but doesn't parse the chunks — reuse the existing NSFe
-  chunk reader once it's been split out).
-* Wire the APU's existing DMC + frame-counter IRQ flags into
-  `NesBus::irq_line` so non-NSF2 programs that enable APU IRQs can
-  observe them via the CPU (currently only the NSF2 timer source).
+* MMC5 PCM: round 4 leaves the channel decoded at register-level only;
+  needs a software-mode timer + read-mode wiring.
+* Dendy region: round 4 decodes `regn` preferred=2 and the `RATE`
+  Dendy field, but `NsfPlayer` still folds Dendy onto the PAL clock
+  — add a third CPU-Hz constant + a `NsfRegion::Dendy` variant.
+* Apply NSFe `mixe` overrides to the APU's per-device output gains
+  (currently surfaced for callers but not consumed by the mixer).
+* `plst` / `psfx` playlist iteration in the player API (currently the
+  caller chooses a song index by hand).
 * RIFF-NSF container variant.
 * `oxideav-source` magic-detection registration so the framework
   auto-dispatches `*.nsf` and `*.nsfe` URIs.

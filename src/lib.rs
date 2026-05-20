@@ -15,6 +15,7 @@ pub mod bus;
 pub mod cpu;
 pub mod expansion;
 pub mod header;
+pub mod nsfe;
 pub mod player;
 
 #[cfg(feature = "registry")]
@@ -24,6 +25,9 @@ pub use apu::Apu2A03;
 pub use bus::NesBus;
 pub use cpu::Cpu6502;
 pub use header::{parse_nsf, ExpansionChips, Nsf2Features, NsfError, NsfHeader, NsfRegion};
+pub use nsfe::{
+    NsfeAuth, NsfeMetaError, NsfeMetadata, NsfeMixerEntry, NsfeRate, NsfeRegions, NsfeVrc7,
+};
 pub use player::NsfPlayer;
 
 #[cfg(feature = "registry")]

@@ -581,6 +581,16 @@ pub struct Apu2A03 {
 
     /// `$4017` mode: false = 4-step, true = 5-step.
     five_step: bool,
+    /// `$4017` bit 6 — frame-interrupt inhibit. While set the
+    /// frame-counter IRQ is suppressed AND any latched flag is
+    /// cleared on the next `write_frame_counter` per nesdev spec.
+    frame_irq_inhibit: bool,
+    /// Frame-counter IRQ flag: in 4-step mode the flag latches at
+    /// the end of every frame (just after step 3) when `irq_inhibit`
+    /// is clear. Cleared by writing $4017 with bit 6 set or by
+    /// reading `$4015` (which also acknowledges the DMC IRQ flag).
+    /// 5-step mode never sets the flag per spec.
+    frame_irq_flag: bool,
     /// CPU cycles since the last frame-counter event.
     frame_acc: u32,
     /// Step counter (0..=3 in 4-step mode; 0..=4 in 5-step mode).
@@ -609,6 +619,8 @@ impl Apu2A03 {
             noise: NoiseChannel::new(),
             dmc: DmcChannel::default(),
             five_step: false,
+            frame_irq_inhibit: false,
+            frame_irq_flag: false,
             frame_acc: 0,
             frame_step: 0,
             pal: false,
@@ -709,19 +721,38 @@ impl Apu2A03 {
         if self.dmc.bytes_remaining > 0 {
             s |= 0x10;
         }
+        if self.frame_irq_flag {
+            s |= 0x40;
+        }
         if self.dmc.irq_flag {
             s |= 0x80;
         }
-        // Reads to $4015 acknowledge / clear the DMC IRQ flag.
+        // Reads to $4015 acknowledge / clear the frame-counter and
+        // DMC IRQ flags per nesdev wiki §APU Status.
+        self.frame_irq_flag = false;
         self.dmc.irq_flag = false;
         s
     }
 
-    /// `$4017` write — frame-counter mode.
+    /// True iff the APU is currently asserting the CPU's IRQ line.
+    /// Two sources: the frame-counter (clocked from `$4017`'s
+    /// inhibit bit + 4-step mode) and the DMC (end-of-sample +
+    /// `$4010` bit 7 set).
+    pub fn irq_line(&self) -> bool {
+        self.frame_irq_flag || self.dmc.irq_flag
+    }
+
+    /// `$4017` write — frame-counter mode + IRQ inhibit.
     pub fn write_frame_counter(&mut self, value: u8) {
         self.five_step = value & 0x80 != 0;
+        self.frame_irq_inhibit = value & 0x40 != 0;
         self.frame_acc = 0;
         self.frame_step = 0;
+        if self.frame_irq_inhibit {
+            // Spec §$4017: "If set, the frame interrupt flag is
+            // cleared, otherwise it is unaffected."
+            self.frame_irq_flag = false;
+        }
         if self.five_step {
             // 5-step: an immediate envelope + length tick on write.
             self.tick_quarter_frame();
@@ -790,6 +821,14 @@ impl Apu2A03 {
                 1 | 3 => {
                     self.tick_quarter_frame();
                     self.tick_half_frame();
+                    if self.frame_step == 3 && !self.frame_irq_inhibit {
+                        // 4-step mode latches the frame interrupt
+                        // flag at the end of step 3 (the same
+                        // event that issues the second half-frame
+                        // tick). Spec: only 4-step mode raises the
+                        // flag; 5-step never does.
+                        self.frame_irq_flag = true;
+                    }
                 }
                 _ => {}
             }
@@ -978,5 +1017,36 @@ mod tests {
         // Second read clears.
         let s2 = apu.read_status();
         assert_eq!(s2 & 0x80, 0);
+    }
+
+    #[test]
+    fn apu_irq_line_or_of_frame_and_dmc_sources() {
+        let mut apu = Apu2A03::new();
+        assert!(!apu.irq_line());
+
+        // Light up the frame counter IRQ path.
+        apu.write_frame_counter(0x00); // 4-step mode, inhibit clear
+        apu.tick_cpu_cycles(35_000);
+        assert!(apu.irq_line(), "frame IRQ should assert the line");
+
+        // $4015 read acks frame + DMC IRQs.
+        apu.read_status();
+        assert!(!apu.irq_line());
+
+        // Inhibit + cleared flag should keep the line down.
+        apu.write_frame_counter(0x40); // 4-step, inhibit set
+        apu.tick_cpu_cycles(35_000);
+        assert!(!apu.irq_line(), "inhibit must suppress frame IRQ");
+    }
+
+    #[test]
+    fn frame_counter_irq_flag_in_status_byte_acknowledges_on_read() {
+        let mut apu = Apu2A03::new();
+        apu.write_frame_counter(0x00);
+        apu.tick_cpu_cycles(35_000);
+        let s = apu.read_status();
+        assert!(s & 0x40 != 0, "$4015 bit 6 = frame IRQ flag");
+        let s2 = apu.read_status();
+        assert_eq!(s2 & 0x40, 0);
     }
 }

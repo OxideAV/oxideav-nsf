@@ -7,6 +7,7 @@
 //! audio output.
 
 use oxideav_nsf::{parse_nsf, Nsf2Features, NsfPlayer, NsfRegion};
+use oxideav_nsf::{NsfeAuth, NsfeMixerEntry};
 
 /// Manually-assembled NSF with all the documented header fields set so
 /// the parser exercises every byte-position offset we care about.
@@ -210,4 +211,274 @@ fn nsf2_irq_handler_fires_under_timer() {
     let _ = player.render(&mut pcm);
     let peak = pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap();
     assert!(peak > 1000, "IRQ-driven NSF2 produced too-quiet audio");
+}
+
+// =============================================================================
+// NSFe extended chunks (round 4)
+// =============================================================================
+
+/// Append a chunk (4-byte little-endian length, 4-byte FOURCC, body).
+fn push_chunk(buf: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(tag);
+    buf.extend_from_slice(body);
+}
+
+/// Synthesise an NSFe file that exercises every extended chunk
+/// (auth / tlbl / taut / text / time / fade / plst / psfx / mixe /
+/// regn / RATE / VRC7) on top of the mandatory INFO + DATA + NEND.
+fn synth_nsfe_with_extended_chunks() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"NSFE");
+
+    // INFO: load $8000, init $8000, play $8003, region byte = 0 (NTSC),
+    // expansion = $03 (VRC6 + VRC7), total=3, starting=0.
+    let info: [u8; 10] = [0x00, 0x80, 0x00, 0x80, 0x03, 0x80, 0x00, 0x03, 3, 0];
+    push_chunk(&mut out, b"INFO", &info);
+
+    // RATE: NTSC=16639, PAL=19997, Dendy=19120
+    let mut rate = Vec::new();
+    rate.extend_from_slice(&16639u16.to_le_bytes());
+    rate.extend_from_slice(&19997u16.to_le_bytes());
+    rate.extend_from_slice(&19120u16.to_le_bytes());
+    push_chunk(&mut out, b"RATE", &rate);
+
+    push_chunk(
+        &mut out,
+        b"auth",
+        b"Title Of Rip\0Composer Name\0(c)2026\0My Ripper\0",
+    );
+    push_chunk(&mut out, b"tlbl", b"Track A\0Track B\0Track C\0");
+    push_chunk(&mut out, b"taut", b"Composer A\0Composer B\0");
+    push_chunk(&mut out, b"text", b"Game notes go here.\nLine two.\0");
+
+    // time / fade: 3 entries each.
+    let times = [120_000i32, 60_000, -1];
+    let fades = [3_000i32, 0, -1];
+    let mut tb = Vec::new();
+    let mut fb = Vec::new();
+    for v in times {
+        tb.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in fades {
+        fb.extend_from_slice(&v.to_le_bytes());
+    }
+    push_chunk(&mut out, b"time", &tb);
+    push_chunk(&mut out, b"fade", &fb);
+
+    push_chunk(&mut out, b"plst", &[1u8, 0, 2]);
+    push_chunk(&mut out, b"psfx", &[2u8]);
+
+    // mixe: two device overrides (APU squares 0 mB, VRC7 1100 mB).
+    let mut mb = Vec::new();
+    mb.push(0u8);
+    mb.extend_from_slice(&0i16.to_le_bytes());
+    mb.push(3u8);
+    mb.extend_from_slice(&1100i16.to_le_bytes());
+    push_chunk(&mut out, b"mixe", &mb);
+
+    // regn: NTSC|PAL|Dendy with PAL preferred (id 1).
+    push_chunk(&mut out, b"regn", &[0x07u8, 0x01]);
+
+    // VRC7: device byte 1 (YM2413), no patch payload.
+    push_chunk(&mut out, b"VRC7", &[1u8]);
+
+    // DATA: a tiny program (RTS) that any decoder can run.
+    push_chunk(&mut out, b"DATA", &[0x60u8]);
+
+    // NEND terminator (0 length).
+    push_chunk(&mut out, b"NEND", &[]);
+
+    out
+}
+
+#[test]
+fn nsfe_extended_chunks_decode_into_metadata() {
+    let bytes = synth_nsfe_with_extended_chunks();
+    let h = parse_nsf(&bytes).unwrap();
+    assert!(h.is_nsfe);
+
+    // auth populates the legacy v1 string fields.
+    assert_eq!(h.song_name, "Title Of Rip");
+    assert_eq!(h.artist, "Composer Name");
+    assert_eq!(h.copyright, "(c)2026");
+
+    // tlbl lifted into the top-level helper field.
+    assert_eq!(h.track_labels, vec!["Track A", "Track B", "Track C"]);
+
+    // RATE supersedes the default refresh rate (NTSC 16666 → 16639).
+    assert_eq!(h.ntsc_speed_us, 16639);
+    assert_eq!(h.pal_speed_us, 19997);
+
+    // regn preferred=PAL overrides INFO byte-6 NTSC.
+    assert_eq!(h.region, NsfRegion::Pal);
+
+    // The extended-chunk struct still carries every per-chunk decoded
+    // field for higher-layer use (player UIs, etc).
+    let m = &h.metadata;
+    assert_eq!(
+        m.auth.as_ref(),
+        Some(&NsfeAuth {
+            title: "Title Of Rip".into(),
+            artist: "Composer Name".into(),
+            copyright: "(c)2026".into(),
+            ripper: "My Ripper".into(),
+        })
+    );
+    assert_eq!(m.track_authors, vec!["Composer A", "Composer B"]);
+    assert_eq!(m.text.as_deref(), Some("Game notes go here.\nLine two."));
+    assert_eq!(m.track_times_ms, vec![120_000, 60_000, -1]);
+    assert_eq!(m.track_fades_ms, vec![3_000, 0, -1]);
+    assert_eq!(m.playlist, vec![1, 0, 2]);
+    assert_eq!(m.sfx_playlist, vec![2]);
+    assert_eq!(
+        m.mixer,
+        vec![
+            NsfeMixerEntry {
+                device: 0,
+                millibel: 0
+            },
+            NsfeMixerEntry {
+                device: 3,
+                millibel: 1100
+            },
+        ]
+    );
+    let r = m.regions.unwrap();
+    assert!(r.supports_ntsc() && r.supports_pal() && r.supports_dendy());
+    assert_eq!(r.preferred, Some(1));
+    let rate = m.rate.unwrap();
+    assert_eq!(rate.ntsc_us, Some(16639));
+    assert_eq!(rate.pal_us, Some(19997));
+    assert_eq!(rate.dendy_us, Some(19120));
+    assert_eq!(m.vrc7.as_ref().map(|v| v.device), Some(1));
+}
+
+#[test]
+fn nsf2_appended_metadata_blob_is_parsed_into_metadata_field() {
+    // Build an NSF2 with a one-byte program and an auth chunk in the
+    // appended metadata slot.
+    let mut header = vec![0u8; 0x80];
+    header[..5].copy_from_slice(b"NESM\x1a");
+    header[0x05] = 2;
+    header[0x06] = 1;
+    header[0x07] = 1;
+    header[0x08..0x0a].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0a..0x0c].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0c..0x0e].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x6e..0x70].copy_from_slice(&16666u16.to_le_bytes());
+    let program: [u8; 1] = [0x60];
+    header[0x7d] = program.len() as u8;
+    header[0x7e] = 0;
+    header[0x7f] = 0;
+
+    let mut metadata = Vec::new();
+    push_chunk(
+        &mut metadata,
+        b"auth",
+        b"NSF2 Title\0NSF2 Artist\0NSF2 (c)\0\0",
+    );
+    push_chunk(&mut metadata, b"tlbl", b"Only Track\0");
+
+    let mut blob = header.clone();
+    blob.extend_from_slice(&program);
+    blob.extend_from_slice(&metadata);
+
+    let h = parse_nsf(&blob).unwrap();
+    assert_eq!(h.version, 2);
+    // Legacy v1 string fields were empty in the 128-byte header; the
+    // appended `auth` chunk lifted them.
+    assert_eq!(h.song_name, "NSF2 Title");
+    assert_eq!(h.artist, "NSF2 Artist");
+    assert_eq!(h.copyright, "NSF2 (c)");
+    assert_eq!(h.track_labels, vec!["Only Track"]);
+    assert!(h.metadata.auth.is_some());
+}
+
+#[test]
+fn nsfe_rejects_unknown_uppercase_extended_chunk() {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"NSFE");
+    let info: [u8; 10] = [0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x00, 1, 0];
+    push_chunk(&mut out, b"INFO", &info);
+    push_chunk(&mut out, b"WXYZ", &[]);
+    push_chunk(&mut out, b"DATA", &[0x60u8]);
+    push_chunk(&mut out, b"NEND", &[]);
+    let err = parse_nsf(&out).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("unknown mandatory") || msg.contains("WXYZ"),
+        "expected unknown-mandatory rejection, got {msg}"
+    );
+}
+
+// =============================================================================
+// APU IRQ wiring (round 4)
+// =============================================================================
+
+#[test]
+fn apu_frame_counter_irq_asserts_the_bus_irq_line() {
+    // Hand-assemble an NSF whose INIT writes $4017=$00 (4-step mode,
+    // IRQ inhibit clear) and then RTSes. After INIT returns we
+    // step a 240 Hz frame counter ourselves by ticking the bus
+    // directly and observe the IRQ line.
+    use oxideav_nsf::NesBus;
+    let mut bus = NesBus::new();
+    bus.apu.set_cpu_hz(1_789_773);
+
+    // Write $4017 with bit 6 = 0 (inhibit clear) and bit 7 = 0
+    // (4-step mode). This is the only "let frame IRQ fire" state.
+    bus.write(0x4017, 0x00);
+    assert!(!bus.irq_line());
+
+    // 4-step mode latches the IRQ flag at the end of step 3, which
+    // is the fourth quarter-frame tick (29830 CPU cycles into the
+    // sequence per nesdev wiki). We tick a generous 35 000 cycles
+    // to guarantee we crossed the boundary.
+    bus.tick_cycles(35_000);
+    assert!(
+        bus.irq_line(),
+        "frame-counter IRQ should be asserted after one full 4-step pass"
+    );
+
+    // Reading $4015 acknowledges both APU IRQ flags per spec.
+    let status = bus.read(0x4015);
+    assert!(
+        status & 0x40 != 0,
+        "$4015 bit 6 should reflect frame IRQ flag before ack"
+    );
+    assert!(!bus.irq_line(), "$4015 read should clear the frame IRQ");
+}
+
+#[test]
+fn frame_counter_irq_inhibit_suppresses_assertion() {
+    use oxideav_nsf::NesBus;
+    let mut bus = NesBus::new();
+    bus.apu.set_cpu_hz(1_789_773);
+    // $4017 = $40 → 4-step mode, inhibit set.
+    bus.write(0x4017, 0x40);
+    bus.tick_cycles(35_000);
+    assert!(
+        !bus.irq_line(),
+        "frame IRQ inhibit must keep the line clear"
+    );
+    assert_eq!(
+        bus.read(0x4015) & 0x40,
+        0,
+        "frame IRQ flag must NOT latch while inhibit is set"
+    );
+}
+
+#[test]
+fn five_step_mode_never_raises_frame_irq() {
+    use oxideav_nsf::NesBus;
+    let mut bus = NesBus::new();
+    bus.apu.set_cpu_hz(1_789_773);
+    // $4017 = $80 → 5-step mode, inhibit clear.
+    bus.write(0x4017, 0x80);
+    bus.tick_cycles(50_000);
+    assert!(
+        !bus.irq_line(),
+        "5-step mode never sets the frame IRQ per spec"
+    );
 }

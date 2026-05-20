@@ -28,6 +28,8 @@
 
 use core::fmt;
 
+use crate::nsfe::{self, NsfeMetaError, NsfeMetadata};
+
 /// NSF v1 magic — `NESM\x1a`.
 pub const NSF_MAGIC: [u8; 5] = *b"NESM\x1a";
 
@@ -151,6 +153,11 @@ pub struct NsfHeader {
     /// Stored verbatim; per spec it never starts with an `NSFE` fourCC
     /// and never contains `INFO` / `DATA` / `BANK` / `NSF2` chunks.
     pub nsf2_metadata: Vec<u8>,
+    /// Parsed extended NSFe chunks (`auth` / `tlbl` / `taut` / `text`
+    /// / `time` / `fade` / `plst` / `psfx` / `mixe` / `regn` / `RATE`
+    /// / `VRC7`). Populated for NSFe files and for NSF2 files whose
+    /// appended-metadata blob is non-empty; defaulted on v1 NSF.
+    pub metadata: NsfeMetadata,
 }
 
 impl NsfHeader {
@@ -195,6 +202,16 @@ pub enum NsfError {
         declared: usize,
         available: usize,
     },
+    /// The NSFe extended-chunk parser rejected the appended metadata
+    /// (truncated chunk, overflowing size, illegal payload length, or
+    /// an unknown mandatory chunk).
+    Metadata(NsfeMetaError),
+}
+
+impl From<NsfeMetaError> for NsfError {
+    fn from(err: NsfeMetaError) -> Self {
+        NsfError::Metadata(err)
+    }
 }
 
 impl fmt::Display for NsfError {
@@ -221,6 +238,7 @@ impl fmt::Display for NsfError {
                 f,
                 "NSF2: declared data length {declared} overflows available program bytes {available}"
             ),
+            NsfError::Metadata(e) => write!(f, "{e}"),
         }
     }
 }
@@ -300,6 +318,30 @@ fn parse_nsf_v1(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         )
     };
 
+    // Parse the appended NSF2 metadata blob (a bare chunk run with no
+    // `NSFE` magic and no INFO/DATA/BANK/NSF2 chunks per spec). Empty
+    // blobs decode to a defaulted `NsfeMetadata`. Lift extended
+    // strings into the legacy v1 string fields when the v1 fields are
+    // unset and the metadata supplied them.
+    let mut metadata = if nsf2_metadata.is_empty() {
+        NsfeMetadata::default()
+    } else {
+        nsfe::parse_metadata_chunks(&nsf2_metadata)?
+    };
+    let (mut song_name, mut artist, mut copyright) = (song_name, artist, copyright);
+    if let Some(auth) = metadata.auth.as_ref() {
+        if song_name.is_empty() {
+            song_name = auth.title.clone();
+        }
+        if artist.is_empty() {
+            artist = auth.artist.clone();
+        }
+        if copyright.is_empty() {
+            copyright = auth.copyright.clone();
+        }
+    }
+    let track_labels = std::mem::take(&mut metadata.track_labels);
+
     Ok(NsfHeader {
         version,
         total_songs,
@@ -316,20 +358,26 @@ fn parse_nsf_v1(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         region,
         expansion,
         program,
-        track_labels: Vec::new(),
+        track_labels,
         is_nsfe: false,
         nsf2,
         nsf2_metadata,
+        metadata,
     })
 }
 
 fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
+    // Two-pass walk: first peel off the chunks that belong to the v1
+    // shadow header (INFO / DATA / BANK / NSF2) plus the special
+    // `NEND` terminator, then re-feed every other chunk into the
+    // extended-metadata parser so the heavy decoding for `auth /
+    // tlbl / taut / text / time / fade / plst / psfx / mixe / regn
+    // / RATE / VRC7` lives in one place.
     let mut info: Option<NsfeInfo> = None;
     let mut data: Option<Vec<u8>> = None;
-    let mut song_name = String::new();
-    let mut artist = String::new();
-    let mut copyright = String::new();
-    let mut track_labels: Vec<String> = Vec::new();
+    let mut bank_init: Option<[u8; 8]> = None;
+    let mut nsf2_features: Option<u8> = None;
+    let mut meta_blob = Vec::<u8>::new();
 
     let mut cursor = 4usize;
     while cursor < bytes.len() {
@@ -356,25 +404,33 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         match &fcc {
             b"INFO" => info = Some(parse_nsfe_info(body)?),
             b"DATA" => data = Some(body.to_vec()),
-            b"auth" => {
-                let mut it = body.split(|&b| b == 0);
-                song_name = it.next().map(read_nsf_string).unwrap_or_default();
-                artist = it.next().map(read_nsf_string).unwrap_or_default();
-                copyright = it.next().map(read_nsf_string).unwrap_or_default();
+            b"BANK" => {
+                let mut b = [0u8; 8];
+                let n = body.len().min(8);
+                b[..n].copy_from_slice(&body[..n]);
+                bank_init = Some(b);
             }
-            b"tlbl" => {
-                track_labels = body
-                    .split(|&b| b == 0)
-                    .filter(|s| !s.is_empty())
-                    .map(read_nsf_string)
-                    .collect();
+            b"NSF2" => {
+                // Single-byte mirror of the NSF2 header feature
+                // bits — surface so callers can act on the IRQ /
+                // non-returning-INIT / suppressed-PLAY flags.
+                nsf2_features = Some(body.first().copied().unwrap_or(0));
             }
             b"NEND" => break,
+            // Everything else gets re-emitted into the metadata
+            // buffer for the extended parser, which knows the full
+            // catalogue of optional chunks (`auth / tlbl / taut /
+            // text / time / fade / plst / psfx / mixe / regn /
+            // RATE / VRC7`). Eagerly enforce the mandatory rule
+            // here so a malformed file is rejected before we
+            // bother walking the rest.
             _ => {
-                let first = fcc[0];
-                if first.is_ascii_uppercase() {
+                if !is_known_extended(&fcc) && fcc[0].is_ascii_uppercase() {
                     return Err(NsfError::NsfeUnknownMandatory(fcc));
                 }
+                meta_blob.extend_from_slice(&(size as u32).to_le_bytes());
+                meta_blob.extend_from_slice(&fcc);
+                meta_blob.extend_from_slice(body);
             }
         }
         cursor = body_end;
@@ -382,6 +438,39 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
 
     let info = info.ok_or(NsfError::NsfeMissingRequired("INFO"))?;
     let program = data.ok_or(NsfError::NsfeMissingRequired("DATA"))?;
+
+    let mut metadata = if meta_blob.is_empty() {
+        NsfeMetadata::default()
+    } else {
+        nsfe::parse_metadata_chunks(&meta_blob)?
+    };
+
+    let (mut song_name, mut artist, mut copyright) = (String::new(), String::new(), String::new());
+    if let Some(auth) = metadata.auth.as_ref() {
+        song_name = auth.title.clone();
+        artist = auth.artist.clone();
+        copyright = auth.copyright.clone();
+    }
+    let track_labels = std::mem::take(&mut metadata.track_labels);
+
+    // RATE chunk takes precedence over the v1 header defaults when
+    // present (and when it provides the matching region's period).
+    let (ntsc_speed_us, pal_speed_us) = match &metadata.rate {
+        Some(rate) => (rate.ntsc_us.unwrap_or(0), rate.pal_us.unwrap_or(0)),
+        None => (0, 0),
+    };
+
+    // regn overrides the INFO byte-6 region when present.
+    let region = match metadata.regions.as_ref().and_then(|r| r.preferred) {
+        Some(0) => NsfRegion::Ntsc,
+        Some(1) => NsfRegion::Pal,
+        // Dendy (preferred = 2) plays back on the PAL clock per spec
+        // until/unless we model the Dendy clock as its own variant.
+        Some(2) => NsfRegion::Pal,
+        _ => NsfRegion::from_byte(info.region),
+    };
+
+    let bankswitch_init = bank_init.unwrap_or([0u8; 8]);
 
     Ok(NsfHeader {
         version: 1,
@@ -393,16 +482,17 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         song_name,
         artist,
         copyright,
-        ntsc_speed_us: 0,
-        pal_speed_us: 0,
-        bankswitch_init: [0u8; 8],
-        region: NsfRegion::from_byte(info.region),
+        ntsc_speed_us,
+        pal_speed_us,
+        bankswitch_init,
+        region,
         expansion: ExpansionChips(info.expansion),
         program,
         track_labels,
         is_nsfe: true,
-        nsf2: Nsf2Features(0),
+        nsf2: Nsf2Features(nsf2_features.unwrap_or(0)),
         nsf2_metadata: Vec::new(),
+        metadata,
     })
 }
 
@@ -429,6 +519,27 @@ fn parse_nsfe_info(body: &[u8]) -> Result<NsfeInfo, NsfError> {
         total_songs: body.get(8).copied().unwrap_or(1),
         starting_song: body.get(9).copied().unwrap_or(0),
     })
+}
+
+/// True for any chunk FOURCC the extended-metadata parser knows how
+/// to decode (so a header-layer pre-pass can let it through without
+/// triggering the "unknown mandatory chunk" check on uppercase tags).
+fn is_known_extended(fcc: &[u8; 4]) -> bool {
+    matches!(
+        fcc,
+        b"auth"
+            | b"tlbl"
+            | b"taut"
+            | b"text"
+            | b"time"
+            | b"fade"
+            | b"plst"
+            | b"psfx"
+            | b"mixe"
+            | b"regn"
+            | b"RATE"
+            | b"VRC7"
+    )
 }
 
 fn read_nsf_string(field: &[u8]) -> String {
