@@ -43,6 +43,10 @@ use crate::header::{NsfHeader, NsfRegion};
 const NTSC_CPU_HZ: u32 = 1_789_773;
 /// PAL NES CPU clock.
 const PAL_CPU_HZ: u32 = 1_662_607;
+/// Dendy NES-clone CPU clock per
+/// `docs/audio/nsf/apu-pulse-wiki.html` (the `f_CPU is … 1.773448 MHz
+/// for Dendy` parenthetical in the pulse-period formula).
+const DENDY_CPU_HZ: u32 = 1_773_448;
 
 /// Sentinel return address pushed under the init / play subroutine
 /// frame. When the routine RTS's, the CPU jumps here and we stop
@@ -91,25 +95,33 @@ impl NsfPlayer {
     pub fn new(header: NsfHeader, sample_rate: u32) -> Self {
         let cpu_hz = match header.region {
             NsfRegion::Pal => PAL_CPU_HZ,
+            NsfRegion::Dendy => DENDY_CPU_HZ,
             NsfRegion::Ntsc | NsfRegion::Dual => NTSC_CPU_HZ,
         };
         let mut bus = NesBus::new();
         bus.apu.set_cpu_hz(cpu_hz);
         bus.configure_from_header(&header);
 
-        let play_us = match header.region {
-            NsfRegion::Pal => header.pal_speed_us,
-            NsfRegion::Ntsc | NsfRegion::Dual => header.ntsc_speed_us,
-        };
+        // `play_period_us` honours the Dendy speed (NSFe RATE byte
+        // $0004) with PAL fallback, matching the spec.
+        let play_us = header.play_period_us();
         let play_us_eff = if play_us != 0 {
             play_us as u32
         } else {
             match header.region {
-                NsfRegion::Pal => 19_997,
+                NsfRegion::Pal | NsfRegion::Dendy => 19_997,
                 NsfRegion::Ntsc | NsfRegion::Dual => 16_666,
             }
         };
         let play_period_cycles = ((play_us_eff as u64 * cpu_hz as u64) / 1_000_000) as u32;
+
+        // Apply NSFe `mixe` per-device gain overrides to the APU
+        // mixer. The mixer entries are already decoded in the header
+        // metadata; the APU stores them as a linear-gain table indexed
+        // by NSFe device id.
+        if !header.metadata.mixer.is_empty() {
+            bus.apu.apply_mixe_overrides(&header.metadata.mixer);
+        }
 
         let nsf2_nmi_play = header.nsf2.non_returning_init();
         let nsf2_suppress_play = header.nsf2.suppressed_play();
@@ -173,9 +185,13 @@ impl NsfPlayer {
     pub fn start_song(&mut self, song: u8) {
         self.song = song;
         let a = song.saturating_sub(1);
+        // Per `docs/audio/nsf/nsf-nesdev-wiki.html` §INIT and
+        // `docs/audio/nsf/nsfe-nesdev-wiki.html` §regn: X carries the
+        // region selector — 0 NTSC, 1 PAL, 2 Dendy.
         let x = match self.header.region {
             NsfRegion::Pal => 1,
-            _ => 0,
+            NsfRegion::Dendy => 2,
+            NsfRegion::Ntsc | NsfRegion::Dual => 0,
         };
 
         // NSF2 vector-overlay paradigms need the wrapper installed
@@ -343,6 +359,64 @@ impl NsfPlayer {
 
     pub fn cpu_hz(&self) -> u32 {
         self.cpu_hz
+    }
+
+    /// Number of entries in the NSFe `plst` music playlist (zero if
+    /// the file ships none). Per `docs/audio/nsf/nsfe-nesdev-wiki.html`
+    /// §plst the chunk is a flat sequence of 1-byte song-indexes (the
+    /// values are 0-based song indexes; we surface them unchanged).
+    pub fn playlist_len(&self) -> usize {
+        self.header.metadata.playlist.len()
+    }
+
+    /// Number of entries in the NSFe `psfx` sound-effect playlist
+    /// (separate from `plst` per spec — typically used by ripping
+    /// tools to flag the SFX bank for non-musical sound tests).
+    pub fn sfx_playlist_len(&self) -> usize {
+        self.header.metadata.sfx_playlist.len()
+    }
+
+    /// 1-based song number for entry `index` of the `plst` playlist,
+    /// or `None` when no playlist exists or `index` is out of range.
+    /// `plst` stores 0-based song indexes; this getter converts to the
+    /// 1-based convention used by [`NsfPlayer::start_song`] /
+    /// [`NsfPlayer::start_playlist_entry`].
+    pub fn playlist_song(&self, index: usize) -> Option<u8> {
+        self.header
+            .metadata
+            .playlist
+            .get(index)
+            .map(|&zero_based| zero_based.saturating_add(1))
+    }
+
+    /// 1-based song number for entry `index` of the `psfx` playlist,
+    /// using the same 0→1 base conversion as [`playlist_song`].
+    pub fn sfx_playlist_song(&self, index: usize) -> Option<u8> {
+        self.header
+            .metadata
+            .sfx_playlist
+            .get(index)
+            .map(|&zero_based| zero_based.saturating_add(1))
+    }
+
+    /// Start the `index`-th entry of the music playlist. Equivalent to
+    /// `start_song(self.playlist_song(index)?)`. Returns the 1-based
+    /// song number that was started, or `None` when no such entry
+    /// exists.
+    pub fn start_playlist_entry(&mut self, index: usize) -> Option<u8> {
+        let song = self.playlist_song(index)?;
+        self.start_song(song);
+        Some(song)
+    }
+
+    /// Iterator over the resolved 1-based song numbers of the `plst`
+    /// playlist. Convenience for callers that want to walk every track.
+    pub fn playlist_iter(&self) -> impl Iterator<Item = u8> + '_ {
+        self.header
+            .metadata
+            .playlist
+            .iter()
+            .map(|&zero_based| zero_based.saturating_add(1))
     }
 }
 

@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dendy region support** (round 5): new `NsfRegion::Dendy` variant
+  carrying the 1.773448 MHz CPU clock per
+  `docs/audio/nsf/apu-pulse-wiki.html`. NSFe `regn` chunks with
+  `preferred = 2` (both on header-level NSFe files and on NSF 2
+  appended-metadata blobs) now promote the region to `Dendy` instead
+  of folding onto PAL. The player honours the dedicated Dendy speed
+  from the NSFe `RATE` chunk byte $0004 (with PAL fallback per spec)
+  and seeds INIT with `X = 2` per `docs/audio/nsf/nsfe-nesdev-wiki.html`
+  §regn. New `NsfHeader::play_period_us()` getter centralises the
+  per-region speed-selection logic.
+- **NSFe `mixe` per-device gain overrides** (round 5): `Apu2A03` now
+  carries an 8-slot `device_gain` table indexed by NSFe device id
+  (`apu::mixe_device::*` — APU squares, APU TND, VRC6, VRC7, FDS,
+  MMC5, N163, 5B) and applies the gain inside `output_sample`. A
+  new `Apu2A03::apply_mixe_overrides(&[NsfeMixerEntry])` converts
+  signed millibels to a linear `10^(mB / 2000)` scalar per the
+  `dB = 20 * log10(linear)` convention from the §mixe spec. `NsfPlayer::new`
+  auto-applies the overrides from `header.metadata.mixer`. Expansion
+  output gets a parallel `Expansion::output_with_device_gain` path
+  that scales each enabled chip's contribution by its mixe slot.
+- **`plst` / `psfx` playlist iteration API** (round 5):
+  `NsfPlayer::playlist_len()` / `sfx_playlist_len()`,
+  `playlist_song(index)` / `sfx_playlist_song(index)`,
+  `playlist_iter()`, and `start_playlist_entry(index)`. Plays the
+  NSFe playlist (which is 0-based on disk) using the 1-based song
+  convention `start_song` already uses.
+- 9 new integration tests (`tests/parse_header.rs`) and 1 new unit
+  test (apu) covering: Dendy region detection from `regn`, fallback
+  to PAL speed when Dendy speed is missing, Dendy CPU clock + INIT
+  X=2, NSF2 appended `regn` promotion to Dendy, mixe gain table
+  construction, mixe gain propagated into APU `output_sample`, plst
+  helpers, `start_playlist_entry` seeding, and an end-to-end Dendy
+  render that confirms the player produces non-trivial PCM through
+  the new clock.
+- `RATE` chunk on the NSF 2 appended-metadata blob path now
+  overrides the v1 header speed fields (matching the NSFe
+  header-path behaviour landed in round 4).
+
 - **NSFe extended-chunk metadata parser** (round 4): new `nsfe` module
   decodes every documented optional chunk — `auth` (title/artist/
   copyright/ripper), `tlbl` (per-track labels), `taut` (per-track

@@ -482,3 +482,295 @@ fn five_step_mode_never_raises_frame_irq() {
         "5-step mode never sets the frame IRQ per spec"
     );
 }
+
+// =================================================================
+// Round 5 — Dendy region + mixe overrides + plst/psfx playlist API
+// =================================================================
+
+/// NSFe with regn preferred=Dendy and a RATE chunk that carries
+/// the optional Dendy speed field. The Dendy player should pick
+/// 1.773448 MHz CPU clock, honour the Dendy period over PAL, and
+/// seed INIT with X=2.
+fn synth_nsfe_dendy() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"NSFE");
+
+    // INFO: INIT $8000, PLAY $8003, byte-6 region defaults NTSC.
+    let info: [u8; 10] = [0x00, 0x80, 0x00, 0x80, 0x03, 0x80, 0x00, 0x00, 1, 0];
+    push_chunk(&mut out, b"INFO", &info);
+
+    // RATE: NTSC=16666, PAL=19997, Dendy=19120.
+    let mut rate = Vec::new();
+    rate.extend_from_slice(&16666u16.to_le_bytes());
+    rate.extend_from_slice(&19997u16.to_le_bytes());
+    rate.extend_from_slice(&19120u16.to_le_bytes());
+    push_chunk(&mut out, b"RATE", &rate);
+
+    // regn: NTSC|PAL|Dendy mask, preferred = Dendy (2).
+    push_chunk(&mut out, b"regn", &[0x07u8, 0x02]);
+
+    // DATA: a single-RTS routine.
+    push_chunk(&mut out, b"DATA", &[0x60u8]);
+    push_chunk(&mut out, b"NEND", &[]);
+    out
+}
+
+#[test]
+fn nsfe_regn_dendy_selects_dendy_region() {
+    let bytes = synth_nsfe_dendy();
+    let h = parse_nsf(&bytes).unwrap();
+    assert_eq!(
+        h.region,
+        NsfRegion::Dendy,
+        "regn preferred=2 must surface as NsfRegion::Dendy"
+    );
+    // play_period_us prefers the Dendy speed when present.
+    assert_eq!(h.play_period_us(), 19120);
+    // play_rate_hz follows from it.
+    let hz = h.play_rate_hz();
+    assert!((hz - (1_000_000.0 / 19120.0)).abs() < 0.01);
+}
+
+#[test]
+fn nsfe_regn_dendy_falls_back_to_pal_speed_when_dendy_speed_absent() {
+    // Same as above but RATE only carries NTSC+PAL.
+    let mut out = Vec::new();
+    out.extend_from_slice(b"NSFE");
+    let info: [u8; 10] = [0x00, 0x80, 0x00, 0x80, 0x03, 0x80, 0x00, 0x00, 1, 0];
+    push_chunk(&mut out, b"INFO", &info);
+    let mut rate = Vec::new();
+    rate.extend_from_slice(&16666u16.to_le_bytes());
+    rate.extend_from_slice(&19997u16.to_le_bytes());
+    push_chunk(&mut out, b"RATE", &rate);
+    push_chunk(&mut out, b"regn", &[0x07u8, 0x02]);
+    push_chunk(&mut out, b"DATA", &[0x60u8]);
+    push_chunk(&mut out, b"NEND", &[]);
+
+    let h = parse_nsf(&out).unwrap();
+    assert_eq!(h.region, NsfRegion::Dendy);
+    assert_eq!(
+        h.play_period_us(),
+        19997,
+        "missing Dendy speed must fall back to PAL per spec"
+    );
+}
+
+#[test]
+fn dendy_player_uses_dendy_cpu_clock_and_init_x_register() {
+    let bytes = synth_nsfe_dendy();
+    let h = parse_nsf(&bytes).unwrap();
+    let mut player = NsfPlayer::new(h, 44_100);
+    assert_eq!(
+        player.cpu_hz(),
+        1_773_448,
+        "Dendy CPU clock per apu-pulse-wiki.html"
+    );
+    player.start_song(1);
+    // INIT was driven with X=2 (Dendy selector). The CPU's X register
+    // after a return-to-sentinel run holds the last value it had at
+    // the RTS — since our DATA is a bare RTS the X seed is preserved.
+    assert_eq!(
+        player.cpu.x, 2,
+        "Dendy INIT must seed X with 2 per regn spec"
+    );
+}
+
+#[test]
+fn nsf2_appended_regn_dendy_promotes_region() {
+    // Build a v2 NSF whose appended metadata blob carries a regn
+    // chunk with preferred=Dendy. The v1 region byte stays NTSC.
+    let mut buf = vec![0u8; 0x80];
+    buf[..5].copy_from_slice(b"NESM\x1a");
+    buf[0x05] = 2;
+    buf[0x06] = 1;
+    buf[0x07] = 1;
+    buf[0x08..0x0a].copy_from_slice(&0x8000u16.to_le_bytes());
+    buf[0x0a..0x0c].copy_from_slice(&0x8000u16.to_le_bytes());
+    buf[0x0c..0x0e].copy_from_slice(&0x8003u16.to_le_bytes());
+    buf[0x6e..0x70].copy_from_slice(&16666u16.to_le_bytes());
+    buf[0x78..0x7a].copy_from_slice(&19997u16.to_le_bytes());
+    buf[0x7a] = 0x00; // NTSC byte
+    buf[0x7c] = 0x00; // no feature bits
+
+    // Program block: a single RTS.
+    let program = vec![0x60u8];
+    // 24-bit length of program at $7D-$7F.
+    let plen = program.len() as u32;
+    buf[0x7d] = plen as u8;
+    buf[0x7e] = (plen >> 8) as u8;
+    buf[0x7f] = (plen >> 16) as u8;
+    buf.extend_from_slice(&program);
+
+    // Appended NSFe-style metadata: regn preferred=Dendy.
+    let mut meta = Vec::new();
+    push_chunk(&mut meta, b"regn", &[0x07, 0x02]);
+    buf.extend_from_slice(&meta);
+
+    let h = parse_nsf(&buf).unwrap();
+    assert_eq!(
+        h.region,
+        NsfRegion::Dendy,
+        "NSF2 appended regn must override the v1 region byte"
+    );
+}
+
+#[test]
+fn mixe_overrides_set_per_device_gain_table() {
+    use oxideav_nsf::Apu2A03;
+    let mut apu = Apu2A03::new();
+    let entries = [
+        NsfeMixerEntry {
+            device: 0,
+            millibel: 0,
+        }, // APU squares → 1.0
+        NsfeMixerEntry {
+            device: 1,
+            millibel: -2000,
+        }, // APU TND   → 10^(-1) = 0.1
+        NsfeMixerEntry {
+            device: 4,
+            millibel: 2000,
+        }, // FDS       → 10^( 1) = 10.0
+    ];
+    apu.apply_mixe_overrides(&entries);
+    let g = apu.device_gains();
+    assert!((g[0] - 1.0).abs() < 1e-6);
+    assert!((g[1] - 0.1).abs() < 1e-4);
+    assert!((g[4] - 10.0).abs() < 1e-3);
+    // Unmentioned slots stay at the default 1.0.
+    assert!((g[2] - 1.0).abs() < 1e-6);
+    assert!((g[7] - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn mixe_overrides_propagate_into_apu_output() {
+    // Drive pulse 1 to a non-zero output, then halve the APU-squares
+    // gain via a -6dB (-600 mB) mixe override. The output sample
+    // should drop accordingly.
+    use oxideav_nsf::Apu2A03;
+    let mut apu = Apu2A03::new();
+    apu.set_cpu_hz(1_789_773);
+    apu.write_status(0x01);
+    apu.write_register(0x4000, 0xBF); // duty 50, constant vol 15, halted
+    apu.write_register(0x4002, 0x40);
+    apu.write_register(0x4003, 0x00);
+    // Spin enough cycles to advance the duty step into a high slot.
+    let mut high = 0.0f32;
+    for _ in 0..64 {
+        apu.tick_cpu_cycles(64);
+        let s = apu.output_sample();
+        if s > high {
+            high = s;
+        }
+    }
+    assert!(high > 0.0, "baseline mixer never emitted output");
+
+    // Halve via -6 dB (-600 mB) on APU squares.
+    apu.apply_mixe_overrides(&[NsfeMixerEntry {
+        device: 0,
+        millibel: -600,
+    }]);
+    let mut high2 = 0.0f32;
+    for _ in 0..64 {
+        apu.tick_cpu_cycles(64);
+        let s = apu.output_sample();
+        if s > high2 {
+            high2 = s;
+        }
+    }
+    // -6 dB ≈ 0.501. Allow generous tolerance for non-linear mixer +
+    // duty-step phase drift between the two test windows.
+    let ratio = high2 / high;
+    assert!(
+        (0.40..=0.60).contains(&ratio),
+        "expected ~0.50 gain ratio, got {ratio}"
+    );
+}
+
+#[test]
+fn player_exposes_plst_playlist_helpers() {
+    let bytes = synth_nsfe_with_extended_chunks();
+    let h = parse_nsf(&bytes).unwrap();
+    let player = NsfPlayer::new(h, 44_100);
+    // Synth ships plst = [1, 0, 2] and psfx = [2].
+    assert_eq!(player.playlist_len(), 3);
+    assert_eq!(player.sfx_playlist_len(), 1);
+    // plst stores 0-based song indexes; helper converts to 1-based.
+    assert_eq!(player.playlist_song(0), Some(2));
+    assert_eq!(player.playlist_song(1), Some(1));
+    assert_eq!(player.playlist_song(2), Some(3));
+    assert_eq!(player.playlist_song(3), None);
+    let collected: Vec<u8> = player.playlist_iter().collect();
+    assert_eq!(collected, vec![2u8, 1, 3]);
+    assert_eq!(player.sfx_playlist_song(0), Some(3));
+}
+
+#[test]
+fn start_playlist_entry_seeds_the_song_index() {
+    // Build a v1 NSF with 3 songs + an appended NSFe blob carrying a
+    // 2-entry plst. Then exercise start_playlist_entry.
+    let mut buf = vec![0u8; 0x80];
+    buf[..5].copy_from_slice(b"NESM\x1a");
+    buf[0x05] = 2;
+    buf[0x06] = 3;
+    buf[0x07] = 1;
+    buf[0x08..0x0a].copy_from_slice(&0x8000u16.to_le_bytes());
+    buf[0x0a..0x0c].copy_from_slice(&0x8000u16.to_le_bytes());
+    buf[0x0c..0x0e].copy_from_slice(&0x8003u16.to_le_bytes());
+    buf[0x6e..0x70].copy_from_slice(&16666u16.to_le_bytes());
+    let program = vec![0x60u8];
+    let plen = program.len() as u32;
+    buf[0x7d] = plen as u8;
+    buf[0x7e] = (plen >> 8) as u8;
+    buf[0x7f] = (plen >> 16) as u8;
+    buf.extend_from_slice(&program);
+    let mut meta = Vec::new();
+    push_chunk(&mut meta, b"plst", &[2u8, 0]);
+    buf.extend_from_slice(&meta);
+
+    let h = parse_nsf(&buf).unwrap();
+    let mut player = NsfPlayer::new(h, 44_100);
+    // Entry 0 of the playlist is song index 2 → 1-based song 3.
+    let started = player.start_playlist_entry(0);
+    assert_eq!(started, Some(3));
+    // INIT seeded A with (song-1) = 2.
+    assert_eq!(player.cpu.a, 2);
+    // Out-of-range entry returns None and leaves the player as-is.
+    assert!(player.start_playlist_entry(99).is_none());
+}
+
+#[test]
+fn dendy_player_renders_audible_pcm_through_dendy_clock() {
+    // Borrow the synth NSFe shape but make the program something audible:
+    // load $8000 with a tiny init that primes pulse-1 at constant volume.
+    let mut out = Vec::new();
+    out.extend_from_slice(b"NSFE");
+    let info: [u8; 10] = [0x00, 0x80, 0x00, 0x80, 0x20, 0x80, 0x00, 0x00, 1, 0];
+    push_chunk(&mut out, b"INFO", &info);
+    push_chunk(&mut out, b"regn", &[0x07u8, 0x02]); // prefer Dendy
+
+    // Program: enable pulse 1 + program a fixed period/duty + RTS.
+    // PLAY at $8020 is a single RTS.
+    let mut program = vec![
+        0xA9, 0x01, 0x8D, 0x15, 0x40, // LDA #$01 / STA $4015
+        0xA9, 0xBF, 0x8D, 0x00, 0x40, // LDA #$BF / STA $4000
+        0xA9, 0x40, 0x8D, 0x02, 0x40, // LDA #$40 / STA $4002
+        0xA9, 0x00, 0x8D, 0x03, 0x40, // LDA #$00 / STA $4003
+        0x60, // RTS
+    ];
+    while program.len() < 0x20 {
+        program.push(0xEA);
+    }
+    program.push(0x60); // PLAY: RTS
+    push_chunk(&mut out, b"DATA", &program);
+    push_chunk(&mut out, b"NEND", &[]);
+
+    let h = parse_nsf(&out).unwrap();
+    let mut player = NsfPlayer::new(h, 44_100);
+    player.start_song(1);
+    let mut buf = vec![0i16; 4096];
+    let n = player.render(&mut buf);
+    assert_eq!(n, buf.len(), "Dendy player halted prematurely");
+    let peak = buf.iter().map(|s| s.unsigned_abs() as u32).max().unwrap();
+    assert!(peak > 1000, "Dendy render too quiet: peak {peak}");
+}

@@ -39,12 +39,22 @@ pub const NSFE_MAGIC: [u8; 4] = *b"NSFE";
 /// Fixed header size for the v1.x format.
 pub const NSF_HEADER_LEN: usize = 0x80;
 
-/// Region indicator (the low two bits of the v1 region byte).
+/// Region indicator (the low two bits of the v1 region byte plus the
+/// NSFe `regn` chunk's preferred-region byte).
+///
+/// The v1 NSF header byte at `$7A` only encodes NTSC vs PAL vs dual —
+/// Dendy is exclusively surfaced through the `regn` extended chunk per
+/// `docs/audio/nsf/nsfe-nesdev-wiki.html` §regn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NsfRegion {
     Ntsc,
     Pal,
     Dual,
+    /// Dendy — Russian NES clone running at 1.773448 MHz CPU clock.
+    /// `regn.preferred == 2` selects this; the INIT call receives
+    /// `X=2` per spec. When the dedicated Dendy play-period is absent
+    /// the player falls back to the PAL period (per the same spec).
+    Dendy,
 }
 
 impl NsfRegion {
@@ -162,18 +172,45 @@ pub struct NsfHeader {
 
 impl NsfHeader {
     /// Returns the playback rate in Hz for the chosen region.
+    ///
+    /// Per `docs/audio/nsf/nsfe-nesdev-wiki.html` §RATE: if the
+    /// region-specific period is zero the player uses the region's
+    /// default (NTSC 60.0024 Hz / PAL 50.006 Hz). Dendy falls back to
+    /// the dedicated Dendy speed (`NsfeRate::dendy_us`) first, then
+    /// to the PAL speed, then to the PAL default — exactly as the
+    /// spec dictates.
     pub fn play_rate_hz(&self) -> f64 {
-        let us = match self.region {
-            NsfRegion::Pal => self.pal_speed_us,
-            NsfRegion::Ntsc | NsfRegion::Dual => self.ntsc_speed_us,
-        };
+        let us = self.play_period_us();
         if us == 0 {
             match self.region {
-                NsfRegion::Pal => 50.006,
+                NsfRegion::Pal | NsfRegion::Dendy => 50.006,
                 NsfRegion::Ntsc | NsfRegion::Dual => 60.0024,
             }
         } else {
             1_000_000.0 / us as f64
+        }
+    }
+
+    /// Effective per-region play period in microseconds. Looks at the
+    /// dedicated Dendy speed (NSFe `RATE` chunk byte $0004) before
+    /// falling back to the PAL field, matching the spec text.
+    pub fn play_period_us(&self) -> u16 {
+        match self.region {
+            NsfRegion::Pal => self.pal_speed_us,
+            NsfRegion::Dendy => {
+                let dendy = self
+                    .metadata
+                    .rate
+                    .as_ref()
+                    .and_then(|r| r.dendy_us)
+                    .unwrap_or(0);
+                if dendy != 0 {
+                    dendy
+                } else {
+                    self.pal_speed_us
+                }
+            }
+            NsfRegion::Ntsc | NsfRegion::Dual => self.ntsc_speed_us,
         }
     }
 
@@ -342,6 +379,25 @@ fn parse_nsf_v1(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
     }
     let track_labels = std::mem::take(&mut metadata.track_labels);
 
+    // NSF2 appended metadata may carry a `regn` chunk whose preferred
+    // byte overrides the v1 region byte ($7A). Specifically, Dendy is
+    // exclusively surfaced through `regn` per spec.
+    let region = match metadata.regions.as_ref().and_then(|r| r.preferred) {
+        Some(0) => NsfRegion::Ntsc,
+        Some(1) => NsfRegion::Pal,
+        Some(2) => NsfRegion::Dendy,
+        _ => region,
+    };
+
+    // `RATE` chunk (when present) overrides the v1 header period fields.
+    let (ntsc_speed_us, pal_speed_us) = match &metadata.rate {
+        Some(rate) => (
+            rate.ntsc_us.unwrap_or(ntsc_speed_us),
+            rate.pal_us.unwrap_or(pal_speed_us),
+        ),
+        None => (ntsc_speed_us, pal_speed_us),
+    };
+
     Ok(NsfHeader {
         version,
         total_songs,
@@ -460,13 +516,13 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         None => (0, 0),
     };
 
-    // regn overrides the INFO byte-6 region when present.
+    // regn overrides the INFO byte-6 region when present. Dendy is
+    // exclusively surfaced through this chunk per spec — there is no
+    // v1-byte $7A encoding for it.
     let region = match metadata.regions.as_ref().and_then(|r| r.preferred) {
         Some(0) => NsfRegion::Ntsc,
         Some(1) => NsfRegion::Pal,
-        // Dendy (preferred = 2) plays back on the PAL clock per spec
-        // until/unless we model the Dendy clock as its own variant.
-        Some(2) => NsfRegion::Pal,
+        Some(2) => NsfRegion::Dendy,
         _ => NsfRegion::from_byte(info.region),
     };
 

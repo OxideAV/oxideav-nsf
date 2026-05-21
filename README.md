@@ -14,7 +14,11 @@ paradigms. Round 4 adds: full NSFe extended-chunk metadata
 (`auth` / `tlbl` / `taut` / `text` / `time` / `fade` / `plst` /
 `psfx` / `mixe` / `regn` / `RATE` / `VRC7`) decoded for both NSFe
 and NSF2 appended-metadata blobs; APU frame-counter + DMC IRQs
-wired into the bus IRQ line.
+wired into the bus IRQ line. Round 5 adds: dedicated Dendy region
+on a 1.773448 MHz CPU clock with `regn`-driven promotion + INIT
+`X=2` + `RATE` Dendy-period preference; NSFe `mixe` per-device
+gain overrides applied to the APU mixer (linear gain from signed
+millibels); `plst` / `psfx` playlist iteration API on `NsfPlayer`.
 
 ## Round 2 scope
 
@@ -73,6 +77,16 @@ wired into the bus IRQ line.
     raises the flag. Acknowledged by `$4015` read.
   * Non-linear closed-form mixer per nesdev.org/wiki/APU_Mixer plus
     linearly-summed expansion-chip outputs.
+  * **NSFe `mixe` per-device gain overrides** (round 5) — `Apu2A03`
+    carries an 8-slot `device_gain` table indexed by NSFe device id
+    (`apu::mixe_device::{APU_SQUARES, APU_TND, VRC6, VRC7, FDS,
+    MMC5, N163, S5B}`). `apply_mixe_overrides` decodes signed
+    millibels via `10^(mB/2000)` linear gain (per the
+    `dB = 20·log10` §mixe convention) and `output_sample` multiplies
+    each channel's contribution by the matching slot.
+    `Expansion::output_with_device_gain` runs the same scaling on
+    the expansion-chip path. `NsfPlayer::new` auto-applies the
+    overrides from `header.metadata.mixer`.
 * **Bankswitching** ([`bus`]):
   * `bankswitch_init` triggers 4 KiB-bank pool construction; eight
     bank-select registers `$5FF8..=$5FFF` route windows in
@@ -104,7 +118,16 @@ wired into the bus IRQ line.
   * Loads the program (or builds the bank pool when bankswitching is
     active), runs the `init` routine for a chosen song, then steps
     CPU + APU at the NES clock and invokes `play` once per
-    `play_period` (NTSC ~60 Hz / PAL ~50 Hz).
+    `play_period` (NTSC ~60 Hz / PAL ~50 Hz / Dendy ~50 Hz).
+  * **Dendy region** (round 5) — `regn` preferred = 2 promotes
+    `NsfRegion::Dendy`; the player runs on the 1.773448 MHz Dendy
+    CPU clock and seeds INIT with `X = 2` per
+    `docs/audio/nsf/nsfe-nesdev-wiki.html` §regn. Period preference
+    is Dendy RATE → PAL RATE → 19 997 µs default.
+  * **`plst` / `psfx` playlist API** (round 5) — `playlist_len`,
+    `playlist_song(idx)`, `playlist_iter()`, `start_playlist_entry(idx)`
+    plus the symmetric `sfx_*` getters. The on-disk 0-based song
+    indexes are lifted to the 1-based convention `start_song` uses.
   * Resamples to 44 100 Hz mono S16 by hold-and-pick.
   * **NSF2 paradigms** (round 3):
     * **IRQ support** — the player honours `$7C` bit 4 by enabling
@@ -145,8 +168,16 @@ wired into the bus IRQ line.
 * Expansion-chip unit tests cover register decoding for VRC6, MMC5,
   Sunsoft 5B, FDS, and N163 — plus the routing logic in
   [`expansion::Expansion`].
+* Round-5 integration tests cover: Dendy region detection from
+  `regn`, fallback to PAL speed when the Dendy RATE field is absent,
+  Dendy CPU clock + INIT `X = 2` seeding, NSF 2 appended-`regn`
+  promotion to Dendy, `mixe` gain-table construction (`10^(mB/2000)`),
+  `mixe` gain propagating into `output_sample` at ~0.5x for -6 dB,
+  `plst` helpers (`playlist_song` / `playlist_iter` /
+  `start_playlist_entry`), and an end-to-end Dendy render that
+  produces non-trivial PCM.
 
-## Round 5+ followups
+## Round 6+ followups
 
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   read-cycle-stall behaviour, DMC CPU-stall halt-cycle accounting).
@@ -163,13 +194,6 @@ wired into the bus IRQ line.
   rebiasing.
 * MMC5 PCM: round 4 leaves the channel decoded at register-level only;
   needs a software-mode timer + read-mode wiring.
-* Dendy region: round 4 decodes `regn` preferred=2 and the `RATE`
-  Dendy field, but `NsfPlayer` still folds Dendy onto the PAL clock
-  — add a third CPU-Hz constant + a `NsfRegion::Dendy` variant.
-* Apply NSFe `mixe` overrides to the APU's per-device output gains
-  (currently surfaced for callers but not consumed by the mixer).
-* `plst` / `psfx` playlist iteration in the player API (currently the
-  caller chooses a song index by hand).
 * RIFF-NSF container variant.
 * `oxideav-source` magic-detection registration so the framework
   auto-dispatches `*.nsf` and `*.nsfe` URIs.

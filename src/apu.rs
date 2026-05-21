@@ -569,6 +569,26 @@ impl DmcChannel {
     }
 }
 
+/// Number of distinct NSFe `mixe` device-id slots per
+/// `docs/audio/nsf/nsfe-nesdev-wiki.html` §mixe. The spec enumerates
+/// 0..=7:
+/// `0 APU Squares / 1 APU Triangle+Noise+DPCM / 2 VRC6 / 3 VRC7 /
+///  4 FDS / 5 MMC5 / 6 N163 / 7 Sunsoft 5B`.
+pub const MIXE_DEVICE_COUNT: usize = 8;
+
+/// `mixe` device-id constants for callers that want to construct a
+/// table directly instead of going through the parsed NSFe metadata.
+pub mod mixe_device {
+    pub const APU_SQUARES: u8 = 0;
+    pub const APU_TND: u8 = 1;
+    pub const VRC6: u8 = 2;
+    pub const VRC7: u8 = 3;
+    pub const FDS: u8 = 4;
+    pub const MMC5: u8 = 5;
+    pub const N163: u8 = 6;
+    pub const S5B: u8 = 7;
+}
+
 /// 2A03 APU — five channels + frame counter + status / mixer + the
 /// expansion-chip aggregate.
 pub struct Apu2A03 {
@@ -599,6 +619,15 @@ pub struct Apu2A03 {
     /// PAL flag — toggles the DMC rate table.
     pal: bool,
 
+    /// Linear gain per NSFe `mixe` device id. `1.0` = unchanged.
+    /// Index 0 = APU squares, 1 = APU triangle/noise/DPCM, 2..=7 =
+    /// VRC6 / VRC7 / FDS / MMC5 / N163 / 5B. Populated from a
+    /// `Vec<NsfeMixerEntry>` via [`Apu2A03::apply_mixe_overrides`].
+    /// All gains default to `1.0`; an override of `+X` millibels
+    /// produces `10^(X/2000)` (using the
+    /// `dB = 20 * log10(linear)` convention from the §mixe spec).
+    device_gain: [f32; MIXE_DEVICE_COUNT],
+
     /// Aggregate of the active expansion chips.
     pub expansion: crate::expansion::Expansion,
 }
@@ -624,8 +653,30 @@ impl Apu2A03 {
             frame_acc: 0,
             frame_step: 0,
             pal: false,
+            device_gain: [1.0; MIXE_DEVICE_COUNT],
             expansion: crate::expansion::Expansion::new(),
         }
+    }
+
+    /// Apply NSFe `mixe` per-device millibel overrides. The spec says
+    /// each entry is a signed 16-bit millibel comparison with the
+    /// reference square at maximum volume — the player converts it to
+    /// a linear gain via `10^(mB/2000)` and multiplies the channel's
+    /// post-mixer contribution by that gain. Devices not mentioned by
+    /// the entries keep their existing gain (default `1.0`).
+    pub fn apply_mixe_overrides(&mut self, entries: &[crate::nsfe::NsfeMixerEntry]) {
+        for entry in entries {
+            if (entry.device as usize) < MIXE_DEVICE_COUNT {
+                let mb = entry.millibel as f32;
+                let linear = 10.0f32.powf(mb / 2000.0);
+                self.device_gain[entry.device as usize] = linear;
+            }
+        }
+    }
+
+    /// Inspect the current per-device gain table (mostly for tests).
+    pub fn device_gains(&self) -> [f32; MIXE_DEVICE_COUNT] {
+        self.device_gain
     }
 
     pub fn set_cpu_hz(&mut self, hz: u32) {
@@ -853,8 +904,11 @@ impl Apu2A03 {
     }
 
     /// Closed-form non-linear mix per nesdev.org/wiki/APU_Mixer, plus
-    /// the linearly-mixed expansion-chip outputs.
-    /// Output is in the range 0.0 .. ~1.5 once expansion chips fire.
+    /// the linearly-mixed expansion-chip outputs, scaled by the NSFe
+    /// `mixe` per-device gain table.
+    ///
+    /// Output is in the range 0.0 .. ~1.5 once expansion chips fire
+    /// (gain overrides can push that higher).
     pub fn output_sample(&self) -> f32 {
         let p1 = self.pulse1.output() as f32;
         let p2 = self.pulse2.output() as f32;
@@ -872,7 +926,9 @@ impl Apu2A03 {
         } else {
             159.79 / (1.0 / tnd_sum + 100.0)
         };
-        pulse_out + tnd_out + self.expansion.output()
+        let core = pulse_out * self.device_gain[mixe_device::APU_SQUARES as usize]
+            + tnd_out * self.device_gain[mixe_device::APU_TND as usize];
+        core + self.expansion.output_with_device_gain(&self.device_gain)
     }
 }
 

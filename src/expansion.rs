@@ -843,6 +843,33 @@ impl Expansion {
         }
         o
     }
+
+    /// Linearly-mixed expansion output with per-device gain applied
+    /// from the NSFe `mixe` table. `device_gain` is indexed by the
+    /// NSFe device id constants in [`crate::apu::mixe_device`]; only
+    /// indexes 2..=7 (VRC6 / VRC7 / FDS / MMC5 / N163 / 5B) are read.
+    pub fn output_with_device_gain(&self, device_gain: &[f32; 8]) -> f32 {
+        let mut o = 0.0f32;
+        if self.vrc6.enabled {
+            o += self.vrc6.output() * device_gain[crate::apu::mixe_device::VRC6 as usize];
+        }
+        if self.vrc7.enabled {
+            o += self.vrc7.output() * device_gain[crate::apu::mixe_device::VRC7 as usize];
+        }
+        if self.mmc5.enabled {
+            o += self.mmc5.output() * device_gain[crate::apu::mixe_device::MMC5 as usize];
+        }
+        if self.n163.enabled {
+            o += self.n163.output() * device_gain[crate::apu::mixe_device::N163 as usize];
+        }
+        if self.s5b.enabled {
+            o += self.s5b.output() * device_gain[crate::apu::mixe_device::S5B as usize];
+        }
+        if self.fds.enabled {
+            o += self.fds.output() * device_gain[crate::apu::mixe_device::FDS as usize];
+        }
+        o
+    }
 }
 
 #[cfg(test)]
