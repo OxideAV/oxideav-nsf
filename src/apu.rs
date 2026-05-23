@@ -64,9 +64,17 @@ const TRIANGLE_TABLE: [u8; 32] = [
     13, 14, 15,
 ];
 
-/// Noise period table (NTSC).
+/// Noise period table (NTSC) — nesdev.org/wiki/APU_Noise §"Period".
 const NOISE_PERIOD_NTSC: [u16; 16] = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
+];
+
+/// Noise period table (PAL) — nesdev.org/wiki/APU_Noise §"Period". The
+/// PAL 2A07 uses a distinct divider table because the channel timer
+/// counts CPU cycles and the PAL CPU runs at a different rate; without
+/// it a PAL rip's noise channel plays at the wrong pitch.
+const NOISE_PERIOD_PAL: [u16; 16] = [
+    4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778,
 ];
 
 #[derive(Default)]
@@ -336,11 +344,16 @@ impl TriangleChannel {
 struct NoiseChannel {
     enabled: bool,
     mode: bool, // true = short-period (tap bit 6), false = long (tap bit 1)
+    /// Period selector (`$400E` low nibble) — kept so the period can be
+    /// re-derived if the region (NTSC/PAL) flips after the write.
+    period_index: u8,
     timer_period: u16,
     timer: u16,
     shift: u16,
     envelope: Envelope,
     length: LengthCounter,
+    /// True when the PAL period table should be used.
+    pal: bool,
 }
 
 impl NoiseChannel {
@@ -351,6 +364,20 @@ impl NoiseChannel {
         }
     }
 
+    fn period_for(period_index: u8, pal: bool) -> u16 {
+        let idx = (period_index & 0x0F) as usize;
+        if pal {
+            NOISE_PERIOD_PAL[idx]
+        } else {
+            NOISE_PERIOD_NTSC[idx]
+        }
+    }
+
+    fn set_pal(&mut self, pal: bool) {
+        self.pal = pal;
+        self.timer_period = Self::period_for(self.period_index, pal);
+    }
+
     fn write_main(&mut self, value: u8) {
         self.length.halt = value & 0x20 != 0;
         self.envelope.write(value);
@@ -358,7 +385,8 @@ impl NoiseChannel {
 
     fn write_period(&mut self, value: u8) {
         self.mode = value & 0x80 != 0;
-        self.timer_period = NOISE_PERIOD_NTSC[(value & 0x0F) as usize];
+        self.period_index = value & 0x0F;
+        self.timer_period = Self::period_for(self.period_index, self.pal);
     }
 
     fn write_length(&mut self, value: u8) {
@@ -682,8 +710,10 @@ impl Apu2A03 {
     pub fn set_cpu_hz(&mut self, hz: u32) {
         self.cpu_hz = hz;
         self.pal = hz < 1_700_000;
-        // Refresh DMC timer period under the new rate table.
+        // Refresh the DMC + noise timer periods under the new rate /
+        // period tables (both are CPU-rate-dependent on the PAL 2A07).
         self.dmc.timer_period = DmcChannel::rate_for(self.dmc.rate_index, self.pal);
+        self.noise.set_pal(self.pal);
     }
 
     pub fn set_expansion(&mut self, flags: crate::header::ExpansionChips) {
@@ -984,6 +1014,28 @@ mod tests {
         }
         // The LFSR is now in some non-1 state.
         assert_ne!(apu.noise.shift, 1);
+    }
+
+    #[test]
+    fn noise_period_table_follows_region() {
+        // Default region is NTSC: the fastest index ($F) is 4068 cycles.
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x400E, 0x0F);
+        assert_eq!(apu.noise.timer_period, 4068);
+        // Index $0 → 4 on both tables; index $5 differs (96 NTSC, 88 PAL).
+        apu.write_register(0x400E, 0x05);
+        assert_eq!(apu.noise.timer_period, 96);
+
+        // Switch to a PAL clock: the period table flips and the stored
+        // index is re-derived against the PAL table.
+        apu.set_cpu_hz(1_662_607);
+        assert_eq!(apu.noise.timer_period, 88, "index $5 PAL = 88");
+        apu.write_register(0x400E, 0x0F);
+        assert_eq!(apu.noise.timer_period, 3778, "index $F PAL = 3778");
+
+        // Back to NTSC: the same index re-derives to the NTSC value.
+        apu.set_cpu_hz(1_789_773);
+        assert_eq!(apu.noise.timer_period, 4068);
     }
 
     #[test]

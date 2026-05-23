@@ -19,6 +19,9 @@ on a 1.773448 MHz CPU clock with `regn`-driven promotion + INIT
 `X=2` + `RATE` Dendy-period preference; NSFe `mixe` per-device
 gain overrides applied to the APU mixer (linear gain from signed
 millibels); `plst` / `psfx` playlist iteration API on `NsfPlayer`.
+Round 6 adds: region-aware noise channel — the PAL divider table
+joins the NTSC one so PAL/2A07 rips no longer play their noise
+channel at NTSC pitch.
 
 ## Round 2 scope
 
@@ -64,7 +67,11 @@ millibels); `plst` / `psfx` playlist iteration API on `NsfPlayer`.
 * **2A03 APU emulator** ([`Apu2A03`]):
   * Pulse 1 + Pulse 2 (sweep, envelope, length counter, duty).
   * Triangle (linear counter, length counter, 32-step sequencer).
-  * Noise (LFSR with both tap modes).
+  * Noise (LFSR with both tap modes). Round 6 makes the period
+    region-aware — NTSC and PAL divider tables per
+    `docs/audio/nsf/apu-noise-wiki.html`, selected off the same
+    region flag the DMC uses and re-derived when `set_cpu_hz`
+    flips the region.
   * **DMC fully wired** — sample-fetch DMA via the bus, NTSC + PAL
     rate tables, looping flag, IRQ flag surfaced through `$4015`
     (cleared on read) AND through `NesBus::irq_line()` (round 4),

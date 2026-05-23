@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Region-aware noise period table** (round 6): the noise channel now
+  carries both the NTSC and the PAL divider tables from
+  `docs/audio/nsf/apu-noise-wiki.html` §"Period"
+  (`[4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944,
+  1890, 3778]` for PAL) and selects between them off the same `pal`
+  flag the DMC already follows. `Apu2A03::set_cpu_hz` re-derives the
+  active noise period when the region flips, and `$400E` stores the
+  period index so a later region change still picks the correct
+  divider. Previously a PAL rip's noise channel always used the NTSC
+  table and played at the wrong pitch.
+
 - **Dendy region support** (round 5): new `NsfRegion::Dendy` variant
   carrying the 1.773448 MHz CPU clock per
   `docs/audio/nsf/apu-pulse-wiki.html`. NSFe `regn` chunks with
