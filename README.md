@@ -25,6 +25,12 @@ channel at NTSC pitch. Round 7 adds: the FDS frequency-modulation
 unit — the wave output now advances at the modulated pitch (mod
 table → signed mod counter → pitch formula → 20-bit `wave_pitch`)
 instead of the raw register frequency, so FDS vibrato is audible.
+Round 8 adds: the FDS volume + mod envelope ramp generators — the
+`$4080`/`$4084`/`$408A`/`$4083` envelope units ramp their gains on the
+documented `c = 8·(e+1)·(m+1)` timer (with master-speed disable, the
+`$4083` halt + 4x-speed bits, and the wave-position-0 PWM latch), so
+FDS attack/decay/tremolo and mod-gain sweeps are no longer
+register-level only.
 
 ## Round 2 scope
 
@@ -133,8 +139,15 @@ instead of the raw register frequency, so FDS vibrato is audible.
     pitch formula into a 20-bit `wave_pitch` that drives the wave
     output unit. `$4085` directly sets the counter; `$4087` bit 7
     resets the mod accumulator; `$4088` writes the table only while
-    the unit is disabled. The volume/mod envelope *ramp* generators
-    are still register-level only.
+    the unit is disabled. Round 8 adds the volume + mod envelope ramp
+    generators: each runs a `c = 8·(e+1)·(m+1)` CPU-cycle timer
+    (`$4080`/`$4084` speed × `$408A` master speed) and steps its gain
+    ±1 toward the 0..=32 range on the active edge; `$408A = 0` disables
+    both, `$4083` bit 6 halts + resets their timers, `$4083` bit 7 runs
+    them 4x faster, and a volume-gain *change* only commits while the
+    wave position is 0 (direct gain-0 writes mute immediately). The
+    slow PWM volume-latch on wave-table edges other than position 0 is
+    modelled; cycle-exact sub-tick timer phase is not.
 * **Player glue** ([`NsfPlayer`]):
   * Loads the program (or builds the bank pool when bankswitching is
     active), runs the `init` routine for a chosen song, then steps
@@ -189,6 +202,15 @@ instead of the raw register frequency, so FDS vibrato is audible.
 * Expansion-chip unit tests cover register decoding for VRC6, MMC5,
   Sunsoft 5B, FDS, and N163 — plus the routing logic in
   [`expansion::Expansion`].
+* Round-8 FDS unit tests cover the `c = 8·(e+1)·(m+1)` envelope-period
+  formula (including the `$4083` 4x-fast division and the master-speed-0
+  disable), the volume envelope decreasing to 0 and increasing to its 32
+  clamp, the mod envelope ramping the mod gain in both directions,
+  master-speed-0 freezing the envelopes, `$4083` bit-6 halt/resume,
+  `$4083` bit-7 4x speed, the `$4080` mode-bit direct-write and
+  immediate-mute paths, the wave-position-0 PWM latch staging a
+  volume-gain change until the wave position returns to 0, and the mode
+  bit blocking the ramp entirely.
 * Round-7 FDS unit tests cover the modulation pitch formula against
   the spec's C-style reference (centered, positive-round-up, and
   negative-counter branches), the `$4084` mod-gain / `$4085`
@@ -206,10 +228,14 @@ instead of the raw register frequency, so FDS vibrato is audible.
   `start_playlist_entry`), and an end-to-end Dendy render that
   produces non-trivial PCM.
 
-## Round 7+ followups
+## Round 8+ followups
 
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
-  read-cycle-stall behaviour, DMC CPU-stall halt-cycle accounting).
+  read-cycle-stall behaviour, DMC CPU-stall halt-cycle accounting). For
+  FDS specifically: the envelope tick timers are stepped in CPU-cycle
+  batches, not per individual cycle, so sub-tick write-resets land on a
+  batch boundary rather than the exact write cycle — adequate for music,
+  not cycle-exact.
 * VRC7: replace the 2-operator approximation with a real OPLL operator
   chain (logarithmic sin / exp tables, 4-bit feedback, full envelope
   generator). Blocked on OPLL logsin/exp/EG-rate table sizes which
@@ -219,12 +245,11 @@ instead of the raw register frequency, so FDS vibrato is audible.
   ready when the OPLL ops doc lands.)
 * N163: per-channel timer accumulators (currently the 8 channels share
   a coarse phase model).
-* FDS: the volume + mod-gain **envelope ramp generators** (`$4080` /
-  `$4084` bit-6 direction, `$408A` / `$408A` master speed, the
-  `c = 8·(e+1)·(m+1)` tick timing, and the "volume change only takes
-  effect when the wave position is 0" PWM latch). Round 7 landed the
-  frequency-modulation unit; these slow envelope ramps remain
-  register-level only.
+* FDS: the round-8 envelope ramp generators advance their gains on the
+  documented timer; the remaining gap is the `$4023.D1` waveform-halt
+  behaviour (constant `$4040` output + envelopes not ticked while
+  halted, per the §"Frequency high" TODO) and cycle-exact envelope
+  timer phase on register-write resets.
 * MMC5 PCM: round 4 leaves the channel decoded at register-level only;
   needs a software-mode timer + read-mode wiring.
 * RIFF-NSF container variant.

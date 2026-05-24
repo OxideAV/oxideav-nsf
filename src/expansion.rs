@@ -651,6 +651,38 @@ pub struct Fds {
     pub wave_write_enable: bool,
     /// CPU-cycle remainder toward the next 16-cycle unit tick.
     pub cycle_acc: u32,
+
+    // ---- envelope ramp generators (`$4080` / `$4084` / `$408A` / `$4083`)
+    /// 6-bit volume-envelope speed `e` from `$4080` (set regardless of
+    /// the mode bit).
+    pub vol_env_speed: u8,
+    /// `$4080` bit 6: 0 = decrease, 1 = increase.
+    pub vol_env_increase: bool,
+    /// `$4080` bit 7 (mode): true = envelope disabled (gain set
+    /// directly), false = the ramp runs.
+    pub vol_env_disabled: bool,
+    /// CPU clocks remaining until the next volume-envelope tick.
+    pub vol_env_timer: u32,
+    /// 6-bit mod-envelope speed `e` from `$4084`.
+    pub mod_env_speed: u8,
+    /// `$4084` bit 6 direction.
+    pub mod_env_increase: bool,
+    /// `$4084` bit 7 (mode): true = mod gain set directly, no ramp.
+    pub mod_env_disabled: bool,
+    /// CPU clocks remaining until the next mod-envelope tick.
+    pub mod_env_timer: u32,
+    /// 8-bit master envelope speed `m` from `$408A` (0 disables both
+    /// envelopes); BIOS initial value is `$E8`.
+    pub master_env_speed: u8,
+    /// `$4083` bit 7: run both envelopes 4x faster.
+    pub env_fast: bool,
+    /// `$4083` bit 6: halt both envelopes (and reset their timers).
+    pub env_halt: bool,
+    /// Volume gain pending latch: the §"Unit tick" PWM unit only commits
+    /// a volume-gain change while the wave position is 0, so a ramp step
+    /// stages the new gain here and `output`/`tick` commits it once
+    /// `wave_pos == 0`. `None` means "no change pending".
+    pub vol_pending: Option<u8>,
 }
 
 impl Default for Fds {
@@ -672,6 +704,20 @@ impl Default for Fds {
             wave_acc: 0,
             wave_write_enable: false,
             cycle_acc: 0,
+            vol_env_speed: 0,
+            vol_env_increase: false,
+            vol_env_disabled: true,
+            vol_env_timer: 0,
+            mod_env_speed: 0,
+            mod_env_increase: false,
+            mod_env_disabled: true,
+            mod_env_timer: 0,
+            // BIOS initialises $408A to $E8; default to that so a rip
+            // that never writes it still ticks the envelopes.
+            master_env_speed: 0xE8,
+            env_fast: false,
+            env_halt: false,
+            vol_pending: None,
         }
     }
 }
@@ -687,20 +733,52 @@ impl Fds {
                 self.wave[(addr - 0x4040) as usize] = value & 0x3F;
             }
             0x4080 => {
-                self.volume = value & 0x3F;
+                // Volume envelope ($4080): MDVV VVVV. The 6-bit speed is
+                // latched whether or not the ramp is enabled; the volume
+                // gain is set directly only when the mode bit (M) is high.
+                self.vol_env_speed = value & 0x3F;
+                self.vol_env_increase = value & 0x40 != 0;
+                self.vol_env_disabled = value & 0x80 != 0;
+                if self.vol_env_disabled {
+                    // Direct gain write. Muting (gain 0) takes effect
+                    // immediately; a non-zero gain still honours the
+                    // wave-position-0 PWM latch.
+                    let g = value & 0x3F;
+                    if g == 0 {
+                        self.volume = 0;
+                        self.vol_pending = None;
+                    } else {
+                        self.set_volume_gain(g);
+                    }
+                }
+                // Writing resets this unit's tick timer.
+                self.vol_env_timer = self.vol_env_period();
             }
             0x4082 => {
                 self.freq = (self.freq & 0x0F00) | value as u16;
             }
             0x4083 => {
                 self.freq = (self.freq & 0x00FF) | (((value & 0x0F) as u16) << 8);
+                // Bit 6 halts both envelopes and resets their timers;
+                // bit 7 runs both envelopes 4x faster.
+                self.env_halt = value & 0x40 != 0;
+                self.env_fast = value & 0x80 != 0;
+                if self.env_halt {
+                    self.vol_env_timer = self.vol_env_period();
+                    self.mod_env_timer = self.mod_env_period();
+                }
             }
             0x4084 => {
-                // Mod envelope ($4084): bits 0-5 are the mod gain (set
-                // directly when bit 7 — envelope-disable — is high; we
-                // don't model the slow envelope ramp, so take the gain
-                // either way). Bit 6 is the direction (envelope only).
-                self.mod_gain = value & 0x3F;
+                // Mod envelope ($4084): MDSS SSSS — same layout as the
+                // volume envelope. The speed is always latched; the mod
+                // gain is set directly only when the mode bit is high.
+                self.mod_env_speed = value & 0x3F;
+                self.mod_env_increase = value & 0x40 != 0;
+                self.mod_env_disabled = value & 0x80 != 0;
+                if self.mod_env_disabled {
+                    self.mod_gain = value & 0x3F;
+                }
+                self.mod_env_timer = self.mod_env_period();
             }
             0x4085 => {
                 // Directly set the signed 7-bit mod counter.
@@ -730,7 +808,62 @@ impl Fds {
                 self.master_volume_div = value & 0x03;
                 self.wave_write_enable = value & 0x80 != 0;
             }
+            0x408A => {
+                // Master envelope speed multiplier (`m`); 0 disables both
+                // envelopes. The new value takes effect on the next tick.
+                self.master_env_speed = value;
+            }
             _ => {}
+        }
+    }
+
+    /// CPU clocks per volume-envelope tick: `c = 8 * (e + 1) * (m + 1)`,
+    /// halved twice (÷4) when the `$4083` fast bit is set. Returns 0 when
+    /// the master speed disables the envelopes.
+    fn vol_env_period(&self) -> u32 {
+        Self::env_period(self.vol_env_speed, self.master_env_speed, self.env_fast)
+    }
+
+    /// CPU clocks per mod-envelope tick (same formula as the volume
+    /// envelope but driven from the mod speed register).
+    fn mod_env_period(&self) -> u32 {
+        Self::env_period(self.mod_env_speed, self.master_env_speed, self.env_fast)
+    }
+
+    /// Shared envelope-period formula from §"Frequency calculation and
+    /// timing → Envelopes": `c = 8 * (e + 1) * (m + 1)`. `m == 0`
+    /// disables the envelopes (returns 0). The `$4083` fast bit runs them
+    /// 4x faster.
+    fn env_period(e: u8, m: u8, fast: bool) -> u32 {
+        if m == 0 {
+            return 0;
+        }
+        let c = 8 * (e as u32 + 1) * (m as u32 + 1);
+        if fast {
+            (c / 4).max(1)
+        } else {
+            c
+        }
+    }
+
+    /// Stage a volume-gain change. The §"Unit tick" PWM unit only commits
+    /// a gain change while the wave position is 0, so park the new gain in
+    /// `vol_pending` and let `commit_pending_volume` apply it.
+    fn set_volume_gain(&mut self, gain: u8) {
+        if self.wave_pos == 0 {
+            self.volume = gain;
+            self.vol_pending = None;
+        } else {
+            self.vol_pending = Some(gain);
+        }
+    }
+
+    /// Commit a staged volume-gain change once the wave position reaches 0.
+    fn commit_pending_volume(&mut self) {
+        if self.wave_pos == 0 {
+            if let Some(g) = self.vol_pending.take() {
+                self.volume = g;
+            }
         }
     }
 
@@ -813,13 +946,101 @@ impl Fds {
         }
     }
 
+    /// Step the volume + mod envelope ramp generators by `cycles` CPU
+    /// clocks. Each envelope counts its own `c = 8·(e+1)·(m+1)` timer; on
+    /// underflow it ramps the gain ±1 (clamped 0..=32 on the active edge)
+    /// per §"Unit tick → Envelopes". Disabled (master speed 0), halted
+    /// (`$4083` bit 6), or mode-bit-set envelopes do not ramp.
+    fn env_tick(&mut self, cycles: u32) {
+        if self.env_halt || self.master_env_speed == 0 {
+            return;
+        }
+        // Volume envelope.
+        if !self.vol_env_disabled {
+            let period = self.vol_env_period();
+            if period != 0 {
+                let mut rem = cycles;
+                while rem > 0 {
+                    if self.vol_env_timer == 0 {
+                        self.vol_env_timer = period;
+                    }
+                    let step = rem.min(self.vol_env_timer);
+                    self.vol_env_timer -= step;
+                    rem -= step;
+                    if self.vol_env_timer == 0 {
+                        self.step_volume_env();
+                        self.vol_env_timer = period;
+                    }
+                }
+            }
+        }
+        // Mod envelope.
+        if !self.mod_env_disabled {
+            let period = self.mod_env_period();
+            if period != 0 {
+                let mut rem = cycles;
+                while rem > 0 {
+                    if self.mod_env_timer == 0 {
+                        self.mod_env_timer = period;
+                    }
+                    let step = rem.min(self.mod_env_timer);
+                    self.mod_env_timer -= step;
+                    rem -= step;
+                    if self.mod_env_timer == 0 {
+                        self.step_mod_env();
+                        self.mod_env_timer = period;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One volume-envelope ramp step: increase (if gain < 32, +1) or
+    /// decrease (if gain > 0, -1). The change is latched through the
+    /// wave-position-0 PWM gate.
+    fn step_volume_env(&mut self) {
+        let cur = self.vol_pending.unwrap_or(self.volume);
+        let next = if self.vol_env_increase {
+            if cur < 32 {
+                cur + 1
+            } else {
+                cur
+            }
+        } else if cur > 0 {
+            cur - 1
+        } else {
+            cur
+        };
+        if next != cur {
+            self.set_volume_gain(next);
+        }
+    }
+
+    /// One mod-envelope ramp step: increase (if gain < 32, +1) or
+    /// decrease (if gain > 0, -1). The mod gain feeds the pitch formula
+    /// directly (no PWM latch).
+    fn step_mod_env(&mut self) {
+        if self.mod_env_increase {
+            if self.mod_gain < 32 {
+                self.mod_gain += 1;
+            }
+        } else if self.mod_gain > 0 {
+            self.mod_gain -= 1;
+        }
+    }
+
     pub fn tick(&mut self, cycles: u32) {
-        // Both units tick every 16 CPU cycles; accumulate the remainder
-        // so non-multiple-of-16 batches stay phase-correct.
+        // Envelope ramp generators run on their own CPU-cycle timers.
+        self.env_tick(cycles);
+        // Both wave + mod units tick every 16 CPU cycles; accumulate the
+        // remainder so non-multiple-of-16 batches stay phase-correct.
         self.cycle_acc += cycles;
         while self.cycle_acc >= 16 {
             self.cycle_acc -= 16;
             self.unit_tick();
+            // The wave position advanced; commit any staged volume gain
+            // now that we may be at wave position 0.
+            self.commit_pending_volume();
         }
     }
 
@@ -1178,6 +1399,183 @@ mod tests {
         chip.write(0x4087, 0x82); // set disable bit -> reset accumulator
         assert!(chip.mod_disabled);
         assert_eq!(chip.mod_acc, 0);
+    }
+
+    #[test]
+    fn fds_env_period_matches_spec_formula() {
+        // c = 8 * (e + 1) * (m + 1); the $4083 fast bit divides by 4.
+        // e = 5, m = 7: 8 * 6 * 8 = 384.
+        assert_eq!(Fds::env_period(5, 7, false), 384);
+        assert_eq!(Fds::env_period(5, 7, true), 96);
+        // e = 0, m = 0xE8 (BIOS default): 8 * 1 * 233 = 1864.
+        assert_eq!(Fds::env_period(0, 0xE8, false), 1864);
+        // Master speed 0 disables both envelopes.
+        assert_eq!(Fds::env_period(10, 0, false), 0);
+    }
+
+    #[test]
+    fn fds_volume_envelope_decreases_to_zero() {
+        let mut chip = Fds::new();
+        // Park the wave position at 0 so gain changes commit promptly.
+        chip.wave_pos = 0;
+        chip.volume = 20;
+        chip.master_env_speed = 1; // small master speed
+                                   // $4080: M=0 (envelope on), D=0 (decrease), speed=0 -> c = 8*1*2 = 16.
+        chip.write(0x4080, 0x00);
+        assert!(!chip.vol_env_disabled);
+        assert!(!chip.vol_env_increase);
+        // One full period must drop the gain by 1.
+        chip.tick(16);
+        assert_eq!(chip.volume, 19);
+        // Many periods clamp at 0.
+        for _ in 0..40 {
+            chip.tick(16);
+        }
+        assert_eq!(chip.volume, 0);
+    }
+
+    #[test]
+    fn fds_volume_envelope_increases_and_clamps_at_32() {
+        let mut chip = Fds::new();
+        chip.wave_pos = 0;
+        chip.volume = 30;
+        chip.master_env_speed = 1;
+        // $4080: M=0, D=1 (increase), speed=0 -> c = 16.
+        chip.write(0x4080, 0x40);
+        assert!(chip.vol_env_increase);
+        chip.tick(16);
+        assert_eq!(chip.volume, 31);
+        chip.tick(16);
+        assert_eq!(chip.volume, 32);
+        // Stays clamped at 32 — increase cannot push past it.
+        for _ in 0..10 {
+            chip.tick(16);
+        }
+        assert_eq!(chip.volume, 32);
+    }
+
+    #[test]
+    fn fds_mod_envelope_ramps_mod_gain() {
+        let mut chip = Fds::new();
+        chip.mod_gain = 10;
+        chip.master_env_speed = 1;
+        // $4084: M=0 (mod envelope on), D=1 (increase), speed=0 -> c = 16.
+        chip.write(0x4084, 0x40);
+        assert!(!chip.mod_env_disabled);
+        chip.tick(16);
+        assert_eq!(chip.mod_gain, 11);
+        // Decrease direction now.
+        chip.write(0x4084, 0x00); // D=0, speed=0
+        chip.tick(16);
+        assert_eq!(chip.mod_gain, 10);
+    }
+
+    #[test]
+    fn fds_master_speed_zero_freezes_envelopes() {
+        let mut chip = Fds::new();
+        chip.wave_pos = 0;
+        chip.volume = 20;
+        chip.master_env_speed = 0; // disables both envelopes
+        chip.write(0x4080, 0x00); // would otherwise decrease
+        for _ in 0..100 {
+            chip.tick(16);
+        }
+        assert_eq!(chip.volume, 20); // unchanged
+    }
+
+    #[test]
+    fn fds_4083_bit6_halts_envelopes() {
+        let mut chip = Fds::new();
+        chip.wave_pos = 0;
+        chip.volume = 20;
+        chip.master_env_speed = 1;
+        chip.write(0x4080, 0x00); // decrease, c = 16
+                                  // $4083 bit 6 set: halt both envelopes (and reset their timers).
+        chip.write(0x4083, 0x40);
+        assert!(chip.env_halt);
+        for _ in 0..50 {
+            chip.tick(16);
+        }
+        assert_eq!(chip.volume, 20); // frozen while halted
+                                     // Clear the halt: the envelope resumes ramping.
+        chip.write(0x4083, 0x00);
+        chip.tick(16);
+        assert_eq!(chip.volume, 19);
+    }
+
+    #[test]
+    fn fds_4083_bit7_runs_envelopes_4x_faster() {
+        let mut slow = Fds::new();
+        let mut fast = Fds::new();
+        for chip in [&mut slow, &mut fast] {
+            chip.wave_pos = 0;
+            chip.volume = 30;
+            chip.master_env_speed = 1;
+        }
+        // speed e=1, m=1 -> c = 8*2*2 = 32 (slow); /4 = 8 (fast).
+        slow.write(0x4080, 0x01); // M=0, D=0, e=1
+        fast.write(0x4083, 0x80); // set fast bit first
+        fast.write(0x4080, 0x01);
+        // 32 cycles: slow ramps once, fast ramps four times.
+        slow.tick(32);
+        fast.tick(32);
+        assert_eq!(slow.volume, 29);
+        assert_eq!(fast.volume, 26);
+    }
+
+    #[test]
+    fn fds_direct_volume_write_with_mode_bit() {
+        let mut chip = Fds::new();
+        chip.wave_pos = 0;
+        // $4080 with M=1 (env off) sets the gain directly.
+        chip.write(0x4080, 0x80 | 0x14); // gain = 0x14 = 20
+        assert!(chip.vol_env_disabled);
+        assert_eq!(chip.volume, 20);
+        // Writing gain 0 mutes immediately even off wave-position 0.
+        chip.wave_pos = 5;
+        chip.write(0x4080, 0x80); // M=1, gain = 0
+        assert_eq!(chip.volume, 0);
+        assert!(chip.vol_pending.is_none());
+    }
+
+    #[test]
+    fn fds_volume_change_latched_until_wave_pos_zero() {
+        let mut chip = Fds::new();
+        chip.volume = 10;
+        chip.master_env_speed = 1;
+        // Stage a decrease while the wave position is non-zero.
+        chip.wave_pos = 7;
+        chip.write(0x4080, 0x00); // decrease, c = 16
+        chip.tick(16); // ramp steps, but a non-zero wave position holds it
+        assert_eq!(chip.volume, 10);
+        assert_eq!(chip.vol_pending, Some(9));
+        // Freeze the envelope (master speed 0) so no further ramp steps
+        // fire, then advance the wave unit until its position returns to
+        // 0, at which point the staged gain commits through the PWM latch.
+        chip.master_env_speed = 0;
+        chip.freq = 0x100; // advance the wave accumulator
+        for _ in 0..10_000 {
+            chip.tick(16);
+            if chip.wave_pos == 0 {
+                break;
+            }
+        }
+        assert_eq!(chip.wave_pos, 0);
+        assert_eq!(chip.volume, 9);
+        assert!(chip.vol_pending.is_none());
+    }
+
+    #[test]
+    fn fds_mode_bit_blocks_volume_ramp() {
+        let mut chip = Fds::new();
+        chip.wave_pos = 0;
+        chip.master_env_speed = 1;
+        // M=1 (env off): the ramp must never run.
+        chip.write(0x4080, 0x80 | 0x14); // gain 20, env disabled
+        for _ in 0..100 {
+            chip.tick(16);
+        }
+        assert_eq!(chip.volume, 20);
     }
 
     #[test]
