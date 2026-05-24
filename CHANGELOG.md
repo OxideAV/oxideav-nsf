@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **FDS frequency-modulation unit** (round 7): the wave output unit now
+  advances at the *modulated* pitch instead of the raw 12-bit register
+  value, per `docs/audio/nsf/fds-audio-wiki.html` §"Modulation unit" +
+  §"Frequency calculation and timing". Both the mod unit and the wave
+  unit tick every 16 CPU cycles; the mod accumulator adds the 12-bit
+  mod frequency each tick and, on a carry out of bit 11, steps the
+  32-entry mod table (each entry applied twice via the unused LSB of a
+  64-step pointer) and updates the signed 7-bit mod counter by the
+  table's `{0,+1,+2,+4,reset,-4,-2,-1}` increment. The mod counter,
+  the 6-bit mod gain (`$4084`) and the 12-bit pitch feed the
+  documented pitch formula to produce a 20-bit `wave_pitch` that the
+  wave accumulator (6 address bits over 18 fractional bits) consumes.
+  New register handling: `$4084` now sets the mod gain (previously
+  mis-wired to the mod position), `$4085` sets the signed mod counter,
+  `$4087` bit 7 resets the mod accumulator, and `$4088` only writes the
+  mod table while the unit is disabled (advancing the pointer by one
+  entry per write). Previously the modulator computed a position that
+  was never applied to the wave, so FDS vibrato/modulation was silent.
+- 8 new unit tests covering the pitch formula against the spec's
+  C-style reference (centered, positive round-up, and negative-counter
+  branches), the `$4084`/`$4085` register decode, mod-table write
+  gating + pointer advance, bit-11-carry counter stepping, signed
+  7-bit counter wrap, the entry-4 reset, accumulator reset on disable,
+  and an end-to-end check that an active modulator changes the
+  accumulated wave position relative to an unmodulated channel.
+
 - **Region-aware noise period table** (round 6): the noise channel now
   carries both the NTSC and the PAL divider tables from
   `docs/audio/nsf/apu-noise-wiki.html` §"Period"

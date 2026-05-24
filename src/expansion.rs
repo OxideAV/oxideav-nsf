@@ -608,8 +608,23 @@ impl Vrc7 {
 
 /// Famicom Disk System: a single wavetable synth with a frequency
 /// modulator. Wavetable RAM (64 6-bit samples) lives at
-/// `$4040..=$407F`. Round 2 implements: wave RAM, main freq + volume,
-/// modulation freq + table — but no envelope on the main volume.
+/// `$4040..=$407F`.
+///
+/// Round 7 wires the frequency-modulation unit per
+/// `docs/audio/nsf/fds-audio-wiki.html` §"Modulation unit" +
+/// §"Frequency calculation and timing": both the modulation unit and
+/// the wave output unit advance their accumulators every 16 CPU
+/// cycles. The mod accumulator adds the 12-bit modulation frequency
+/// each tick and, on a carry out of bit 11, steps the 32-entry mod
+/// table (each entry applied twice via the unused LSB of a 64-step
+/// pointer) and updates the signed 7-bit mod counter by the table's
+/// `{0,+1,+2,+4,reset,-4,-2,-1}` increment. The mod counter, the
+/// 6-bit mod gain (`$4084`) and the 12-bit pitch (`$4082/$4083`) feed
+/// the documented pitch formula to produce a 20-bit `wave_pitch`,
+/// which the wave output unit adds to its accumulator each wave tick.
+/// The wave position is the top 6 bits of that accumulator. Previously
+/// the wave always advanced at the raw, unmodulated pitch, so FDS
+/// vibrato/modulation was inaudible.
 pub struct Fds {
     pub enabled: bool,
     pub wave: [u8; 64],
@@ -619,11 +634,23 @@ pub struct Fds {
     pub freq: u16,
     pub mod_freq: u16,
     pub mod_disabled: bool,
+    /// 6-bit mod gain from `$4084` (bits 0-5).
+    pub mod_gain: u8,
+    /// Signed 7-bit mod counter (`$4085`), range -64..=63.
+    pub mod_counter: i8,
+    /// 64-step mod-table playback pointer; the LSB is ignored when
+    /// indexing the 32-entry table, so each entry is applied twice.
     pub mod_pos: u8,
-    pub mod_acc: u32,
+    /// Mod accumulator low 12 bits — the 12-bit `mod_freq` is added
+    /// each mod tick; a carry out of bit 11 steps the mod table.
+    pub mod_acc: u16,
     pub wave_pos: u8,
+    /// Wave accumulator (20 fractional bits below the 6-bit position);
+    /// `wave_pitch` is added each wave tick.
     pub wave_acc: u32,
     pub wave_write_enable: bool,
+    /// CPU-cycle remainder toward the next 16-cycle unit tick.
+    pub cycle_acc: u32,
 }
 
 impl Default for Fds {
@@ -637,11 +664,14 @@ impl Default for Fds {
             freq: 0,
             mod_freq: 0,
             mod_disabled: true,
+            mod_gain: 0,
+            mod_counter: 0,
             mod_pos: 0,
             mod_acc: 0,
             wave_pos: 0,
             wave_acc: 0,
             wave_write_enable: false,
+            cycle_acc: 0,
         }
     }
 }
@@ -666,8 +696,15 @@ impl Fds {
                 self.freq = (self.freq & 0x00FF) | (((value & 0x0F) as u16) << 8);
             }
             0x4084 => {
-                // Modulator gain.
-                self.mod_pos = value & 0x3F;
+                // Mod envelope ($4084): bits 0-5 are the mod gain (set
+                // directly when bit 7 — envelope-disable — is high; we
+                // don't model the slow envelope ramp, so take the gain
+                // either way). Bit 6 is the direction (envelope only).
+                self.mod_gain = value & 0x3F;
+            }
+            0x4085 => {
+                // Directly set the signed 7-bit mod counter.
+                self.mod_counter = Self::to_signed7(value & 0x7F);
             }
             0x4086 => {
                 self.mod_freq = (self.mod_freq & 0x0F00) | value as u16;
@@ -675,12 +712,19 @@ impl Fds {
             0x4087 => {
                 self.mod_freq = (self.mod_freq & 0x00FF) | (((value & 0x0F) as u16) << 8);
                 self.mod_disabled = value & 0x80 != 0;
+                if self.mod_disabled {
+                    // Reset mod accumulator (bits 0-12 forced to 0); the
+                    // mod-table position address is left unaltered.
+                    self.mod_acc = 0;
+                }
             }
-            0x4088 => {
-                // Modulation table write — ring buffer.
-                let p = (self.mod_pos & 0x1F) as usize;
+            0x4088 if self.mod_disabled => {
+                // Mod-table write — only honoured while the mod unit is
+                // disabled ($4087 bit 7). Replaces the entry at the
+                // current position, then advances the 64-step pointer.
+                let p = ((self.mod_pos >> 1) & 0x1F) as usize;
                 self.mod_table[p] = value & 0x07;
-                self.mod_pos = (self.mod_pos + 1) & 0x3F;
+                self.mod_pos = self.mod_pos.wrapping_add(2) & 0x3F;
             }
             0x4089 => {
                 self.master_volume_div = value & 0x03;
@@ -690,20 +734,92 @@ impl Fds {
         }
     }
 
-    pub fn tick(&mut self, cycles: u32) {
-        if self.freq == 0 {
-            return;
+    /// Sign-extend a 7-bit value (`$40` = -64 .. `$3F` = 63).
+    fn to_signed7(v: u8) -> i8 {
+        let v = v & 0x7F;
+        if v & 0x40 != 0 {
+            // bit 6 is the sign bit: subtract 128 from the 8-bit value.
+            (v as i16 - 0x80) as i8
+        } else {
+            v as i8
         }
-        // Wavetable advance: phase increment = freq per CPU cycle / 65536.
-        self.wave_acc = self.wave_acc.wrapping_add((self.freq as u32) * cycles);
-        let steps = self.wave_acc >> 16;
-        self.wave_acc &= 0xFFFF;
-        self.wave_pos = self.wave_pos.wrapping_add((steps & 0x3F) as u8) & 0x3F;
+    }
+
+    /// Map a 3-bit mod-table entry to its mod-counter increment per
+    /// §"Modulation unit": 0,1,2,3,4,5,6,7 → 0,+1,+2,+4,reset,-4,-2,-1.
+    /// `None` means "reset counter to 0".
+    fn mod_increment(entry: u8) -> Option<i8> {
+        match entry & 0x07 {
+            0 => Some(0),
+            1 => Some(1),
+            2 => Some(2),
+            3 => Some(4),
+            4 => None, // reset to 0
+            5 => Some(-4),
+            6 => Some(-2),
+            _ => Some(-1), // 7
+        }
+    }
+
+    /// The obtuse pitch formula from §"Modulation unit": fold the
+    /// signed mod counter and mod gain into a 20-bit modulated pitch.
+    fn wave_pitch(&self) -> u32 {
+        let counter = self.mod_counter as i32;
+        let gain = self.mod_gain as i32;
+        // 1. multiply counter by gain.
+        let mut temp = counter * gain;
+        // 2. round up to 6 bits only if sign positive (ignoring bit 4).
+        if (temp & 0x0f) != 0 && (temp & 0x800) == 0 {
+            temp += 0x20;
+        }
+        // 3. drop 4 bits and center to 0x40.
+        temp += 0x400;
+        temp = (temp >> 4) & 0xff;
+        // 4. multiply by pitch to get the 20-bit unsigned result.
+        ((self.freq as i32 * temp) as u32) & 0xF_FFFF
+    }
+
+    /// Advance one 16-CPU-cycle unit tick: step the mod unit (when
+    /// enabled), then the wave output unit at the modulated pitch.
+    fn unit_tick(&mut self) {
+        // Modulation unit: add the 12-bit mod_freq; a carry out of
+        // bit 11 steps the mod table and updates the mod counter.
         if !self.mod_disabled && self.mod_freq != 0 {
-            self.mod_acc = self.mod_acc.wrapping_add((self.mod_freq as u32) * cycles);
-            let msteps = self.mod_acc >> 16;
-            self.mod_acc &= 0xFFFF;
-            self.mod_pos = self.mod_pos.wrapping_add((msteps & 0x3F) as u8) & 0x3F;
+            let sum = self.mod_acc as u32 + self.mod_freq as u32;
+            self.mod_acc = (sum & 0x0FFF) as u16;
+            if sum & 0x1000 != 0 {
+                // Carry out of bit 11: read the table entry at the
+                // current (64-step) pointer, then advance the pointer.
+                let entry = self.mod_table[((self.mod_pos >> 1) & 0x1F) as usize];
+                match Self::mod_increment(entry) {
+                    None => self.mod_counter = 0,
+                    Some(d) => {
+                        // Signed 7-bit wrap: 63 + 1 → -64, -64 - 1 → 63.
+                        let next = (self.mod_counter as i32 + d as i32) & 0x7F;
+                        self.mod_counter = Self::to_signed7(next as u8);
+                    }
+                }
+                self.mod_pos = self.mod_pos.wrapping_add(1) & 0x3F;
+            }
+        }
+
+        // Wave output unit: add the 20-bit modulated pitch into the
+        // 24-bit accumulator (6 address bits 18-23 over 18 fractional
+        // bits per the §"Wavetables" diagram); the wave position is the
+        // top 6 bits.
+        if self.freq != 0 {
+            self.wave_acc = (self.wave_acc.wrapping_add(self.wave_pitch())) & 0xFF_FFFF;
+            self.wave_pos = ((self.wave_acc >> 18) & 0x3F) as u8;
+        }
+    }
+
+    pub fn tick(&mut self, cycles: u32) {
+        // Both units tick every 16 CPU cycles; accumulate the remainder
+        // so non-multiple-of-16 batches stay phase-correct.
+        self.cycle_acc += cycles;
+        while self.cycle_acc >= 16 {
+            self.cycle_acc -= 16;
+            self.unit_tick();
         }
     }
 
@@ -917,6 +1033,151 @@ mod tests {
         chip.write(0x4089, 0x80);
         chip.write(0x4040, 0x3F);
         assert_eq!(chip.wave[0], 0x3F);
+    }
+
+    #[test]
+    fn fds_4084_sets_mod_gain_not_position() {
+        let mut chip = Fds::new();
+        chip.write(0x4084, 0x9F); // bit7 set (env off) + gain = 0x1F
+        assert_eq!(chip.mod_gain, 0x1F);
+        // $4085 sets the signed 7-bit mod counter.
+        chip.write(0x4085, 0x7F); // -1
+        assert_eq!(chip.mod_counter, -1);
+        chip.write(0x4085, 0x40); // -64
+        assert_eq!(chip.mod_counter, -64);
+        chip.write(0x4085, 0x3F); // +63
+        assert_eq!(chip.mod_counter, 63);
+    }
+
+    #[test]
+    fn fds_mod_table_writes_only_when_disabled_and_advance_by_entry() {
+        let mut chip = Fds::new();
+        // Mod unit disabled by default (mod_disabled = true).
+        chip.write(0x4088, 0x05);
+        chip.write(0x4088, 0x02);
+        assert_eq!(chip.mod_table[0], 0x05);
+        assert_eq!(chip.mod_table[1], 0x02);
+        assert_eq!(chip.mod_pos, 4); // advanced by 2 per write
+                                     // Enabling the mod unit blocks further table writes.
+        chip.write(0x4087, 0x00); // mod_freq hi = 0, clears disable bit
+        assert!(!chip.mod_disabled);
+        let before = chip.mod_table[2];
+        chip.write(0x4088, 0x07);
+        assert_eq!(chip.mod_table[2], before); // unchanged
+    }
+
+    #[test]
+    fn fds_pitch_formula_matches_spec_c_code() {
+        let mut chip = Fds::new();
+        chip.freq = 100;
+        // counter=0 -> centered 0x40 multiplier -> 100*64 = 6400.
+        chip.mod_counter = 0;
+        chip.mod_gain = 16;
+        assert_eq!(chip.wave_pitch(), 6400);
+        // counter=32, gain=16 -> 100*96 = 9600 (no round-up).
+        chip.mod_counter = 32;
+        assert_eq!(chip.wave_pitch(), 9600);
+        // counter=1, gain=1 -> positive round-up branch -> 100*66 = 6600.
+        chip.mod_counter = 1;
+        chip.mod_gain = 1;
+        assert_eq!(chip.wave_pitch(), 6600);
+        // negative counter -> no round-up -> 100*56 = 5600.
+        chip.mod_counter = -8;
+        chip.mod_gain = 16;
+        assert_eq!(chip.wave_pitch(), 5600);
+    }
+
+    #[test]
+    fn fds_mod_table_steps_counter_on_bit11_carry() {
+        let mut chip = Fds::new();
+        // Fill the whole table with entry 1 (+1 increment).
+        for _ in 0..32 {
+            chip.write(0x4088, 0x01);
+        }
+        // mod_pos wraps back to 0 after 32 entry-writes (64 steps).
+        assert_eq!(chip.mod_pos, 0);
+        // Enable mod unit with the maximum 12-bit freq so every tick
+        // carries out of bit 11.
+        chip.write(0x4086, 0xFF);
+        chip.write(0x4087, 0x0F); // mod_freq = 0xFFF, disable bit clear
+        assert!(!chip.mod_disabled);
+        chip.mod_counter = 0;
+        // Seed the accumulator so the very next add (0x001 + 0xFFF)
+        // carries out of bit 11 -> table entry applies -> counter += 1.
+        chip.mod_acc = 0x001;
+        chip.unit_tick();
+        assert_eq!(chip.mod_counter, 1);
+        chip.mod_acc = 0x001;
+        chip.unit_tick();
+        assert_eq!(chip.mod_counter, 2);
+    }
+
+    #[test]
+    fn fds_mod_counter_wraps_signed_7bit() {
+        let mut chip = Fds::new();
+        for _ in 0..32 {
+            chip.write(0x4088, 0x01); // +1
+        }
+        chip.write(0x4086, 0xFF);
+        chip.write(0x4087, 0x0F);
+        chip.mod_counter = 63;
+        chip.mod_acc = 0x001;
+        chip.unit_tick(); // 63 + 1 -> -64 (signed 7-bit wrap)
+        assert_eq!(chip.mod_counter, -64);
+    }
+
+    #[test]
+    fn fds_mod_table_entry4_resets_counter() {
+        let mut chip = Fds::new();
+        for _ in 0..32 {
+            chip.write(0x4088, 0x04); // reset
+        }
+        chip.write(0x4086, 0xFF);
+        chip.write(0x4087, 0x0F);
+        chip.mod_counter = 50;
+        chip.mod_acc = 0x001;
+        chip.unit_tick();
+        assert_eq!(chip.mod_counter, 0);
+    }
+
+    #[test]
+    fn fds_modulation_changes_wave_advance_rate() {
+        // Drive two FDS chips identically except for active modulation;
+        // the modulated one must reach a different wave position.
+        let mut plain = Fds::new();
+        let mut modu = Fds::new();
+        for chip in [&mut plain, &mut modu] {
+            chip.freq = 0x200;
+            chip.mod_gain = 0x20;
+        }
+        // Modulated chip: a non-zero, oscillating mod table + enabled
+        // mod unit with a fast mod frequency.
+        for v in [0x01u8, 0x07] {
+            for _ in 0..16 {
+                modu.write(0x4088, v);
+            }
+        }
+        modu.write(0x4086, 0x80);
+        modu.write(0x4087, 0x07); // mod_freq high nibble 7, enabled
+        for _ in 0..4000 {
+            plain.tick(16);
+            modu.tick(16);
+        }
+        // The plain chip uses the centered 0x40 multiplier; the
+        // modulated chip's counter has drifted, changing its pitch and
+        // hence its accumulated wave position.
+        assert_ne!(plain.wave_acc, modu.wave_acc);
+    }
+
+    #[test]
+    fn fds_disabling_mod_unit_resets_accumulator() {
+        let mut chip = Fds::new();
+        chip.write(0x4086, 0x55);
+        chip.write(0x4087, 0x02); // freq set, enabled
+        chip.mod_acc = 0x0ABC;
+        chip.write(0x4087, 0x82); // set disable bit -> reset accumulator
+        assert!(chip.mod_disabled);
+        assert_eq!(chip.mod_acc, 0);
     }
 
     #[test]

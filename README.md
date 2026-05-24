@@ -21,7 +21,10 @@ gain overrides applied to the APU mixer (linear gain from signed
 millibels); `plst` / `psfx` playlist iteration API on `NsfPlayer`.
 Round 6 adds: region-aware noise channel — the PAL divider table
 joins the NTSC one so PAL/2A07 rips no longer play their noise
-channel at NTSC pitch.
+channel at NTSC pitch. Round 7 adds: the FDS frequency-modulation
+unit — the wave output now advances at the modulated pitch (mod
+table → signed mod counter → pitch formula → 20-bit `wave_pitch`)
+instead of the raw register frequency, so FDS vibrato is audible.
 
 ## Round 2 scope
 
@@ -121,6 +124,17 @@ channel at NTSC pitch.
     place of the full OPLL operator chain — sufficient to mix at the
     right balance, not bit-exact.
   * **FDS** — wavetable + frequency modulator (`$4040..=$4089`).
+    Round 7 wires the modulation unit per
+    `docs/audio/nsf/fds-audio-wiki.html`: the mod accumulator adds the
+    12-bit mod frequency every 16 CPU cycles, steps the 32-entry mod
+    table on each bit-11 carry, updates the signed 7-bit mod counter
+    (`{0,+1,+2,+4,reset,-4,-2,-1}` increments with 7-bit wrap), and
+    folds counter × mod gain (`$4084`) × pitch through the documented
+    pitch formula into a 20-bit `wave_pitch` that drives the wave
+    output unit. `$4085` directly sets the counter; `$4087` bit 7
+    resets the mod accumulator; `$4088` writes the table only while
+    the unit is disabled. The volume/mod envelope *ramp* generators
+    are still register-level only.
 * **Player glue** ([`NsfPlayer`]):
   * Loads the program (or builds the bank pool when bankswitching is
     active), runs the `init` routine for a chosen song, then steps
@@ -175,6 +189,14 @@ channel at NTSC pitch.
 * Expansion-chip unit tests cover register decoding for VRC6, MMC5,
   Sunsoft 5B, FDS, and N163 — plus the routing logic in
   [`expansion::Expansion`].
+* Round-7 FDS unit tests cover the modulation pitch formula against
+  the spec's C-style reference (centered, positive-round-up, and
+  negative-counter branches), the `$4084` mod-gain / `$4085`
+  mod-counter decode, mod-table write gating + pointer advance,
+  bit-11-carry counter stepping, signed-7-bit wrap, the entry-4
+  counter reset, accumulator reset on `$4087` disable, and an
+  end-to-end check that an active modulator changes the accumulated
+  wave position relative to an unmodulated channel.
 * Round-5 integration tests cover: Dendy region detection from
   `regn`, fallback to PAL speed when the Dendy RATE field is absent,
   Dendy CPU clock + INIT `X = 2` seeding, NSF 2 appended-`regn`
@@ -184,7 +206,7 @@ channel at NTSC pitch.
   `start_playlist_entry`), and an end-to-end Dendy render that
   produces non-trivial PCM.
 
-## Round 6+ followups
+## Round 7+ followups
 
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   read-cycle-stall behaviour, DMC CPU-stall halt-cycle accounting).
@@ -197,8 +219,12 @@ channel at NTSC pitch.
   ready when the OPLL ops doc lands.)
 * N163: per-channel timer accumulators (currently the 8 channels share
   a coarse phase model).
-* FDS: amplitude envelope on the main volume + LFO-style modulator
-  rebiasing.
+* FDS: the volume + mod-gain **envelope ramp generators** (`$4080` /
+  `$4084` bit-6 direction, `$408A` / `$408A` master speed, the
+  `c = 8·(e+1)·(m+1)` tick timing, and the "volume change only takes
+  effect when the wave position is 0" PWM latch). Round 7 landed the
+  frequency-modulation unit; these slow envelope ramps remain
+  register-level only.
 * MMC5 PCM: round 4 leaves the channel decoded at register-level only;
   needs a software-mode timer + read-mode wiring.
 * RIFF-NSF container variant.
