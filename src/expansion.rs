@@ -683,6 +683,16 @@ pub struct Fds {
     /// stages the new gain here and `output`/`tick` commits it once
     /// `wave_pos == 0`. `None` means "no change pending".
     pub vol_pending: Option<u8>,
+    /// `$4023` bit 1 (master sound enable). Per §"Master I/O enable", the
+    /// sound registers only function while this bit is set; the BIOS
+    /// writes `$00` then `$83`. While clear the waveform is halted — the
+    /// wave + mod accumulators stop advancing, the wave position is frozen
+    /// at 0 so the channel outputs the constant `$4040` value, and the
+    /// envelopes are not ticked (§"Frequency high" halt note). Writes to
+    /// `$4080` / `$4089` still affect the held output. Defaults to `true`
+    /// so a rip that relies on the BIOS having already enabled sound (or
+    /// that never re-writes `$4023`) still plays.
+    pub sound_enabled: bool,
 }
 
 impl Default for Fds {
@@ -718,6 +728,9 @@ impl Default for Fds {
             env_fast: false,
             env_halt: false,
             vol_pending: None,
+            // The BIOS enables sound ($4023 = $83) before any music runs,
+            // so default to enabled for rips that never touch $4023.
+            sound_enabled: true,
         }
     }
 }
@@ -729,6 +742,22 @@ impl Fds {
 
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
+            0x4023 => {
+                // Master I/O enable: bit 1 (S) gates the sound channel.
+                // Per §"Master I/O enable" the sound registers only
+                // function while it is set. Entering the halted state
+                // (bit clear) freezes the wave position at 0 so the
+                // channel holds the constant `$4040` value.
+                let now = value & 0x02 != 0;
+                if !now {
+                    // Reset the wave position to the $4040 sample. The
+                    // accumulator is parked too so the next enable starts
+                    // a fresh wave period rather than mid-step.
+                    self.wave_pos = 0;
+                    self.wave_acc = 0;
+                }
+                self.sound_enabled = now;
+            }
             0x4040..=0x407F if self.wave_write_enable => {
                 self.wave[(addr - 0x4040) as usize] = value & 0x3F;
             }
@@ -1032,6 +1061,15 @@ impl Fds {
     }
 
     pub fn tick(&mut self, cycles: u32) {
+        // `$4023.D1 = 0` halts the waveform: the wave + mod accumulators
+        // stop, the wave position holds at 0 (constant `$4040` output) and
+        // the envelopes are not ticked (§"Frequency high" halt note).
+        // Writes to `$4080` / `$4089` still affect the held output, which
+        // is preserved because those register writes update `volume` /
+        // `master_volume_div` directly outside this tick.
+        if !self.sound_enabled {
+            return;
+        }
         // Envelope ramp generators run on their own CPU-cycle timers.
         self.env_tick(cycles);
         // Both wave + mod units tick every 16 CPU cycles; accumulate the
@@ -1597,6 +1635,97 @@ mod tests {
             chip.tick(16);
         }
         assert_eq!(chip.volume, 20);
+    }
+
+    #[test]
+    fn fds_4023_disable_defaults_to_enabled() {
+        // A fresh chip behaves as if the BIOS already wrote $4023 = $83.
+        let chip = Fds::new();
+        assert!(chip.sound_enabled);
+    }
+
+    #[test]
+    fn fds_4023_sound_disable_halts_wave_and_freezes_position() {
+        let mut chip = Fds::new();
+        chip.freq = 0x200; // non-zero so the wave unit would advance
+                           // Advance a bit so the position is non-zero, then disable sound.
+        for _ in 0..32 {
+            chip.tick(16);
+        }
+        assert_ne!(chip.wave_acc, 0);
+        // $4023 bit 1 clear: halt. Position resets to $4040 (wave_pos 0).
+        chip.write(0x4023, 0x00);
+        assert!(!chip.sound_enabled);
+        assert_eq!(chip.wave_pos, 0);
+        assert_eq!(chip.wave_acc, 0);
+        // Ticking while halted does not advance the wave accumulator.
+        for _ in 0..1000 {
+            chip.tick(16);
+        }
+        assert_eq!(chip.wave_acc, 0);
+        assert_eq!(chip.wave_pos, 0);
+        // Re-enabling ($83 -> bit 1 set) lets the wave unit run again.
+        chip.write(0x4023, 0x83);
+        assert!(chip.sound_enabled);
+        chip.tick(16);
+        assert_ne!(chip.wave_acc, 0);
+    }
+
+    #[test]
+    fn fds_4023_sound_disable_halts_mod_accumulator() {
+        let mut chip = Fds::new();
+        chip.write(0x4086, 0x55);
+        chip.write(0x4087, 0x02); // mod unit enabled, non-zero freq
+        chip.tick(16);
+        let before = chip.mod_acc;
+        chip.write(0x4023, 0x00); // halt
+        for _ in 0..200 {
+            chip.tick(16);
+        }
+        // The mod accumulator does not advance while the waveform is halted.
+        assert_eq!(chip.mod_acc, before);
+    }
+
+    #[test]
+    fn fds_4023_sound_disable_freezes_envelopes() {
+        let mut chip = Fds::new();
+        chip.wave_pos = 0;
+        chip.volume = 20;
+        chip.master_env_speed = 1;
+        chip.write(0x4080, 0x00); // decrease envelope, c = 16
+                                  // Disable sound: the envelopes must not tick.
+        chip.write(0x4023, 0x00);
+        for _ in 0..50 {
+            chip.tick(16);
+        }
+        assert_eq!(chip.volume, 20); // frozen while halted
+                                     // Re-enable: the envelope resumes ramping.
+        chip.write(0x4023, 0x82);
+        chip.tick(16);
+        assert_eq!(chip.volume, 19);
+    }
+
+    #[test]
+    fn fds_4023_volume_writes_still_affect_held_output() {
+        // While halted the channel holds the constant $4040 value, but
+        // $4080 / $4089 writes still change the output level per spec.
+        let mut chip = Fds::new();
+        chip.wave[0] = 63; // $4040 sample
+        chip.wave_pos = 0;
+        chip.write(0x4089, 0x00); // master volume full, write-protect RAM
+        chip.write(0x4023, 0x00); // halt
+                                  // Direct volume write (M=1) sets the gain immediately.
+        chip.write(0x4080, 0x80 | 0x20); // gain 32
+        let loud = chip.output();
+        chip.write(0x4080, 0x80 | 0x08); // gain 8
+        let quiet = chip.output();
+        assert!(loud.abs() > quiet.abs());
+        // Master-volume divider also affects the held output.
+        chip.write(0x4080, 0x80 | 0x20);
+        let full = chip.output();
+        chip.write(0x4089, 0x03); // master volume 2/5
+        let attenuated = chip.output();
+        assert!(full.abs() > attenuated.abs());
     }
 
     #[test]

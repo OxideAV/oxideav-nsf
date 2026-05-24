@@ -30,7 +30,11 @@ Round 8 adds: the FDS volume + mod envelope ramp generators — the
 documented `c = 8·(e+1)·(m+1)` timer (with master-speed disable, the
 `$4083` halt + 4x-speed bits, and the wave-position-0 PWM latch), so
 FDS attack/decay/tremolo and mod-gain sweeps are no longer
-register-level only.
+register-level only. Round 9 adds: the FDS `$4023` master sound-enable —
+clearing bit 1 halts the waveform (frozen wave + mod accumulators,
+constant `$4040` output, envelopes not ticked) while `$4080`/`$4089`
+writes still affect the held level, per the nesdev FDS-audio §"Master
+I/O enable" + §"Frequency high" notes.
 
 ## Round 2 scope
 
@@ -148,7 +152,15 @@ register-level only.
     volume-gain *change* only commits while the
     wave position is 0 (direct gain-0 writes mute immediately). The
     slow PWM volume-latch on wave-table edges other than position 0 is
-    modelled; cycle-exact sub-tick timer phase is not.
+    modelled; cycle-exact sub-tick timer phase is not. Round 9 adds the
+    `$4023` master sound-enable / waveform-halt: bit 1 (S) gates the
+    channel (BIOS writes `$00` then `$83`), and while it is clear the
+    wave + mod accumulators stop, the wave position holds at 0 (constant
+    `$4040` output) and the envelopes are not ticked — yet `$4080` /
+    `$4089` writes still affect the held level (per
+    `docs/audio/nsf/fds-audio-wiki.html` §"Master I/O enable" +
+    §"Frequency high"). Defaults to enabled for rips that rely on the
+    BIOS having already set `$4023`.
 * **Player glue** ([`NsfPlayer`]):
   * Loads the program (or builds the bank pool when bankswitching is
     active), runs the `init` routine for a chosen song, then steps
@@ -203,6 +215,12 @@ register-level only.
 * Expansion-chip unit tests cover register decoding for VRC6, MMC5,
   Sunsoft 5B, FDS, and N163 — plus the routing logic in
   [`expansion::Expansion`].
+* Round-9 FDS unit tests cover the `$4023.D1` sound-enable default, the
+  sound-disable wave-accumulator halt + wave-position freeze-to-0 +
+  re-enable, the mod-accumulator halt while sound is disabled, the
+  envelopes being frozen while halted (and resuming on re-enable), and
+  `$4080` / `$4089` volume writes still affecting the held output during
+  the halt.
 * Round-8 FDS unit tests cover the `c = 8·(e+1)·(m+1)` envelope-period
   formula (including the `$4083` 4x-fast division and the master-speed-0
   disable), the volume envelope decreasing to 0 and increasing to its 32
@@ -247,11 +265,13 @@ register-level only.
   ready when the OPLL ops doc lands.)
 * N163: per-channel timer accumulators (currently the 8 channels share
   a coarse phase model).
-* FDS: the round-8 envelope ramp generators advance their gains on the
-  documented timer; the remaining gap is the `$4023.D1` waveform-halt
-  behaviour (constant `$4040` output + envelopes not ticked while
-  halted, per the §"Frequency high" TODO) and cycle-exact envelope
-  timer phase on register-write resets.
+* FDS: round 8 added the envelope ramp generators and round 9 the
+  `$4023.D1` waveform-halt (constant `$4040` output + frozen
+  accumulators + envelopes not ticked while halted, per §"Master I/O
+  enable" + the §"Frequency high" TODO). The remaining gap is
+  cycle-exact envelope timer phase on register-write resets (the timers
+  are stepped in CPU-cycle batches, so a sub-tick write-reset lands on a
+  batch boundary rather than the exact write cycle).
 * MMC5 PCM: round 4 leaves the channel decoded at register-level only;
   needs a software-mode timer + read-mode wiring.
 * RIFF-NSF container variant.

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **FDS `$4023.D1` master sound-enable / waveform-halt** (round 9): the
+  FDS channel now honours the `$4023` Master I/O enable register per
+  `docs/audio/nsf/fds-audio-wiki.html` §"Master I/O enable" + the
+  §"Frequency high" waveform-halt note. Bit 1 (S) must be set for the
+  sound channel to function (the BIOS writes `$00` then `$83`); while it
+  is clear the waveform is halted — the wave + modulation accumulators
+  stop advancing and the wave position is frozen at 0, so the channel
+  holds the constant `$4040` value, and the volume + mod envelopes are
+  not ticked. Writes to the volume (`$4080`) and master-volume (`$4089`)
+  registers still affect the held output. Defaults to enabled so a rip
+  that relies on the BIOS having already set `$4023 = $83` (or that never
+  re-writes `$4023`) still plays. Previously `$4023` writes were silently
+  dropped, so the channel kept running even when the program had disabled
+  sound.
+- 5 new FDS unit tests covering the enabled-by-default state, the
+  sound-disable wave-accumulator halt + position-freeze-to-0 + re-enable,
+  the mod-accumulator halt while disabled, the envelopes being frozen
+  while halted (and resuming on re-enable), and `$4080`/`$4089` volume
+  writes still affecting the held output during halt.
 - **FDS volume + mod envelope ramp generators** (round 8): the FDS
   `$4080` / `$4084` / `$408A` / `$4083` envelope units now ramp their
   gains over time instead of only taking direct register writes, per
