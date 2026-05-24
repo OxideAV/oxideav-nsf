@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **FDS read registers `$4090..=$4097`** (round 10): the FDS channel now
+  exposes the read-only status register window documented in
+  `docs/audio/nsf/fds-audio-wiki.html` §"Volume gain ($4090)" through
+  §"Mod counter value ($4097)". The new `Fds::read` returns: `$4090`
+  current volume gain (`0x40 | volume & 0x3F`, top 2 bits "01" open
+  bus); `$4091` bits 12-19 of the wave accumulator; `$4092` current mod
+  gain (`0x40 | mod_gain & 0x3F`, same open-bus pattern); `$4093` bits
+  5-11 of the 12-bit mod accumulator (top bit 0); `$4094` bits 4-11 of
+  the `mod_counter * mod_gain` intermediate; `$4095` the next mod-counter
+  increment translated into 4-bit twos-complement display form
+  (`0,1,2,3,4,5,6,7 → 0,1,2,4,C,C,E,F`); `$4096` the wavetable sample at
+  the current position (same open-bus pattern); `$4097` the signed 7-bit
+  mod counter (top bit 0). `Expansion::read` now also routes to FDS when
+  the chip is enabled, so a music driver running on the bus can poll the
+  unit's live state instead of always seeing the `0xFF` open-bus default.
+  Previously every read inside this window fell through to open bus.
+- 9 new FDS unit tests covering each of `$4090`/`$4091`/`$4092`/`$4093`/
+  `$4094`/`$4095`/`$4096`/`$4097` (positive and negative mod-counter
+  cases, full coverage of the mod-table display-form table including
+  reset/entry-4), the open-bus fall-through for unmapped FDS reads
+  (`$4080`/`$408A`/`$4040`/`$4098`/`$4099`), and the `Expansion::read`
+  routing only triggering once the FDS chip flag is enabled.
 - **FDS `$4023.D1` master sound-enable / waveform-halt** (round 9): the
   FDS channel now honours the `$4023` Master I/O enable register per
   `docs/audio/nsf/fds-audio-wiki.html` §"Master I/O enable" + the

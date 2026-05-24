@@ -846,6 +846,71 @@ impl Fds {
         }
     }
 
+    /// CPU-side read of the FDS status registers at `$4090..=$4097`
+    /// (write-only registers and unmapped addresses return `0xFF`,
+    /// matching the bus open-bus default). Per §"Volume gain ($4090)" …
+    /// §"Mod counter value ($4097)" in `docs/audio/nsf/fds-audio-wiki.html`,
+    /// these mirror live internal state of the wave + mod units and
+    /// preserve the documented open-bus pattern in the top bits
+    /// (`01` for `$4090` / `$4092` / `$4096`; `0` for `$4093` / `$4097`).
+    pub fn read(&self, addr: u16) -> u8 {
+        match addr {
+            // Volume gain: top bits "01" (open bus), bottom 6 bits = volume.
+            0x4090 => 0x40 | (self.volume & 0x3F),
+            // Wave accumulator: bits 12-19 of the 24-bit `wave_acc`.
+            0x4091 => ((self.wave_acc >> 12) & 0xFF) as u8,
+            // Mod gain: top bits "01" (open bus), bottom 6 bits = mod_gain.
+            0x4092 => 0x40 | (self.mod_gain & 0x3F),
+            // Mod table address accumulator: bits 5-11 of the 12-bit `mod_acc`
+            // (the mod-table address proper sits in bits 13-17 = `mod_pos`,
+            // outside this read window). Top bit returns 0 per open bus.
+            0x4093 => ((self.mod_acc >> 5) & 0x7F) as u8,
+            // Mod counter * gain intermediate: bits 4-11 of `counter * gain`.
+            // The sequential multiplier exposes its 16-bit accumulator here;
+            // we sample the final product directly since the multiplier
+            // completes within a single 16-CPU-cycle unit tick.
+            0x4094 => {
+                let product = (self.mod_counter as i32) * (self.mod_gain as i32);
+                ((product >> 4) & 0xFF) as u8
+            }
+            // Next mod-counter increment: the mod-table entry at the current
+            // pointer, translated into a 4-bit twos-complement display value
+            // (0,1,2,3,4,5,6,7 → 0,1,2,4,C,C,E,F) per §"Mod counter
+            // increment ($4095)". Top nibble is documented as "Unknown
+            // counter" — return 0.
+            0x4095 => {
+                let entry = self.mod_table[((self.mod_pos >> 1) & 0x1F) as usize] & 0x07;
+                Self::mod_increment_display(entry)
+            }
+            // Wavetable value at the current position, masked by the PWM
+            // volume envelope (the wave-position-0 PWM latch already keeps
+            // `self.volume` consistent with what is being fed to the DAC).
+            // Per §"Wavetable value ($4096)" the field is the raw sample,
+            // not the gain-scaled output; top bits "01" (open bus).
+            0x4096 => 0x40 | (self.wave[self.wave_pos as usize] & 0x3F),
+            // Mod counter value: signed 7-bit, top bit returns 0 per open bus.
+            0x4097 => (self.mod_counter as u8) & 0x7F,
+            _ => 0xFF,
+        }
+    }
+
+    /// Display form of a mod-table entry for `$4095`. Maps the 3-bit
+    /// table entry into the 4-bit twos-complement increment the register
+    /// shows (per §"Mod counter increment ($4095)"):
+    /// `0→0, 1→1, 2→2, 3→4, 4→C, 5→C, 6→E, 7→F`.
+    fn mod_increment_display(entry: u8) -> u8 {
+        match entry & 0x07 {
+            0 => 0x0,
+            1 => 0x1,
+            2 => 0x2,
+            3 => 0x4,
+            4 => 0xC, // reset → renders as -4 in 4-bit twos-complement
+            5 => 0xC, // -4
+            6 => 0xE, // -2
+            _ => 0xF, // 7 → -1
+        }
+    }
+
     /// CPU clocks per volume-envelope tick: `c = 8 * (e + 1) * (m + 1)`,
     /// halved twice (÷4) when the `$4083` fast bit is set. Returns 0 when
     /// the master speed disables the envelopes.
@@ -1191,6 +1256,12 @@ impl Expansion {
         }
         if self.n163.enabled {
             let v = self.n163.read(addr);
+            if v != 0xFF {
+                return v;
+            }
+        }
+        if self.fds.enabled {
+            let v = self.fds.read(addr);
             if v != 0xFF {
                 return v;
             }
@@ -1752,5 +1823,159 @@ mod tests {
         chip.write(0x4800, 0xAB);
         assert_eq!(chip.ram[0x10], 0xAB);
         assert_eq!(chip.addr, 0x11);
+    }
+
+    // ------- FDS read registers $4090..=$4097 (round 10) -------
+
+    #[test]
+    fn fds_4090_reads_volume_gain_with_open_bus_top_bits() {
+        let mut chip = Fds::new();
+        // Direct gain via $4080 M=1: volume = 0x14 = 20.
+        chip.write(0x4080, 0x80 | 0x14);
+        // Top 2 bits return "01"; bottom 6 bits are the volume gain.
+        assert_eq!(chip.read(0x4090), 0x40 | 0x14);
+        // Maximum volume gain (0x3F) still keeps the top bits at 01.
+        chip.write(0x4080, 0x80 | 0x3F);
+        assert_eq!(chip.read(0x4090), 0x7F);
+    }
+
+    #[test]
+    fn fds_4091_reads_wave_accumulator_bits_12_to_19() {
+        let mut chip = Fds::new();
+        // Pick a value whose bits 12-19 are easy to read: 0xABCDE_F.
+        chip.wave_acc = 0xABCDEF;
+        // Bits 12-19 = 0xBC.
+        assert_eq!(chip.read(0x4091), 0xBC);
+        // Fresh chip: zero accumulator → zero readout.
+        let fresh = Fds::new();
+        assert_eq!(fresh.read(0x4091), 0x00);
+    }
+
+    #[test]
+    fn fds_4092_reads_mod_gain_with_open_bus_top_bits() {
+        let mut chip = Fds::new();
+        // Direct mod gain via $4084 M=1: gain = 0x1F.
+        chip.write(0x4084, 0x80 | 0x1F);
+        assert_eq!(chip.read(0x4092), 0x40 | 0x1F);
+        // Mod gain field is only 6 bits — top bits of $4092 always "01".
+        chip.mod_gain = 0x3F;
+        assert_eq!(chip.read(0x4092), 0x7F);
+    }
+
+    #[test]
+    fn fds_4093_reads_mod_acc_bits_5_to_11_top_bit_zero() {
+        let mut chip = Fds::new();
+        // Set mod_acc to 0xABC (12-bit max field = 0xFFF).
+        chip.mod_acc = 0xABC;
+        // Bits 5-11 of 0xABC = (0xABC >> 5) & 0x7F = 0x55.
+        assert_eq!(chip.read(0x4093), 0x55);
+        // Top bit must always be 0 (open bus).
+        chip.mod_acc = 0xFFF;
+        assert_eq!(chip.read(0x4093) & 0x80, 0x00);
+        assert_eq!(chip.read(0x4093), 0x7F);
+    }
+
+    #[test]
+    fn fds_4094_reads_counter_times_gain_bits_4_to_11() {
+        let mut chip = Fds::new();
+        // counter = 16, gain = 16 → product = 256 = 0x100. (0x100 >> 4) = 0x10.
+        chip.mod_counter = 16;
+        chip.mod_gain = 16;
+        assert_eq!(chip.read(0x4094), 0x10);
+        // Negative counter: -8 * 16 = -128 = 0xFFFF_FF80 (i32). >> 4 = 0xFFFF_FFF8.
+        // Mask to 0xFF → 0xF8.
+        chip.mod_counter = -8;
+        chip.mod_gain = 16;
+        assert_eq!(chip.read(0x4094), 0xF8);
+    }
+
+    #[test]
+    fn fds_4095_reads_next_mod_increment_in_display_form() {
+        let mut chip = Fds::new();
+        // Fill the table with entry 7 (-1 increment), then check the readout.
+        for _ in 0..32 {
+            chip.write(0x4088, 0x07);
+        }
+        // mod_pos wraps to 0 after 32 writes → reads back position-0 entry.
+        assert_eq!(chip.mod_pos, 0);
+        // Entry 7 displays as 0xF.
+        assert_eq!(chip.read(0x4095) & 0x0F, 0x0F);
+        // Top nibble is "Unknown counter" → return 0.
+        assert_eq!(chip.read(0x4095) & 0xF0, 0x00);
+        // Entry 3 displays as 0x4 (per the 0,1,2,3,4,5,6,7→0,1,2,4,C,C,E,F table).
+        chip.mod_table[0] = 3;
+        assert_eq!(chip.read(0x4095), 0x04);
+        // Entry 4 (reset) displays as 0xC.
+        chip.mod_table[0] = 4;
+        assert_eq!(chip.read(0x4095), 0x0C);
+        // Entry 6 displays as 0xE.
+        chip.mod_table[0] = 6;
+        assert_eq!(chip.read(0x4095), 0x0E);
+    }
+
+    #[test]
+    fn fds_4096_reads_current_wavetable_sample() {
+        let mut chip = Fds::new();
+        chip.write(0x4089, 0x80); // arm wave-RAM write
+                                  // Fill a recognisable pattern at position 0 + position 7.
+        chip.write(0x4040, 0x2A);
+        chip.write(0x4047, 0x15);
+        chip.wave_pos = 0;
+        assert_eq!(chip.read(0x4096), 0x40 | 0x2A);
+        chip.wave_pos = 7;
+        assert_eq!(chip.read(0x4096), 0x40 | 0x15);
+        // Top bits always "01" open bus.
+        chip.write(0x4040, 0x3F);
+        chip.wave_pos = 0;
+        assert_eq!(chip.read(0x4096), 0x7F);
+    }
+
+    #[test]
+    fn fds_4097_reads_mod_counter_signed_7bit_top_bit_zero() {
+        let mut chip = Fds::new();
+        // Positive counter: 0x3F = 63.
+        chip.mod_counter = 63;
+        assert_eq!(chip.read(0x4097), 0x3F);
+        // Negative counter: -1 = 0xFF as u8 → masked to 0x7F.
+        chip.mod_counter = -1;
+        assert_eq!(chip.read(0x4097), 0x7F);
+        // -64 = 0xC0 as u8 → masked to 0x40.
+        chip.mod_counter = -64;
+        assert_eq!(chip.read(0x4097), 0x40);
+        // Zero counter.
+        chip.mod_counter = 0;
+        assert_eq!(chip.read(0x4097), 0x00);
+        // Top bit always 0 across the whole range.
+        for c in -64..=63i8 {
+            chip.mod_counter = c;
+            assert_eq!(chip.read(0x4097) & 0x80, 0x00, "top bit set for c={c}");
+        }
+    }
+
+    #[test]
+    fn fds_unmapped_read_returns_open_bus() {
+        let chip = Fds::new();
+        // The status-read window is $4090..=$4097; addresses outside
+        // it (including the write-only register file at $4080..$408A
+        // and the wave RAM at $4040..$407F) must return the open-bus
+        // sentinel so the upstream router can fall through.
+        assert_eq!(chip.read(0x4080), 0xFF);
+        assert_eq!(chip.read(0x408A), 0xFF);
+        assert_eq!(chip.read(0x4040), 0xFF);
+        assert_eq!(chip.read(0x4098), 0xFF);
+        assert_eq!(chip.read(0x4099), 0xFF);
+    }
+
+    #[test]
+    fn expansion_routes_fds_reads_only_when_enabled() {
+        let mut x = Expansion::new();
+        x.set_flags(ExpansionChips(0)); // no chips enabled
+        assert_eq!(x.read(0x4090), 0xFF); // open bus when FDS off
+                                          // Enable FDS and prime a volume gain readback.
+        x.set_flags(ExpansionChips(0x04)); // FDS flag bit
+        x.fds.volume = 0x12;
+        assert_eq!(x.read(0x4090), 0x40 | 0x12);
+        // A non-FDS address still falls through to the open-bus default.
+        assert_eq!(x.read(0x4080), 0xFF);
     }
 }

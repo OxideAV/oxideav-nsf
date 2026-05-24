@@ -34,7 +34,14 @@ register-level only. Round 9 adds: the FDS `$4023` master sound-enable —
 clearing bit 1 halts the waveform (frozen wave + mod accumulators,
 constant `$4040` output, envelopes not ticked) while `$4080`/`$4089`
 writes still affect the held level, per the nesdev FDS-audio §"Master
-I/O enable" + §"Frequency high" notes.
+I/O enable" + §"Frequency high" notes. Round 10 adds: the FDS read
+register window at `$4090..=$4097` — current volume gain, wave
+accumulator (bits 12-19), current mod gain, mod accumulator (bits 5-11),
+`counter × gain` intermediate, next mod-counter increment in 4-bit
+twos-complement display form, current wavetable sample, and signed
+7-bit mod counter, per the nesdev FDS-audio §"Volume gain ($4090)"
+through §"Mod counter value ($4097)" with documented open-bus top-bit
+patterns.
 
 ## Round 2 scope
 
@@ -215,6 +222,17 @@ I/O enable" + §"Frequency high" notes.
 * Expansion-chip unit tests cover register decoding for VRC6, MMC5,
   Sunsoft 5B, FDS, and N163 — plus the routing logic in
   [`expansion::Expansion`].
+* Round-10 FDS unit tests cover the `$4090..=$4097` read-register window:
+  `$4090` volume-gain readback with the documented `01` open-bus top
+  bits, `$4091` wave-accumulator bits 12-19, `$4092` mod-gain readback,
+  `$4093` mod-accumulator bits 5-11 with top bit 0, `$4094` `counter ×
+  gain` intermediate (positive + negative cases), `$4095` next mod
+  increment in 4-bit twos-complement display form (including the entry-4
+  reset → `0xC` mapping), `$4096` wavetable sample at the current
+  position, `$4097` signed 7-bit mod counter across the full -64..=63
+  range, the open-bus fall-through for unmapped FDS reads, and the
+  `Expansion::read` routing only triggering once the FDS chip flag is
+  enabled.
 * Round-9 FDS unit tests cover the `$4023.D1` sound-enable default, the
   sound-disable wave-accumulator halt + wave-position freeze-to-0 +
   re-enable, the mod-accumulator halt while sound is disabled, the
