@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   increases the gain by 1 (capped at 32 on the active edge) or decreases
   it by 1 (floored at 0). `$408A = 0` disables both envelopes; `$4083`
   bit 6 halts both and resets their timers; `$4083` bit 7 runs them 4x
-  faster. The volume envelope is a PWM unit, so a volume-gain *change*
+  faster (and also halts the mod-table accumulator per §"Frequency
+  high"). The volume envelope is a PWM unit, so a volume-gain *change*
   is staged and only commits while the wave position is 0 (a direct
   `$4080` write of gain 0 still mutes immediately). `$4080`/`$4084`
   mode-bit-set (M=1) writes set the gain directly and suppress the ramp;
@@ -29,14 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the envelope ramps were register-level only, so FDS attack/decay/
   tremolo and mod-gain sweeps were silent — only instantaneous gain
   writes were heard.
-- 10 new unit tests covering the `c = 8·(e+1)·(m+1)` period formula
+- 11 new unit tests covering the `c = 8·(e+1)·(m+1)` period formula
   (incl. the 4x-fast division and master-speed-0 disable), the volume
   envelope decreasing to 0 and increasing to its 32 clamp, the mod
   envelope ramping the mod gain in both directions, master-speed-0
   freezing the envelopes, `$4083` bit-6 halt/resume, `$4083` bit-7 4x
-  speed, the mode-bit direct-write and immediate-mute paths, the
-  wave-position-0 PWM latch on volume-gain changes, and the mode bit
-  blocking the ramp.
+  speed, `$4083` bit-7 halting the mod-table accumulator, the mode-bit
+  direct-write and immediate-mute paths, the wave-position-0 PWM latch
+  on volume-gain changes, and the mode bit blocking the ramp.
 
 - **FDS frequency-modulation unit** (round 7): the wave output unit now
   advances at the *modulated* pitch instead of the raw 12-bit register

@@ -144,7 +144,8 @@ register-level only.
     (`$4080`/`$4084` speed × `$408A` master speed) and steps its gain
     ±1 toward the 0..=32 range on the active edge; `$408A = 0` disables
     both, `$4083` bit 6 halts + resets their timers, `$4083` bit 7 runs
-    them 4x faster, and a volume-gain *change* only commits while the
+    them 4x faster (and halts the mod-table accumulator), and a
+    volume-gain *change* only commits while the
     wave position is 0 (direct gain-0 writes mute immediately). The
     slow PWM volume-latch on wave-table edges other than position 0 is
     modelled; cycle-exact sub-tick timer phase is not.
@@ -207,7 +208,8 @@ register-level only.
   disable), the volume envelope decreasing to 0 and increasing to its 32
   clamp, the mod envelope ramping the mod gain in both directions,
   master-speed-0 freezing the envelopes, `$4083` bit-6 halt/resume,
-  `$4083` bit-7 4x speed, the `$4080` mode-bit direct-write and
+  `$4083` bit-7 4x speed, `$4083` bit-7 halting the mod-table
+  accumulator, the `$4080` mode-bit direct-write and
   immediate-mute paths, the wave-position-0 PWM latch staging a
   volume-gain change until the wave position returns to 0, and the mode
   bit blocking the ramp entirely.

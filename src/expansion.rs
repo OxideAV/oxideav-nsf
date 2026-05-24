@@ -916,8 +916,10 @@ impl Fds {
     /// enabled), then the wave output unit at the modulated pitch.
     fn unit_tick(&mut self) {
         // Modulation unit: add the 12-bit mod_freq; a carry out of
-        // bit 11 steps the mod table and updates the mod counter.
-        if !self.mod_disabled && self.mod_freq != 0 {
+        // bit 11 steps the mod table and updates the mod counter. The
+        // `$4083` 4x-speed bit (`env_fast`) also halts the mod-table
+        // accumulator per §"Frequency high".
+        if !self.mod_disabled && self.mod_freq != 0 && !self.env_fast {
             let sum = self.mod_acc as u32 + self.mod_freq as u32;
             self.mod_acc = (sum & 0x0FFF) as u16;
             if sum & 0x1000 != 0 {
@@ -1521,6 +1523,25 @@ mod tests {
         fast.tick(32);
         assert_eq!(slow.volume, 29);
         assert_eq!(fast.volume, 26);
+    }
+
+    #[test]
+    fn fds_4083_bit7_halts_mod_accumulator() {
+        let mut chip = Fds::new();
+        // Enable the mod unit with a non-zero frequency.
+        chip.write(0x4086, 0x55);
+        chip.write(0x4087, 0x02); // mod_freq set, unit enabled
+        let before = chip.mod_acc;
+        // Set the $4083 fast bit (bit 7): the mod accumulator must freeze.
+        chip.write(0x4083, 0x80);
+        for _ in 0..100 {
+            chip.unit_tick();
+        }
+        assert_eq!(chip.mod_acc, before);
+        // Clearing the fast bit lets the accumulator advance again.
+        chip.write(0x4083, 0x00);
+        chip.unit_tick();
+        assert_ne!(chip.mod_acc, before);
     }
 
     #[test]
