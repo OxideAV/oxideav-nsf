@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Namco 163 per-channel timer accumulators** (round 11): the N163
+  expansion chip now ticks one channel every 15 CPU cycles per
+  `docs/audio/nsf/namco-163-audio-wiki.html` §"Channel Update" +
+  §"Frequency" instead of approximating channel output from the static
+  RAM contents. Each enabled channel walks the documented
+  `phase' = (phase + freq) % (wave_len << 16)` update with its full
+  18-bit frequency (`$78`/`$7A`/`$7C` low+mid+high-2-bits) and 24-bit
+  phase (`$79`/`$7B`/`$7D`); the updated phase is written back into
+  sound RAM at the same three bytes so a program can read it back via
+  the `$4800` data port. The DAC output `(sample(((phase>>16)+wave_addr)
+  &0xFF) - 8) * volume` is held until the next channel update —
+  matching the sample-and-hold behaviour of the real chip's
+  serial-output DAC. The wave length decoder honours the
+  `256 - (LLLLLL00)`-formula from §"Sound RAM $7C". The control byte
+  `$7F`'s `CCC` field selects channels `9-N..=8` (top-down enabling per
+  §"Sound RAM $7F - Volume"); round-robin starts at slot 0 = channel
+  `9-N` and wraps after the last enabled channel. The address port at
+  `$F800` now stops at `$7F` instead of wrapping per the §"Address
+  Port" footnote-cited correction. Previously the channel output was
+  computed from raw `$40+8*ch` RAM contents at the audio-resample rate
+  with no actual phase advance, so N163 tones followed the program's
+  write cadence rather than the chip's clock.
+- 10 new unit tests covering: the `$7F` C-field decoding into
+  `channels_active`, the top-down active-channel set selection, the
+  `$F800` no-wrap-at-`$7F` address-port behaviour, the per-15-cycle
+  phase advance (with sub-window cycle accumulation), phase wrapping
+  modulo `wave_len << 16`, sample decoding at `(phase>>16)+wave_addr`
+  with the `-8` bias and linear-volume scaling, the round-robin
+  ordering across two enabled channels (ch7 → ch8 → ch7 again), the
+  sample-and-hold behaviour on partial-cycle ticks, the silent-when-
+  disabled guarantee, and cycle-accumulator carrying across multiple
+  short calls.
+
 - **FDS read registers `$4090..=$4097`** (round 10): the FDS channel now
   exposes the read-only status register window documented in
   `docs/audio/nsf/fds-audio-wiki.html` §"Volume gain ($4090)" through

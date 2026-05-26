@@ -426,13 +426,35 @@ const LIN_AY_VOL: [f32; 16] = [
 // ---------------------------------------------------------------- N163
 
 /// Namco 163 wavetable synthesis. Up to 8 channels share a 128-byte
-/// wave RAM; each channel reads 4-bit samples through its own pointer.
+/// wave RAM. Round 11 (per `docs/audio/nsf/namco-163-audio-wiki.html`
+/// §Channel Update + §Frequency + §Waveform): every 15 CPU cycles the
+/// chip updates *one* enabled channel — it adds the channel's 18-bit
+/// frequency to its 24-bit phase, computes one 4-bit signed sample
+/// (`sample - 8`) scaled by the 4-bit linear volume, and *holds* that
+/// `last_output` until the next channel-update tick. The phase
+/// accumulator is stored back into the live RAM at `$79`/`$7B`/`$7D`
+/// (for ch8; the other channels mirror the layout 8 bytes earlier per
+/// channel index — see `chan_base`). Channels are enabled top-down:
+/// the `1+C` field in `$7F` selects channels `9-N..=8`.
 pub struct N163 {
     pub enabled: bool,
     pub addr: u8,
     pub addr_inc: bool,
     pub ram: [u8; 0x80],
-    pub channels_active: u8, // 1..=8
+    /// Number of currently-enabled channels (1..=8). When 1, only
+    /// channel 8 plays; when 8, channels 1..=8 all play.
+    pub channels_active: u8,
+    /// Per-channel-update cycle accumulator. The chip clocks every
+    /// 15 CPU cycles regardless of how many channels are enabled.
+    pub cycle_accum: u32,
+    /// Index (0-based, 0..=channels_active-1) of the channel that
+    /// will tick next inside the active set. Round-robin.
+    pub next_chan_slot: u8,
+    /// Sample-and-hold register: the chip drives a single shared DAC
+    /// at the channel-update rate, so the audible output is the last
+    /// channel's update. Sum-of-active-channels matches the audible
+    /// average since outputs alternate at the update rate.
+    pub last_output: f32,
 }
 
 impl Default for N163 {
@@ -443,6 +465,9 @@ impl Default for N163 {
             addr_inc: false,
             ram: [0u8; 0x80],
             channels_active: 1,
+            cycle_accum: 0,
+            next_chan_slot: 0,
+            last_output: 0.0,
         }
     }
 }
@@ -452,6 +477,27 @@ impl N163 {
         Self::default()
     }
 
+    /// Base RAM offset of channel `idx_one_based` (1..=8): ch1 at
+    /// `$40`, ch2 at `$48`, ..., ch8 at `$78`. Per the nesdev wiki
+    /// §"Other Channels" — each channel's register block is 8 bytes
+    /// before the next-higher channel.
+    #[inline]
+    fn chan_base(idx_one_based: u8) -> usize {
+        debug_assert!((1..=8).contains(&idx_one_based));
+        0x40 + (idx_one_based as usize - 1) * 8
+    }
+
+    /// One-based channel index for the `slot`th active channel
+    /// (0..=channels_active-1). Active channels are the highest
+    /// `channels_active` channels per the `1+C` field on `$7F`, so
+    /// `slot=0 → channel (9 - channels_active)`, `slot=channels_active-1
+    /// → channel 8`.
+    #[inline]
+    fn active_channel(&self, slot: u8) -> u8 {
+        debug_assert!(slot < self.channels_active);
+        9 - self.channels_active + slot
+    }
+
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0xF800 => {
@@ -459,13 +505,25 @@ impl N163 {
                 self.addr_inc = value & 0x80 != 0;
             }
             0x4800 => {
-                self.ram[self.addr as usize] = value;
+                let target = self.addr as usize;
+                self.ram[target] = value;
                 if self.addr_inc {
-                    self.addr = (self.addr + 1) & 0x7F;
+                    // Per nesdev §Address Port: the address does NOT
+                    // wrap; it stops at $7F.
+                    if self.addr < 0x7F {
+                        self.addr += 1;
+                    }
                 }
-                if (0x40..0x80).contains(&(self.addr as u32 as usize)) {
-                    // Byte at $7F = control: low 3 bits = (chan_active - 1).
-                    self.channels_active = (self.ram[0x7F] & 0x07) + 1;
+                // The control byte at $7F encodes `1+C` in the high
+                // nibble (bits 6-4 hold the C value). Decode whenever
+                // the program touches $7F.
+                if target == 0x7F {
+                    self.channels_active = ((value >> 4) & 0x07) + 1;
+                    // If the next-tick pointer is now past the end
+                    // of the active set, wrap it back to slot 0.
+                    if self.next_chan_slot >= self.channels_active {
+                        self.next_chan_slot = 0;
+                    }
                 }
             }
             _ => {}
@@ -474,38 +532,137 @@ impl N163 {
 
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
+            // The hardware read-port also auto-increments the pointer
+            // when `addr_inc` is set, but `Expansion::read` takes
+            // `&self`, so the increment lives on the writable
+            // mirror path; reads here are non-mutating.
             0x4800 => self.ram[self.addr as usize],
             _ => 0xFF,
         }
     }
 
-    pub fn output(&self) -> f32 {
-        // Round 2: the channel iteration is a thin approximation. We
-        // sample every active channel's wavetable at its current
-        // frequency-accumulator phase (stored at $40+8*ch). Volume is
-        // at $47+8*ch. This is enough to hear N163 rips chime in but
-        // does not implement per-channel timer accumulation.
-        if self.channels_active == 0 {
-            return 0.0;
+    /// Decode the 18-bit frequency, 24-bit phase, wave length, wave
+    /// address, and linear volume for one channel from sound RAM.
+    /// Layout (for ch8; other channels mirror the layout, see
+    /// `chan_base`):
+    ///
+    /// * `$78` low frequency (bits 0-7)
+    /// * `$79` low phase
+    /// * `$7A` mid frequency (bits 8-15)
+    /// * `$7B` mid phase
+    /// * `$7C` `LLLLLLFF` — high 6 bits = wave length, low 2 = high freq bits
+    /// * `$7D` high phase
+    /// * `$7E` wave address (in 4-bit samples)
+    /// * `$7F` `.CCCVVVV` — C = enabled-1, V = linear volume
+    fn decode_channel(&self, ch: u8) -> N163Channel {
+        let base = Self::chan_base(ch);
+        let freq = (self.ram[base] as u32)
+            | ((self.ram[base + 2] as u32) << 8)
+            | (((self.ram[base + 4] & 0x03) as u32) << 16);
+        let phase = (self.ram[base + 1] as u32)
+            | ((self.ram[base + 3] as u32) << 8)
+            | ((self.ram[base + 5] as u32) << 16);
+        // wave_len in 4-bit samples: 256 - (L bits << 2). The L field
+        // is bits 7-2 of $7C, so `value & 0xFC` already has the trailing
+        // two zeros and the math is "256 - (raw & 0xFC)" → 4..=256.
+        let wave_len = 256u32 - (self.ram[base + 4] & 0xFC) as u32;
+        let wave_addr = self.ram[base + 6];
+        let volume = self.ram[base + 7] & 0x0F;
+        N163Channel {
+            base,
+            freq,
+            phase,
+            wave_len,
+            wave_addr,
+            volume,
         }
-        let mut sum = 0.0f32;
-        for ch in 0..self.channels_active as usize {
-            let base = 0x40 + ch * 8;
-            let vol = self.ram[base + 7] & 0x0F;
-            let phase = self.ram[base];
-            let wave_off = self.ram[base + 6] as usize & 0xFF;
-            let nibble_index = (phase as usize).wrapping_add(wave_off) & 0xFF;
-            let byte = self.ram[(nibble_index >> 1) & 0x7F];
-            let nib = if nibble_index & 1 == 0 {
-                byte & 0x0F
-            } else {
-                byte >> 4
-            };
-            let signed = (nib as i32) - 8;
-            sum += signed as f32 * vol as f32 / 64.0;
-        }
-        sum / self.channels_active as f32
     }
+
+    /// Read a 4-bit sample at nibble index `pos` (mod 256) out of the
+    /// 128-byte sound RAM. Two samples per byte; the low nibble is the
+    /// even-indexed sample, the high nibble is the odd-indexed.
+    #[inline]
+    fn read_nibble(&self, pos: u32) -> u8 {
+        let nibble_index = (pos & 0xFF) as usize;
+        let byte = self.ram[(nibble_index >> 1) & 0x7F];
+        if nibble_index & 1 == 0 {
+            byte & 0x0F
+        } else {
+            byte >> 4
+        }
+    }
+
+    /// Advance one channel by one update — adds `freq` to `phase`,
+    /// wraps mod `wave_len << 16`, recomputes the held output sample,
+    /// and writes the updated phase back into sound RAM. Per
+    /// §"Channel Update" — speculative single-channel update.
+    fn tick_one_channel(&mut self) {
+        if self.channels_active == 0 {
+            return;
+        }
+        let slot = self.next_chan_slot;
+        let ch = self.active_channel(slot);
+        let dec = self.decode_channel(ch);
+
+        let modulus = dec.wave_len << 16;
+        let new_phase = if modulus == 0 {
+            0
+        } else {
+            (dec.phase + dec.freq) % modulus
+        };
+
+        // Write phase back into RAM at the three phase bytes for this
+        // channel. The bit layout matches: low 8 bits → +1, middle 8
+        // bits → +3, high 8 bits → +5.
+        self.ram[dec.base + 1] = new_phase as u8;
+        self.ram[dec.base + 3] = (new_phase >> 8) as u8;
+        self.ram[dec.base + 5] = (new_phase >> 16) as u8;
+
+        // sample(((phase >> 16) + wave_addr) & 0xFF)
+        let pos = (new_phase >> 16) + dec.wave_addr as u32;
+        let nib = self.read_nibble(pos);
+        let signed = nib as i32 - 8;
+        // Output range: signed in -8..=7, volume in 0..=15 → -120..=105.
+        // Scale into a roughly unity envelope — the wiki specifies
+        // `(sample - 8) * volume` as the unscaled DAC, which a real
+        // 163 outputs through an external resistor ladder. Normalise
+        // here so the linear mixer in `Expansion::output` stays in
+        // a reasonable range.
+        self.last_output = signed as f32 * dec.volume as f32 / 128.0;
+
+        // Round-robin pointer through the active set.
+        self.next_chan_slot = (slot + 1) % self.channels_active;
+    }
+
+    /// CPU-side tick: the chip updates one channel every 15 CPU
+    /// cycles. Batch the work — we only need to call `tick_one_channel`
+    /// once per accumulated 15-cycle window.
+    pub fn tick(&mut self, cycles: u32) {
+        if !self.enabled {
+            return;
+        }
+        self.cycle_accum += cycles;
+        while self.cycle_accum >= 15 {
+            self.cycle_accum -= 15;
+            self.tick_one_channel();
+        }
+    }
+
+    pub fn output(&self) -> f32 {
+        self.last_output
+    }
+}
+
+/// Decoded view of one N163 channel — pulled out of `&self.ram` once
+/// per channel update so the update + phase-writeback paths share the
+/// same layout.
+struct N163Channel {
+    base: usize,
+    freq: u32,
+    phase: u32,
+    wave_len: u32,
+    wave_addr: u8,
+    volume: u8,
 }
 
 // ---------------------------------------------------------------- VRC7
@@ -1221,8 +1378,9 @@ impl Expansion {
         if self.fds.enabled {
             self.fds.tick(cycles);
         }
-        // N163 timing is tied to the wavetable write cadence — no
-        // per-cycle tick.
+        if self.n163.enabled {
+            self.n163.tick(cycles);
+        }
     }
 
     pub fn write(&mut self, addr: u16, value: u8) {
@@ -1977,5 +2135,243 @@ mod tests {
         assert_eq!(x.read(0x4090), 0x40 | 0x12);
         // A non-FDS address still falls through to the open-bus default.
         assert_eq!(x.read(0x4080), 0xFF);
+    }
+
+    // ------- N163 per-channel timer accumulator (round 11) -------
+
+    /// Write the channel registers for channel 8 (base $78) directly
+    /// into sound RAM via the auto-increment pointer path.
+    fn n163_write_channel8(
+        chip: &mut N163,
+        freq: u32,
+        phase: u32,
+        wave_len_l_field: u8,
+        wave_addr: u8,
+        volume: u8,
+        c_field: u8,
+    ) {
+        // Set address to $78 with auto-increment, then walk $78..$7F.
+        chip.write(0xF800, 0x80 | 0x78);
+        chip.write(0x4800, (freq & 0xFF) as u8); // $78 low freq
+        chip.write(0x4800, (phase & 0xFF) as u8); // $79 low phase
+        chip.write(0x4800, ((freq >> 8) & 0xFF) as u8); // $7A mid freq
+        chip.write(0x4800, ((phase >> 8) & 0xFF) as u8); // $7B mid phase
+        chip.write(
+            0x4800,
+            ((wave_len_l_field & 0x3F) << 2) | (((freq >> 16) & 0x03) as u8),
+        ); // $7C
+        chip.write(0x4800, ((phase >> 16) & 0xFF) as u8); // $7D high phase
+        chip.write(0x4800, wave_addr); // $7E
+        chip.write(0x4800, ((c_field & 0x07) << 4) | (volume & 0x0F)); // $7F
+    }
+
+    #[test]
+    fn n163_writing_7f_decodes_channels_active() {
+        // The `1+C` field at $7F bits 6-4 selects the number of enabled
+        // channels. Wiki §"Sound RAM $7F - Volume": C=0 → 1 channel
+        // (ch8 only); C=7 → 8 channels.
+        let mut chip = N163::new();
+        // C=0 → 1 enabled channel.
+        chip.write(0xF800, 0x7F);
+        chip.write(0x4800, 0x00);
+        assert_eq!(chip.channels_active, 1);
+        // C=7 → 8 enabled channels.
+        chip.write(0xF800, 0x7F);
+        chip.write(0x4800, 0x70 | 0x05);
+        assert_eq!(chip.channels_active, 8);
+        // The low-nibble volume bits should NOT bleed into the channel
+        // count.
+        chip.write(0xF800, 0x7F);
+        chip.write(0x4800, 0x20 | 0x0F);
+        assert_eq!(chip.channels_active, 3);
+    }
+
+    #[test]
+    fn n163_active_channel_set_is_top_down() {
+        // With N enabled channels, only channels (9-N)..=8 are clocked.
+        // Wiki §"Sound RAM $7F - Volume": "When C=0, only channel 8
+        // enabled; C=1 → channels 7+8; ... C=7 → channels 1..=8".
+        let mut chip = N163::new();
+        chip.channels_active = 1;
+        assert_eq!(chip.active_channel(0), 8);
+        chip.channels_active = 2;
+        assert_eq!(chip.active_channel(0), 7);
+        assert_eq!(chip.active_channel(1), 8);
+        chip.channels_active = 8;
+        for i in 0..8 {
+            assert_eq!(chip.active_channel(i), i + 1);
+        }
+    }
+
+    #[test]
+    fn n163_address_pointer_stops_at_0x7f_no_wrap() {
+        // Wiki §"Address Port": "it does not wrap, instead stopping
+        // at $7F." (Footnote-cited correction to a previous version.)
+        let mut chip = N163::new();
+        chip.write(0xF800, 0x80 | 0x7E); // addr=$7E, auto-inc
+        chip.write(0x4800, 0x11);
+        assert_eq!(chip.addr, 0x7F);
+        chip.write(0x4800, 0x22);
+        assert_eq!(chip.addr, 0x7F, "address must stop at $7F, not wrap to $00");
+        // The second write should still land at the held address.
+        assert_eq!(chip.ram[0x7F], 0x22);
+    }
+
+    #[test]
+    fn n163_tick_advances_phase_by_freq_each_15_cycles() {
+        // Wiki §"Channel Update": every 15 CPU cycles, the chip adds
+        // freq to phase, mod (wave_len << 16).
+        let mut chip = N163::new();
+        chip.enabled = true;
+        // Channel 8: freq=0x100, phase=0, wave_len=4 samples → L=63.
+        // wave_len = 256 - (L<<2) = 256 - 252 = 4. So L field = 63.
+        n163_write_channel8(&mut chip, 0x100, 0, 63, 0, 0x0F, 0);
+        // First channel update happens at cycle 15.
+        chip.tick(14);
+        // Phase should still be 0 — no full 15-cycle window yet.
+        let phase_low = chip.ram[0x40 + 7 * 8 + 1]; // ch8 phase low @ $79
+        assert_eq!(phase_low, 0);
+        chip.tick(1); // total 15 — one tick triggers
+                      // After one update: phase = (0 + 0x100) mod (4<<16) = 0x100.
+        let p_lo = chip.ram[0x79];
+        let p_mid = chip.ram[0x7B];
+        let p_hi = chip.ram[0x7D];
+        let phase = p_lo as u32 | ((p_mid as u32) << 8) | ((p_hi as u32) << 16);
+        assert_eq!(phase, 0x100);
+    }
+
+    #[test]
+    fn n163_phase_wraps_modulo_wave_length_shifted() {
+        // phase = (phase + freq) % (wave_len << 16). At wave_len = 4,
+        // modulus = 0x40000. Pick freq = 0x20000, phase = 0x30000 →
+        // (0x30000 + 0x20000) % 0x40000 = 0x10000.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        n163_write_channel8(&mut chip, 0x20000, 0x30000, 63, 0, 0x0F, 0);
+        chip.tick(15);
+        let p_lo = chip.ram[0x79];
+        let p_mid = chip.ram[0x7B];
+        let p_hi = chip.ram[0x7D];
+        let phase = p_lo as u32 | ((p_mid as u32) << 8) | ((p_hi as u32) << 16);
+        assert_eq!(phase, 0x10000, "phase should wrap mod 0x40000");
+    }
+
+    #[test]
+    fn n163_decodes_sample_at_high_phase_plus_wave_addr() {
+        // Wiki §"Channel Update" speculative version:
+        //   output = (sample(((phase >> 16) + wave_addr) & 0xFF) - 8)
+        //            * volume
+        // Lay down a recognisable wave at RAM offset 0: byte $00 = 0xA9.
+        // Two nibbles → low=9, high=A. Volume = 1 to keep math simple.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        // Channel 8, wave_addr=0 (samples start at nibble index 0).
+        // Wave length 4 samples (L=63), freq=0x10000 (advances 1 sample
+        // per tick), phase initial = 0.
+        n163_write_channel8(&mut chip, 0x10000, 0, 63, 0, 0x01, 0);
+        chip.ram[0x00] = 0xA9; // low nibble = 9, high nibble = A
+        chip.ram[0x01] = 0xC8; // low nibble = 8, high nibble = C
+                               // First tick brings phase to 0x10000 → high byte = 1 → sample
+                               // index 1 → high nibble of $00 = 0xA = 10 → (10 - 8) * 1 = +2.
+        chip.tick(15);
+        let out_after_first = chip.output();
+        // Expected: signed=2, volume=1, normalised by /128 = 2/128.
+        assert!(
+            (out_after_first - 2.0 / 128.0).abs() < 1e-6,
+            "got {out_after_first}"
+        );
+        // Next tick: phase = 0x20000 → high byte = 2 → sample index
+        // 2 → low nibble of $01 = 8 → (8 - 8) = 0 → silence at this
+        // sample.
+        chip.tick(15);
+        assert!(chip.output().abs() < 1e-9);
+    }
+
+    #[test]
+    fn n163_round_robin_advances_through_active_channels() {
+        // With N channels enabled, the chip cycles through them in
+        // order. With 2 active channels (7 + 8), two consecutive ticks
+        // should update channel 7 first (slot 0) then channel 8.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        // Pre-load channel 7 (base $70) and channel 8 (base $78) with
+        // distinct freqs so we can tell which one updated.
+        // Channel 7: freq=0x111, phase=0, wave_len=4 → L=63.
+        chip.write(0xF800, 0x80 | 0x70); // auto-inc from $70
+        chip.write(0x4800, 0x11); // $70 low freq
+        chip.write(0x4800, 0x00); // $71 low phase
+        chip.write(0x4800, 0x01); // $72 mid freq
+        chip.write(0x4800, 0x00); // $73 mid phase
+        chip.write(0x4800, 63 << 2); // $74 wave len, freq high=0
+        chip.write(0x4800, 0x00); // $75 high phase
+        chip.write(0x4800, 0x00); // $76 wave address
+        chip.write(0x4800, 0x00); // $77 volume (channel-7 volume)
+                                  // Channel 8: freq=0x222, two enabled channels (C=1).
+        n163_write_channel8(&mut chip, 0x222, 0, 63, 0, 0x0F, 1);
+        assert_eq!(chip.channels_active, 2);
+        // First tick: slot 0 = channel 7 should advance.
+        chip.tick(15);
+        let ch7_phase_lo = chip.ram[0x71];
+        let ch8_phase_lo = chip.ram[0x79];
+        assert_eq!(ch7_phase_lo, 0x11, "ch7 should have ticked first");
+        assert_eq!(ch8_phase_lo, 0x00, "ch8 should not have ticked yet");
+        // Second tick: slot 1 = channel 8.
+        chip.tick(15);
+        let ch7_phase_lo = chip.ram[0x71];
+        let ch8_phase_lo = chip.ram[0x79];
+        assert_eq!(ch7_phase_lo, 0x11, "ch7 should still hold its phase");
+        assert_eq!(ch8_phase_lo, 0x22, "ch8 should have ticked second");
+        // Third tick: wraps back to slot 0 = channel 7.
+        chip.tick(15);
+        assert_eq!(chip.ram[0x71], 0x22, "ch7 should have ticked twice");
+    }
+
+    #[test]
+    fn n163_output_holds_until_next_tick() {
+        // Per §"Channel Update": "The output will be held until the
+        // next channel update." A `tick(0)` should leave the output
+        // unchanged.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        n163_write_channel8(&mut chip, 0x10000, 0, 63, 0, 0x01, 0);
+        chip.ram[0x00] = 0xA9;
+        chip.tick(15);
+        let held = chip.output();
+        chip.tick(0); // no cycles → no new update
+        assert!((chip.output() - held).abs() < 1e-9);
+        // Another sub-15-cycle batch should also be a no-op.
+        chip.tick(14);
+        assert!((chip.output() - held).abs() < 1e-9);
+    }
+
+    #[test]
+    fn n163_silent_when_disabled() {
+        // The chip should not tick or emit output when the expansion
+        // flag is clear.
+        let mut chip = N163::new();
+        chip.enabled = false;
+        n163_write_channel8(&mut chip, 0x10000, 0, 63, 0, 0x0F, 0);
+        chip.ram[0x00] = 0xFF;
+        chip.tick(1500); // would be 100 channel updates if enabled
+        assert!(chip.output().abs() < 1e-9);
+        // Phase shouldn't have moved either.
+        assert_eq!(chip.ram[0x79], 0x00);
+    }
+
+    #[test]
+    fn n163_cycle_accumulator_carries_leftover_cycles() {
+        // Cycles smaller than 15 should accumulate across calls.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        n163_write_channel8(&mut chip, 0x100, 0, 63, 0, 0x0F, 0);
+        chip.tick(7);
+        chip.tick(7);
+        // 14 total — no update yet.
+        assert_eq!(chip.ram[0x79], 0);
+        chip.tick(1); // pushes us to 15
+        assert_eq!(chip.ram[0x79], 0x00);
+        // The high phase byte stays 0 (freq = 0x100 < 0x10000), but
+        // the low byte ticks to 0x00 and mid byte to 0x01.
+        assert_eq!(chip.ram[0x7B], 0x01);
     }
 }

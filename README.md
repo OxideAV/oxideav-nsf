@@ -41,7 +41,13 @@ accumulator (bits 12-19), current mod gain, mod accumulator (bits 5-11),
 twos-complement display form, current wavetable sample, and signed
 7-bit mod counter, per the nesdev FDS-audio §"Volume gain ($4090)"
 through §"Mod counter value ($4097)" with documented open-bus top-bit
-patterns.
+patterns. Round 11 adds: the Namco 163 per-channel timer
+accumulators — one channel update every 15 CPU cycles per
+`docs/audio/nsf/namco-163-audio-wiki.html` §"Channel Update", driving
+the full 18-bit-freq / 24-bit-phase walk with modulo-`wave_len<<16`
+wrap, sample-and-hold DAC output, top-down active-channel selection
+from the `$7F` `CCC` field, and the `$F800` no-wrap-at-`$7F`
+address-port behaviour.
 
 ## Round 2 scope
 
@@ -135,7 +141,15 @@ patterns.
   * **Sunsoft 5B** — 3 squares with AY-style log-volume envelopes
     (`$C000` / `$E000` indirect register file).
   * **Namco 163** — wavetable RAM at `$4800` indexed via `$F800`
-    pointer; up to 8 channels.
+    pointer; up to 8 channels. Round 11 wires the per-channel timer
+    accumulators per `docs/audio/nsf/namco-163-audio-wiki.html`
+    §"Channel Update" + §"Frequency": every 15 CPU cycles the chip
+    updates one channel (round-robin across the active set), adding
+    the 18-bit frequency to the 24-bit phase modulo `wave_len << 16`
+    and producing one `(sample - 8) * volume` DAC output that is held
+    until the next channel-update tick. The control byte at `$7F`'s
+    `CCC` field selects channels `9-N..=8` top-down, and the `$F800`
+    address pointer stops at `$7F` rather than wrapping.
   * **VRC7** — 6 FM channels driven from `$9010` / `$9030` register
     indirection. Round 2 ships a coarse 2-operator approximation in
     place of the full OPLL operator chain — sufficient to mix at the
@@ -222,6 +236,18 @@ patterns.
 * Expansion-chip unit tests cover register decoding for VRC6, MMC5,
   Sunsoft 5B, FDS, and N163 — plus the routing logic in
   [`expansion::Expansion`].
+* Round-11 N163 unit tests cover the per-channel timer accumulator:
+  the `$7F` `CCC` field decoding `channels_active`, top-down
+  active-channel selection (with N=1→{ch8}, N=2→{ch7,ch8},
+  N=8→{ch1..ch8}), the `$F800` no-wrap-at-`$7F` address-port footnote,
+  the per-15-cycle phase advance (with sub-window cycle accumulation),
+  the phase wrap modulo `wave_len << 16` (4-sample wave at freq=0x20000
+  cycling 0x30000 → 0x10000), sample decoding at `(phase>>16)+wave_addr`
+  with the `-8` bias and linear-volume scaling, round-robin ordering
+  across 2 enabled channels (ch7 → ch8 → ch7 again), the
+  sample-and-hold behaviour across partial-cycle ticks, the
+  silent-when-disabled guarantee, and the cycle accumulator carrying
+  leftover cycles across multiple short calls.
 * Round-10 FDS unit tests cover the `$4090..=$4097` read-register window:
   `$4090` volume-gain readback with the documented `01` open-bus top
   bits, `$4091` wave-accumulator bits 12-19, `$4092` mod-gain readback,
@@ -281,8 +307,12 @@ patterns.
   needs an OPLL operator-internals reference added to docs. (Round 4
   added a typed `NsfeVrc7` patch-table container so the parser is
   ready when the OPLL ops doc lands.)
-* N163: per-channel timer accumulators (currently the 8 channels share
-  a coarse phase model).
+* N163: round 11 added the per-channel timer accumulators. Remaining
+  gap is matching the documented `f = (n * p) / (15 * 65536 * l * c)`
+  output frequency in a calibration test against a known fixture (the
+  current synthetic tests verify per-tick phase advances and
+  round-robin ordering, but not the multi-channel-divided emitted
+  frequency end-to-end).
 * FDS: round 8 added the envelope ramp generators and round 9 the
   `$4023.D1` waveform-halt (constant `$4040` output + frozen
   accumulators + envelopes not ticked while halted, per §"Master I/O
