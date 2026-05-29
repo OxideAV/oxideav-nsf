@@ -947,13 +947,168 @@ struct N163Channel {
 
 // ---------------------------------------------------------------- VRC7
 
+/// The 16 hardwired instrument patches dumped from the VRC7's internal
+/// ROM, per the §"Internal patch set" table in
+/// `docs/audio/nsf/vrc7-audio-wiki.html`. Slot `0` is the user "custom
+/// patch" placeholder — its eight bytes are all `--` (don't-care) and
+/// the actual user patch is read from `regs[0x00..=0x07]` at runtime.
+/// Slots `1..=15` correspond to the 15 read-only instrument presets
+/// ("Buzzy Bell" through "Sweep").
+///
+/// Byte layout matches the §"Custom Patch" table: `[$00, $01, $02,
+/// $03, $04, $05, $06, $07]`. See [`Vrc7Patch::from_bytes`] for the
+/// bitfield decode.
+pub const VRC7_INSTRUMENT_ROM: [[u8; 8]; 16] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0 (Custom Patch)
+    [0x03, 0x21, 0x05, 0x06, 0xE8, 0x81, 0x42, 0x27], // 1 Buzzy Bell
+    [0x13, 0x41, 0x14, 0x0D, 0xD8, 0xF6, 0x23, 0x12], // 2 Guitar
+    [0x11, 0x11, 0x08, 0x08, 0xFA, 0xB2, 0x20, 0x12], // 3 Wurly
+    [0x31, 0x61, 0x0C, 0x07, 0xA8, 0x64, 0x61, 0x27], // 4 Flute
+    [0x32, 0x21, 0x1E, 0x06, 0xE1, 0x76, 0x01, 0x28], // 5 Clarinet
+    [0x02, 0x01, 0x06, 0x00, 0xA3, 0xE2, 0xF4, 0xF4], // 6 Synth
+    [0x21, 0x61, 0x1D, 0x07, 0x82, 0x81, 0x11, 0x07], // 7 Trumpet
+    [0x23, 0x21, 0x22, 0x17, 0xA2, 0x72, 0x01, 0x17], // 8 Organ
+    [0x35, 0x11, 0x25, 0x00, 0x40, 0x73, 0x72, 0x01], // 9 Bells
+    [0xB5, 0x01, 0x0F, 0x0F, 0xA8, 0xA5, 0x51, 0x02], // A Vibes
+    [0x17, 0xC1, 0x24, 0x07, 0xF8, 0xF8, 0x22, 0x12], // B Vibraphone
+    [0x71, 0x23, 0x11, 0x06, 0x65, 0x74, 0x18, 0x16], // C Tutti
+    [0x01, 0x02, 0xD3, 0x05, 0xC9, 0x95, 0x03, 0x02], // D Fretless
+    [0x61, 0x63, 0x0C, 0x00, 0x94, 0xC0, 0x33, 0xF6], // E Synth Bass
+    [0x21, 0x72, 0x0D, 0x00, 0xC1, 0xD5, 0x56, 0x06], // F Sweep
+];
+
+/// Decoded 2-operator patch parameters per the §"Custom Patch"
+/// table in `docs/audio/nsf/vrc7-audio-wiki.html`. The patch defines
+/// one modulator + one carrier; bytes `$00`/`$04`/`$06` describe the
+/// modulator, bytes `$01`/`$05`/`$07` describe the carrier, and bytes
+/// `$02`/`$03` mix global parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Vrc7Patch {
+    // ---- $00 / $01: modulator + carrier "TVSKMMMM"
+    /// `$00 T` modulator tremolo enable.
+    pub mod_tremolo: bool,
+    /// `$00 V` modulator vibrato enable.
+    pub mod_vibrato: bool,
+    /// `$00 S` modulator sustain enable.
+    pub mod_sustain: bool,
+    /// `$00 K` modulator key-rate-scaling enable.
+    pub mod_ksr: bool,
+    /// `$00 M` modulator 4-bit fmult.
+    pub mod_mult: u8,
+
+    /// `$01 T` carrier tremolo enable.
+    pub car_tremolo: bool,
+    /// `$01 V` carrier vibrato enable.
+    pub car_vibrato: bool,
+    /// `$01 S` carrier sustain enable.
+    pub car_sustain: bool,
+    /// `$01 K` carrier key-rate-scaling enable.
+    pub car_ksr: bool,
+    /// `$01 M` carrier 4-bit fmult.
+    pub car_mult: u8,
+
+    // ---- $02: modulator KKOOOOOO
+    /// `$02 KK` modulator key-level-scaling (0..=3).
+    pub mod_ksl: u8,
+    /// `$02 OOOOOO` modulator output level (0..=63, 0.75 dB per step).
+    pub mod_tl: u8,
+
+    // ---- $03: carrier KK-QWFFF
+    /// `$03 KK` carrier key-level-scaling (0..=3).
+    pub car_ksl: u8,
+    /// `$03 Q` carrier waveform: 0 = sine, 1 = half-rectified sine.
+    pub car_wave: u8,
+    /// `$03 W` modulator waveform: 0 = sine, 1 = half-rectified sine.
+    pub mod_wave: u8,
+    /// `$03 FFF` modulator feedback (0..=7).
+    pub feedback: u8,
+
+    // ---- $04 / $05: AAAA DDDD
+    /// `$04 AAAA` modulator attack rate.
+    pub mod_attack: u8,
+    /// `$04 DDDD` modulator decay rate.
+    pub mod_decay: u8,
+    /// `$05 AAAA` carrier attack rate.
+    pub car_attack: u8,
+    /// `$05 DDDD` carrier decay rate.
+    pub car_decay: u8,
+
+    // ---- $06 / $07: SSSS RRRR
+    /// `$06 SSSS` modulator sustain level (0=loudest, 15=lowest, 3 dB
+    /// per step).
+    pub mod_sustain_level: u8,
+    /// `$06 RRRR` modulator release rate.
+    pub mod_release: u8,
+    /// `$07 SSSS` carrier sustain level.
+    pub car_sustain_level: u8,
+    /// `$07 RRRR` carrier release rate.
+    pub car_release: u8,
+}
+
+impl Vrc7Patch {
+    /// Decode the 8-byte patch table per §"Custom Patch" bitfield
+    /// layout — the same format used both for the user-programmable
+    /// `regs[0x00..=0x07]` patch and for every entry in
+    /// [`VRC7_INSTRUMENT_ROM`].
+    pub fn from_bytes(b: &[u8; 8]) -> Self {
+        Self {
+            // $00 — TVSKMMMM
+            mod_tremolo: b[0] & 0x80 != 0,
+            mod_vibrato: b[0] & 0x40 != 0,
+            mod_sustain: b[0] & 0x20 != 0,
+            mod_ksr: b[0] & 0x10 != 0,
+            mod_mult: b[0] & 0x0F,
+            // $01 — TVSKMMMM
+            car_tremolo: b[1] & 0x80 != 0,
+            car_vibrato: b[1] & 0x40 != 0,
+            car_sustain: b[1] & 0x20 != 0,
+            car_ksr: b[1] & 0x10 != 0,
+            car_mult: b[1] & 0x0F,
+            // $02 — KKOOOOOO
+            mod_ksl: (b[2] >> 6) & 0x03,
+            mod_tl: b[2] & 0x3F,
+            // $03 — KK-QWFFF: bits 7-6 KSL, bit 5 unused, bit 4 carrier
+            // waveform Q, bit 3 modulator waveform W, bits 2-0 feedback.
+            car_ksl: (b[3] >> 6) & 0x03,
+            car_wave: (b[3] >> 4) & 0x01,
+            mod_wave: (b[3] >> 3) & 0x01,
+            feedback: b[3] & 0x07,
+            // $04 — AAAA DDDD
+            mod_attack: (b[4] >> 4) & 0x0F,
+            mod_decay: b[4] & 0x0F,
+            // $05
+            car_attack: (b[5] >> 4) & 0x0F,
+            car_decay: b[5] & 0x0F,
+            // $06 — SSSS RRRR
+            mod_sustain_level: (b[6] >> 4) & 0x0F,
+            mod_release: b[6] & 0x0F,
+            // $07
+            car_sustain_level: (b[7] >> 4) & 0x0F,
+            car_release: b[7] & 0x0F,
+        }
+    }
+}
+
 /// VRC7 is a stripped Yamaha YM2413 (OPLL): 6 FM channels, no rhythm.
-/// Round 2 ships a coarse approximation: the channel volumes and
+///
+/// Round 2 shipped a coarse approximation: channel volumes and
 /// fundamental frequencies are honoured; the FM operator math uses a
 /// 2-operator sinusoidal stand-in instead of OPLL's logarithmic LUTs.
-/// Real bit-exact OPLL is deferred; what we ship is enough to test
-/// the channel-mix arithmetic and produce non-crashing audio for
-/// VRC7-flagged NSFs.
+///
+/// Round 13 adds patch decoding — the hardwired §"Internal patch set"
+/// ROM (15 named instruments + slot 0 user-programmable) is exposed
+/// as [`VRC7_INSTRUMENT_ROM`], the user-programmable patch at
+/// `regs[0x00..=0x07]` and each ROM slot decode to a [`Vrc7Patch`]
+/// struct, and each channel's `$3X` high nibble selects the active
+/// patch. The audible signal path still uses the sinusoidal
+/// stand-in, but [`Vrc7Chan::patch_index`] / [`Vrc7::patch`] /
+/// [`Vrc7::active_patch`] make the patch table testable and unblock
+/// a real OPLL operator implementation (#861) without a further API
+/// break.
+///
+/// Real bit-exact OPLL is still deferred; what we ship plays
+/// VRC7-flagged NSFs at the correct pitch and per-channel volume,
+/// with the correct patch-selection plumbing.
 pub struct Vrc7 {
     pub enabled: bool,
     pub addr: u8,
@@ -979,6 +1134,14 @@ pub struct Vrc7Chan {
     pub key_on: bool,
     pub volume: u8,
     pub phase: f32,
+    /// `$2X` bit 5 (S) — when set, overrides the patch's release rate
+    /// with the value `$5` per §Channels. Cached here so it survives
+    /// a later `$3X`-only write.
+    pub sustain: bool,
+    /// `$3X` bits 7-4 (I) — instrument index `0..=15`. Slot 0 selects
+    /// the user-programmable patch at `regs[0x00..=0x07]`; slots
+    /// `1..=15` select an entry from [`VRC7_INSTRUMENT_ROM`].
+    pub patch_index: u8,
 }
 
 impl Vrc7 {
@@ -1003,9 +1166,37 @@ impl Vrc7 {
             self.channels[ch].fnum =
                 (self.regs[0x10 + ch] as u16) | (((self.regs[0x20 + ch] & 0x01) as u16) << 8);
             self.channels[ch].block = (self.regs[0x20 + ch] >> 1) & 0x07;
+            // $2X bitfield --STOOOH: bit 4 = trigger / key-on,
+            // bit 5 = sustain override (§Channels).
             self.channels[ch].key_on = self.regs[0x20 + ch] & 0x10 != 0;
+            self.channels[ch].sustain = self.regs[0x20 + ch] & 0x20 != 0;
+            // $3X bitfield IIIIVVVV: high nibble = instrument index,
+            // low nibble = inverted volume.
+            self.channels[ch].patch_index = (self.regs[0x30 + ch] >> 4) & 0x0F;
             self.channels[ch].volume = self.regs[0x30 + ch] & 0x0F;
         }
+    }
+
+    /// Return the decoded patch parameters for instrument slot
+    /// `index`. Slot `0` reads from the user-programmable
+    /// `regs[0x00..=0x07]`; slots `1..=15` read from
+    /// [`VRC7_INSTRUMENT_ROM`]. Indices `>= 16` wrap modulo 16 (the
+    /// `$3X` instrument field is only 4 bits wide so this is a
+    /// defensive default, never a real write).
+    pub fn patch(&self, index: u8) -> Vrc7Patch {
+        let i = (index as usize) & 0x0F;
+        if i == 0 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&self.regs[0x00..0x08]);
+            Vrc7Patch::from_bytes(&b)
+        } else {
+            Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[i])
+        }
+    }
+
+    /// Return the currently selected patch for channel `ch` (0..=5).
+    pub fn active_patch(&self, ch: usize) -> Vrc7Patch {
+        self.patch(self.channels[ch].patch_index)
     }
 
     pub fn tick(&mut self, cycles: u32) {
@@ -2910,5 +3101,162 @@ mod tests {
         // The high phase byte stays 0 (freq = 0x100 < 0x10000), but
         // the low byte ticks to 0x00 and mid byte to 0x01.
         assert_eq!(chip.ram[0x7B], 0x01);
+    }
+
+    // ------------------------------------------------------------- VRC7
+
+    /// Helper: write `value` into VRC7 internal register `r` via the
+    /// `$9010` select / `$9030` data ports.
+    fn vrc7_write_reg(chip: &mut Vrc7, r: u8, value: u8) {
+        chip.write(0x9010, r);
+        chip.write(0x9030, value);
+    }
+
+    #[test]
+    fn vrc7_instrument_rom_table_size_is_sixteen() {
+        // Per §"Internal patch set": "There are 16 different
+        // instrument patches available on the VRC7." Slot 0 is the
+        // user-programmable placeholder; slots 1..=15 are hardwired.
+        assert_eq!(VRC7_INSTRUMENT_ROM.len(), 16);
+    }
+
+    #[test]
+    fn vrc7_buzzy_bell_patch_decodes_from_rom() {
+        // Patch 1 "Buzzy Bell" = `03 21 05 06 E8 81 42 27` per the
+        // dumped table in vrc7-audio-wiki.html.
+        let p = Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[1]);
+        // $00 = 0x03: T=0 V=0 S=0 K=0 M=3 — pure modulator, no LFOs,
+        // multiplier 3.
+        assert!(!p.mod_tremolo);
+        assert!(!p.mod_vibrato);
+        assert!(!p.mod_sustain);
+        assert!(!p.mod_ksr);
+        assert_eq!(p.mod_mult, 3);
+        // $01 = 0x21: T=0 V=0 S=1 K=0 M=1.
+        assert!(p.car_sustain);
+        assert_eq!(p.car_mult, 1);
+        // $02 = 0x05: KSL=0, TL=5 (modulator output level).
+        assert_eq!(p.mod_ksl, 0);
+        assert_eq!(p.mod_tl, 5);
+        // $03 = 0x06: KSL=0, Q=0, W=0, FB=6.
+        assert_eq!(p.car_ksl, 0);
+        assert_eq!(p.car_wave, 0);
+        assert_eq!(p.mod_wave, 0);
+        assert_eq!(p.feedback, 6);
+        // $04 = 0xE8: mod attack 0xE, decay 0x8.
+        assert_eq!(p.mod_attack, 0xE);
+        assert_eq!(p.mod_decay, 0x8);
+        // $05 = 0x81: car attack 0x8, decay 0x1.
+        assert_eq!(p.car_attack, 0x8);
+        assert_eq!(p.car_decay, 0x1);
+        // $06 = 0x42: mod sustain 0x4, release 0x2.
+        assert_eq!(p.mod_sustain_level, 0x4);
+        assert_eq!(p.mod_release, 0x2);
+        // $07 = 0x27: car sustain 0x2, release 0x7.
+        assert_eq!(p.car_sustain_level, 0x2);
+        assert_eq!(p.car_release, 0x7);
+    }
+
+    #[test]
+    fn vrc7_vibes_patch_has_high_bit_tremolo() {
+        // Patch A "Vibes" = `B5 01 0F 0F A8 A5 51 02`. The wiki
+        // spells the §"Custom Patch" $00 bitfield TVSKMMMM, so
+        // 0xB5 = 1011_0101: T=1 V=0 S=1 K=1 M=5.
+        let p = Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[0xA]);
+        assert!(p.mod_tremolo);
+        assert!(!p.mod_vibrato);
+        assert!(p.mod_sustain);
+        assert!(p.mod_ksr);
+        assert_eq!(p.mod_mult, 5);
+        // $03 = 0x0F = 0000_1111: KK=0, unused=0, Q=0, W=1, FB=7.
+        // The §"Custom Patch" $03 bitfield is KK-QWFFF (bit 7-6 KSL,
+        // bit 5 unused, bit 4 carrier waveform, bit 3 modulator
+        // waveform, bits 2-0 feedback).
+        assert_eq!(p.car_ksl, 0);
+        assert_eq!(p.car_wave, 0);
+        assert_eq!(p.mod_wave, 1);
+        assert_eq!(p.feedback, 7);
+    }
+
+    #[test]
+    fn vrc7_patch_zero_reads_user_programmable_regs() {
+        // Slot 0 is the "custom patch" placeholder. The decoder must
+        // pull from regs[0x00..=0x07] rather than VRC7_INSTRUMENT_ROM.
+        let mut chip = Vrc7::new();
+        // Pre-program: TVSKMMMM = 1101_1010 → tremolo on, vibrato
+        // on, sustain off, KSR on, mult=0xA.
+        vrc7_write_reg(&mut chip, 0x00, 0xDA);
+        // Carrier bytes are 0 — explicit so the decode is unambiguous.
+        for r in 0x01..=0x07 {
+            vrc7_write_reg(&mut chip, r, 0x00);
+        }
+        let p = chip.patch(0);
+        assert!(p.mod_tremolo);
+        assert!(p.mod_vibrato);
+        assert!(!p.mod_sustain);
+        assert!(p.mod_ksr);
+        assert_eq!(p.mod_mult, 0xA);
+        // Carrier bytes were all zero.
+        assert!(!p.car_tremolo);
+        assert_eq!(p.car_mult, 0);
+    }
+
+    #[test]
+    fn vrc7_channel_register_3x_decodes_instrument_and_volume() {
+        // $3X = IIIIVVVV: high nibble = instrument index, low nibble =
+        // inverted volume. Writing 0x73 to channel 2's $32 means
+        // instrument = 7 (Trumpet), volume = 3.
+        let mut chip = Vrc7::new();
+        vrc7_write_reg(&mut chip, 0x32, 0x73);
+        assert_eq!(chip.channels[2].patch_index, 7);
+        assert_eq!(chip.channels[2].volume, 3);
+        // active_patch routes through patch(7) and matches the ROM
+        // entry exactly.
+        let active = chip.active_patch(2);
+        let trumpet = Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[7]);
+        assert_eq!(active, trumpet);
+    }
+
+    #[test]
+    fn vrc7_channel_register_2x_decodes_sustain_and_key_on() {
+        // $2X = --STOOOH. Writing 0x30 to $20 means S=1 T=1 octave=0
+        // fnum-high=0. The channel should report both sustain and
+        // key-on.
+        let mut chip = Vrc7::new();
+        vrc7_write_reg(&mut chip, 0x20, 0x30);
+        assert!(chip.channels[0].sustain);
+        assert!(chip.channels[0].key_on);
+        // 0x10 = key-on without sustain.
+        vrc7_write_reg(&mut chip, 0x21, 0x10);
+        assert!(!chip.channels[1].sustain);
+        assert!(chip.channels[1].key_on);
+        // 0x20 = sustain without trigger — a release-in-progress with
+        // patch-release override per §Channels.
+        vrc7_write_reg(&mut chip, 0x22, 0x20);
+        assert!(chip.channels[2].sustain);
+        assert!(!chip.channels[2].key_on);
+    }
+
+    #[test]
+    fn vrc7_channel_patch_defaults_to_custom_slot_zero() {
+        // Fresh chip: no $3X writes yet, so every channel sees
+        // patch_index=0 (custom) and its custom patch bytes are
+        // still all zero.
+        let chip = Vrc7::new();
+        for ch in 0..6 {
+            assert_eq!(chip.channels[ch].patch_index, 0);
+        }
+        let p = chip.active_patch(0);
+        assert_eq!(p, Vrc7Patch::default());
+    }
+
+    #[test]
+    fn vrc7_patch_index_out_of_range_wraps_mod_sixteen() {
+        // The $3X high nibble is only 4 bits, so this is defensive,
+        // but patch(20) should resolve to patch(4) without panicking.
+        let chip = Vrc7::new();
+        let p = chip.patch(20);
+        let expected = Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[4]);
+        assert_eq!(p, expected);
     }
 }

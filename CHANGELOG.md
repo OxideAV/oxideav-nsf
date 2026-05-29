@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VRC7 patch table + per-channel patch selection** (round 13): the
+  15-instrument hardwired §"Internal patch set" ROM dumped in
+  `docs/audio/nsf/vrc7-audio-wiki.html` is now exposed as the
+  `VRC7_INSTRUMENT_ROM: [[u8; 8]; 16]` table (slot 0 is the
+  user-programmable placeholder; slots 1..=15 are the named presets
+  "Buzzy Bell" through "Sweep"). A new `Vrc7Patch` struct decodes the
+  §"Custom Patch" 8-byte bitfield per operator: modulator + carrier
+  tremolo (T) / vibrato (V) / sustain (S) / key-rate-scaling (K) /
+  multiplier (M) from `$00`/`$01`; modulator KSL + 6-bit output level
+  from `$02`; carrier KSL, carrier waveform (Q), modulator waveform
+  (W), and 3-bit feedback from `$03`; attack + decay per operator
+  from `$04`/`$05`; sustain level + release per operator from
+  `$06`/`$07`. `Vrc7Patch::from_bytes` works on both the
+  `VRC7_INSTRUMENT_ROM` rows and the user patch at
+  `regs[0x00..=0x07]`. The `$3X` channel register's high nibble (I)
+  now maps to `Vrc7Chan::patch_index` and `Vrc7::active_patch(ch)`
+  returns the patch the channel currently asks for; slot 0 reads
+  through to the live custom-patch registers so a runtime
+  re-program is reflected immediately. The `$2X` sustain bit (S) is
+  also decoded into `Vrc7Chan::sustain` so the §Channels "S overrides
+  patch release with $5" rule can be honoured by a future OPLL
+  operator implementation. +9 unit tests covering the 16-entry ROM
+  size, the §"Custom Patch" bitfield decode against Buzzy Bell + Vibes
+  byte-for-byte, slot-0 custom-patch reads through `Vrc7::patch`, the
+  `$2X` decode of sustain + key-on combinations, the `$3X` decode of
+  instrument index + inverted volume, the default-everything fresh-chip
+  state, and the patch-index modulo-16 defensive wrap. The audible
+  signal path is unchanged — VRC7 output is still the round-2
+  sinusoidal stand-in — but the patch-selection plumbing now matches
+  the wiki and unblocks a real OPLL operator implementation (#861)
+  without another API break.
+
 - **Sunsoft 5B noise + envelope generators** (round 12): the 5B
   expansion chip now drives the documented 17-bit LFSR noise
   generator (5-bit period at `$06`, taps at bits 16 and 13, one new

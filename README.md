@@ -61,7 +61,20 @@ tone, noise and envelope per the §Sound period-zero footnote. The
 channel — emitting tone, noise, tone-AND-noise, or constant-DC as
 documented in §Sound — and bit 4 of `$08`..=`$0A` routes the envelope
 DAC in place of the 4-bit volume per §Output's 0.75 dB-per-step
-envelope-vs-volume mapping.
+envelope-vs-volume mapping. Round 13 adds: the VRC7 patch table —
+the dumped §"Internal patch set" 15-instrument ROM from
+`docs/audio/nsf/vrc7-audio-wiki.html` lands as `VRC7_INSTRUMENT_ROM`,
+the §"Custom Patch" 8-byte bitfield decodes to a `Vrc7Patch` struct
+(per-operator tremolo / vibrato / sustain / KSR / fmult, modulator
+output level, KSL per operator, both operator waveforms, feedback,
+attack / decay / sustain-level / release per operator), and each
+channel's `$3X` high nibble + `$2X` sustain bit are now decoded so
+`Vrc7::active_patch(ch)` returns the patch the channel is asking for.
+The audible signal path still uses the sinusoidal stand-in, so VRC7
+output is not yet bit-exact OPLL — but the patch-selection plumbing
+is in place and tested against the wiki's dumped table, which
+unblocks a future OPLL operator implementation (#861) without
+another API break.
 
 ## Round 2 scope
 
