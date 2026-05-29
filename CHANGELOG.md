@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sunsoft 5B noise + envelope generators** (round 12): the 5B
+  expansion chip now drives the documented 17-bit LFSR noise
+  generator (5-bit period at `$06`, taps at bits 16 and 13, one new
+  random bit every 32 CPU clocks per
+  `docs/audio/nsf/sunsoft-5b-audio-wiki.html` §Noise) and the full
+  16-bit-period 4-bit-shape envelope generator (period at
+  `$0B`/`$0C`, shape at `$0D`, 32-step ramp per §Envelope and §Shape).
+  All ten §Shape rows are implemented — the four `$00..$07`
+  one-shot decay/attack patterns silence to step 0 and hold there;
+  `$08` is a continued falling sawtooth that wraps to 31; `$0A` is
+  a continued falling-then-rising triangle; `$0C` is a continued
+  rising sawtooth that wraps to 0; `$0E` is the rising-then-falling
+  triangle; `$09`/`$0B` hold at the floor (with `$0B` flipping to
+  31 at the end of the attack); `$0D`/`$0F` hold at the top (with
+  `$0F` flipping to 0 at the end). Writing `$0D` resets the envelope
+  phase to the start of the shape. Tone channels now also flip on
+  the documented `counter >= period` boundary (counter resets to 0,
+  immediate flip if the new period is smaller than the current
+  counter per the §Sound period-shortening note); period 0 behaves
+  as period 1 for tone, noise, and envelope per the §Sound
+  period-zero footnote. The §Sound mixer at `$07` now interprets
+  both tone-disable AND noise-disable bits per channel — when both
+  are clear the channel emits the logical AND of tone and noise;
+  when both are set the channel emits a constant DC at the
+  configured volume. Bit 4 of `$08`..=`$0A` routes the envelope DAC
+  in place of the 4-bit volume; the 32-step envelope DAC table is
+  generated at 0.75 dB per step (envelope step 0 and 1 both
+  silent; envelope step `2k+2` matches volume step `k` per §Output).
+  +13 tests (tone period 0, tone flip cadence, noise LFSR cycle
+  length 2^17-1, six envelope shape walks, shape-reset phase, both
+  mixer-mode combinations).
+
 - **Namco 163 per-channel timer accumulators** (round 11): the N163
   expansion chip now ticks one channel every 15 CPU cycles per
   `docs/audio/nsf/namco-163-audio-wiki.html` §"Channel Update" +

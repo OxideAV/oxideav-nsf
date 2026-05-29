@@ -339,22 +339,109 @@ impl Mmc5 {
 // ---------------------------------------------------------------- Sunsoft 5B
 
 /// Sunsoft 5B (a Yamaha YM2149F derivative) has three square channels,
-/// a noise generator, and an envelope generator. Round 2 implements
-/// the three squares + amplitude envelope (no shape generator yet —
-/// it averages to the 16-step decay shape).
+/// a noise generator, and an envelope generator that may be shared by
+/// any of the three channels.
+///
+/// Round 12 (per `docs/audio/nsf/sunsoft-5b-audio-wiki.html`):
+///   * **Tone**: 12-bit period at `$00`..=`$05`; the high/low square
+///     state flips every 16 clocks when an internal counter reaches
+///     (>=) the period, then the counter resets to 0 per §Sound.
+///     Writing a period smaller than the current counter triggers an
+///     immediate flip on the next 16-clock boundary per §Sound.
+///   * **Noise**: 5-bit period at `$06`; a 17-bit linear-feedback
+///     shift register with taps at bits 16 and 13 advances every 32
+///     clocks (one new random bit per 32 clocks per §Noise).
+///   * **Mixer** at `$07`: low three bits = per-channel tone-disable
+///     (active-high), high three bits = per-channel noise-disable
+///     (active-high). When BOTH tone and noise are disabled on a
+///     channel, the channel emits a constant signal at the configured
+///     volume per §Sound. When both are enabled, the channel emits
+///     the logical AND of tone and noise.
+///   * **Volume / envelope-route** at `$08`..=`$0A`: bit 4 routes
+///     the envelope generator instead of the 4-bit volume.
+///   * **Envelope**: 16-bit period at `$0B`/`$0C` and 4-bit shape at
+///     `$0D`. A 32-step ramp ticks every `16 * period` clocks. Shape
+///     bits select continue / attack / alternate / hold per §Shape:
+///     the eight bilevel patterns `$08`..=`$0F` and the four
+///     decay/attack-once patterns `$00`..=`$07`. Writing `$0D`
+///     resets the envelope phase to step 0 of the selected shape.
+///   * **Output**: each tone produces a 5-bit signal converted by a
+///     logarithmic DAC with 1.5 dB per step. Envelope step 1 equals
+///     volume 0 (silent); even envelope steps map to the
+///     corresponding 4-bit volume per the §Output step table.
+///
+/// Period 0 produces the same period as 1 per the §Sound note (and
+/// the cited Period 0 verification) for tone, noise, and envelope.
 #[derive(Default)]
 pub struct Sunsoft5b {
     pub enabled: bool,
     pub addr: u8,
     pub regs: [u8; 16],
     pub channels: [S5bChan; 3],
+    /// Noise generator — 5-bit period at `$06`, 17-bit LFSR shared
+    /// by every channel whose `$07` noise-disable bit is clear.
+    pub noise: S5bNoise,
+    /// Envelope generator — 16-bit period at `$0B`/`$0C`, 32-step
+    /// ramp, shape parameters at `$0D` low nibble.
+    pub envelope: S5bEnvelope,
 }
 
 #[derive(Default, Clone, Copy)]
 pub struct S5bChan {
     pub timer_period: u16,
+    /// Counter that increments every 16 clocks; on reaching the
+    /// period it flips `level` and resets to 0 per §Sound.
     pub timer: u16,
     pub level: u8,
+}
+
+#[derive(Clone, Copy)]
+pub struct S5bNoise {
+    /// 5-bit period from `$06` (low five bits).
+    pub period: u8,
+    /// 16-clock-tick counter. Bit 0 toggles every 16 clocks so the
+    /// noise advances only on its 0-phase (every 32 clocks per
+    /// §Noise); the upper bits are the noise-period counter.
+    pub timer: u16,
+    /// 17-bit linear-feedback shift register. Bit 0 is the live
+    /// output sample shared with the three channels.
+    pub lfsr: u32,
+}
+
+impl Default for S5bNoise {
+    fn default() -> Self {
+        // The noise LFSR must seed to a non-zero value, otherwise
+        // an all-zero shift-register stays at all-zero forever and
+        // the chip emits silence on the noise output.
+        Self {
+            period: 0,
+            timer: 0,
+            lfsr: 1,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct S5bEnvelope {
+    /// 16-bit period at `$0B`/`$0C`.
+    pub period: u16,
+    /// 16-clock-tick counter — the envelope advances one step every
+    /// `period` of these 16-clock intervals per §Period.
+    pub timer: u16,
+    /// Current ramp step, 0..=31.
+    pub step: u8,
+    /// Shape low nibble: `CAaH` (continue / attack / alternate /
+    /// hold) per §Shape table. The semantics live in
+    /// `envelope_advance()`.
+    pub shape: u8,
+    /// Set true after the first attack pass completes; controls the
+    /// `continue=0` "one-shot" patterns that drop to silence and
+    /// stay silent forever.
+    pub attacked: bool,
+    /// Holding flag once the shape requested a hold and the attack
+    /// pass finished — when true, the step counter stops advancing
+    /// per §Shape "hold".
+    pub holding: bool,
 }
 
 impl Sunsoft5b {
@@ -368,11 +455,44 @@ impl Sunsoft5b {
             0xE000 => {
                 let r = (self.addr & 0x0F) as usize;
                 self.regs[r] = value;
-                // Update channel periods + volumes.
-                for ch in 0..3 {
-                    let lo = self.regs[ch * 2] as u16;
-                    let hi = (self.regs[ch * 2 + 1] & 0x0F) as u16;
-                    self.channels[ch].timer_period = (hi << 8) | lo;
+                match r {
+                    // Channel A/B/C 12-bit tone periods at `$00`..=`$05`.
+                    0..=5 => {
+                        let ch = r / 2;
+                        let lo = self.regs[ch * 2] as u16;
+                        let hi = (self.regs[ch * 2 + 1] & 0x0F) as u16;
+                        self.channels[ch].timer_period = (hi << 8) | lo;
+                    }
+                    // Noise 5-bit period at `$06`.
+                    6 => {
+                        self.noise.period = value & 0x1F;
+                    }
+                    // Envelope low / high period at `$0B` / `$0C`.
+                    0x0B => {
+                        let hi = self.regs[0x0C] as u16;
+                        self.envelope.period = (hi << 8) | value as u16;
+                    }
+                    0x0C => {
+                        let lo = self.regs[0x0B] as u16;
+                        self.envelope.period = ((value as u16) << 8) | lo;
+                    }
+                    // Envelope shape at `$0D` — writing it resets the
+                    // envelope phase to the start of the selected
+                    // shape per §Shape.
+                    0x0D => {
+                        let shape = value & 0x0F;
+                        self.envelope.shape = shape;
+                        self.envelope.timer = 0;
+                        self.envelope.attacked = false;
+                        self.envelope.holding = false;
+                        // Attack bit 2 selects rising vs falling, so
+                        // the ramp starts at 0 if attacking and 31
+                        // otherwise — matches the leading edge in
+                        // every row of the §Shape table.
+                        let attack = (shape & 0b0100) != 0;
+                        self.envelope.step = if attack { 0 } else { 31 };
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -380,47 +500,207 @@ impl Sunsoft5b {
     }
 
     pub fn tick(&mut self, cycles: u32) {
-        // Sunsoft 5B clocks at the CPU clock / 16.
-        for ch in &mut self.channels {
-            if ch.timer_period == 0 {
-                continue;
-            }
-            let div = ch.timer_period.max(1);
-            let mut left = cycles / 16;
-            while left > 0 {
-                if ch.timer == 0 {
-                    ch.timer = div;
-                    ch.level ^= 1;
+        // The 5B's audio is driven by the CPU clock; tone, noise and
+        // envelope all observe a 16-clock minor tick per §Sound. We
+        // count whole 16-clock intervals here.
+        let intervals = cycles / 16;
+        for _ in 0..intervals {
+            // Tone channels — flip when the counter reaches the
+            // period (`>= period`), then reset to 0 per §Sound. A
+            // period of 0 behaves as 1 (flip every 16 clocks). The
+            // §Sound note about shortened periods causing an
+            // immediate flip falls out of `>=` automatically.
+            for ch in &mut self.channels {
+                let p = if ch.timer_period == 0 {
+                    1
                 } else {
-                    ch.timer -= 1;
+                    ch.timer_period
+                };
+                ch.timer = ch.timer.saturating_add(1);
+                if ch.timer >= p {
+                    ch.timer = 0;
+                    ch.level ^= 1;
                 }
-                left -= 1;
+            }
+            // Noise — advances only every other 16-clock interval
+            // (every 32 clocks per §Noise). Period 0 again behaves
+            // as 1.
+            self.noise.timer = self.noise.timer.wrapping_add(1);
+            if self.noise.timer & 1 == 0 {
+                let p = if self.noise.period == 0 {
+                    1
+                } else {
+                    self.noise.period
+                };
+                let nticks = self.noise.timer >> 1;
+                if nticks as u32 >= p as u32 {
+                    self.noise.timer = 0;
+                    // 17-bit LFSR with taps at bits 16 and 13 per
+                    // §Noise. Shift right by one; the feedback bit
+                    // is (bit 0 XOR bit 3) re-inserted at bit 16.
+                    let lfsr = self.noise.lfsr;
+                    let new_bit = ((lfsr ^ (lfsr >> 3)) & 1) << 16;
+                    self.noise.lfsr = (lfsr >> 1) | new_bit;
+                    self.noise.lfsr &= 0x0001_FFFF;
+                }
+            }
+            // Envelope — advances one step every `period` intervals
+            // per §Period. Period 0 again behaves as 1. The holding
+            // flag stops the ramp at the held step per §Shape.
+            if !self.envelope.holding {
+                let p = if self.envelope.period == 0 {
+                    1
+                } else {
+                    self.envelope.period
+                };
+                self.envelope.timer = self.envelope.timer.wrapping_add(1);
+                if self.envelope.timer >= p {
+                    self.envelope.timer = 0;
+                    self.envelope_advance();
+                }
             }
         }
     }
 
+    /// Advance the envelope one step inside the active shape per
+    /// §Shape, handling continue / attack / alternate / hold.
+    fn envelope_advance(&mut self) {
+        let shape = self.envelope.shape;
+        let attack = (shape & 0b0100) != 0;
+        let cont = (shape & 0b1000) != 0;
+        let alt = (shape & 0b0010) != 0;
+        let hold = (shape & 0b0001) != 0;
+
+        let mut step = self.envelope.step;
+        let mut attacked = self.envelope.attacked;
+        let mut holding = self.envelope.holding;
+
+        // Direction: follow the `attack` bit until the first edge
+        // is reached; thereafter, alternate flips the direction.
+        let rising = if !attacked { attack } else { attack ^ alt };
+
+        // Compute the natural next step in the active direction,
+        // then apply edge-of-ramp behaviour when we land outside
+        // 0..=31.  The order is important: edge transitions take
+        // effect on the same tick that crossed the boundary, so the
+        // ramp doesn't sit one extra tick at the held endpoint
+        // before applying the §Shape behaviour.
+        let next = if rising {
+            step as i16 + 1
+        } else {
+            step as i16 - 1
+        };
+        if (0..=31).contains(&next) {
+            step = next as u8;
+        } else {
+            attacked = true;
+            if rising {
+                // Just walked past 31 — apply §Shape behaviour for
+                // the high edge.
+                if !cont {
+                    // §Shape `$04..$07`: one-shot attack `/_______`
+                    // — drop to 0 and stay there forever.
+                    step = 0;
+                    holding = true;
+                } else if hold {
+                    // §Shape `$0D` / `$0F`: hold after attack. With
+                    // alternate, value flips at the end of the
+                    // attack per §Shape (`$0F` → 0).
+                    step = if alt { 0 } else { 31 };
+                    holding = true;
+                } else if alt {
+                    // §Shape `$0E`: continue + attack + alternate
+                    // (no hold) — flip and start falling. 30 is the
+                    // first falling step after the peak.
+                    step = 30;
+                } else {
+                    // §Shape `$0C`: continue + attack sawtooth —
+                    // wrap to 0 and rise again.
+                    step = 0;
+                }
+            } else {
+                // Just walked past 0 — apply §Shape behaviour for
+                // the low edge.
+                if !cont {
+                    // §Shape `$00..$03`: one-shot decay `\_______`
+                    // — hold at 0 forever.
+                    step = 0;
+                    holding = true;
+                } else if hold {
+                    // §Shape `$09` / `$0B`: hold after attack. With
+                    // alternate, value flips at the end per §Shape.
+                    step = if alt { 31 } else { 0 };
+                    holding = true;
+                } else if alt {
+                    // §Shape `$0A`: continue + falling + alternate
+                    // (no hold) — flip and start rising. Step 1 is
+                    // the first rising step after the floor.
+                    step = 1;
+                } else {
+                    // §Shape `$08`: continue + falling sawtooth —
+                    // wrap to 31 and fall again.
+                    step = 31;
+                }
+            }
+        }
+        self.envelope.step = step;
+        self.envelope.attacked = attacked;
+        self.envelope.holding = holding;
+    }
+
     pub fn output(&self) -> f32 {
         let mut sum = 0.0f32;
-        // Mixer enable byte at register 7 (R7): low 3 bits = tone enable
-        // (active-low). High bits select noise — ignored.
+        // §Sound: mixer enable byte at register 7. Low three bits =
+        // tone-disable, high three bits = noise-disable. Both active
+        // high (bit set = disabled). When both bits are set for the
+        // channel, the channel still outputs a constant DC at the
+        // configured volume.
         let r7 = self.regs[7];
+        let noise_bit = (self.noise.lfsr & 1) as u8;
         for (i, ch) in self.channels.iter().enumerate() {
-            let tone_on = (r7 >> i) & 1 == 0;
-            if !tone_on {
-                continue;
-            }
-            let vol = self.regs[8 + i] & 0x0F;
-            let vol_lin = LIN_AY_VOL[vol as usize];
-            sum += if ch.level != 0 { vol_lin } else { 0.0 };
+            let tone_dis = (r7 >> i) & 1 == 1;
+            let noise_dis = (r7 >> (i + 3)) & 1 == 1;
+            // §Sound: per-channel signal is one of tone, noise,
+            // tone-AND-noise, or constant (when both are disabled).
+            let signal: u8 = match (tone_dis, noise_dis) {
+                (false, true) => ch.level,
+                (true, false) => noise_bit,
+                (false, false) => ch.level & noise_bit,
+                (true, true) => 1,
+            };
+            // §Sound: bit 4 of `$08`..=`$0A` routes the envelope
+            // generator; otherwise the 4-bit volume in bits 3..0.
+            let vol_reg = self.regs[8 + i];
+            let env_route = (vol_reg & 0x10) != 0;
+            let amp_lin = if env_route {
+                S5B_ENV_LIN[self.envelope.step as usize]
+            } else {
+                LIN_AY_VOL[(vol_reg & 0x0F) as usize]
+            };
+            sum += if signal != 0 { amp_lin } else { 0.0 };
         }
         sum / 3.0
     }
 }
 
-// AY-style logarithmic volume table → linear amplitude (16 steps).
+/// 16-step logarithmic DAC table for the 4-bit volume register, in
+/// linear amplitude. Each step is 1.5 dB louder than the previous
+/// per §Output; the table is normalised so step 15 lands near the
+/// chip's peak and step 0 is silent.
 const LIN_AY_VOL: [f32; 16] = [
     0.0, 0.011, 0.022, 0.033, 0.046, 0.066, 0.094, 0.133, 0.188, 0.265, 0.375, 0.529, 0.747, 1.057,
     1.494, 2.114,
+];
+
+/// 32-step envelope DAC table per §Output: envelope steps 0 and 1
+/// both map to silence (volume 0); envelope step `2k+1` and `2k+2`
+/// map to volume `k`. Intermediate odd entries are independently
+/// interpolated at 0.75 dB to match the §Output 1.5 dB-per-volume
+/// step / 0.75 dB-per-envelope step rule.
+const S5B_ENV_LIN: [f32; 32] = [
+    0.0, 0.0, 0.0095, 0.011, 0.018, 0.022, 0.027, 0.033, 0.039, 0.046, 0.055, 0.066, 0.079, 0.094,
+    0.111, 0.133, 0.158, 0.188, 0.224, 0.265, 0.316, 0.375, 0.447, 0.529, 0.629, 0.747, 0.889,
+    1.057, 1.257, 1.494, 1.776, 2.114,
 ];
 
 // ---------------------------------------------------------------- N163
@@ -1511,6 +1791,263 @@ mod tests {
         chip.write(0xC000, 0x01);
         chip.write(0xE000, 0x03); // R1 = 0x03 (period hi channel A)
         assert_eq!(chip.channels[0].timer_period, 0x0342);
+    }
+
+    /// Helper: write `value` into Sunsoft 5B register `r` using the
+    /// `$C000`/`$E000` address-port + data-port sequence.
+    fn s5b_write_reg(chip: &mut Sunsoft5b, r: u8, value: u8) {
+        chip.write(0xC000, r);
+        chip.write(0xE000, value);
+    }
+
+    #[test]
+    fn s5b_tone_flips_every_two_periods_of_sixteen_clocks() {
+        // §Sound: tone counter increments every 16 clocks; flips
+        // and resets when counter >= period. With period = 4, the
+        // tone level toggles every 4 * 16 = 64 clocks.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0, 0x04); // period lo = 4
+        s5b_write_reg(&mut chip, 1, 0x00); // period hi = 0
+        assert_eq!(chip.channels[0].timer_period, 4);
+        let start = chip.channels[0].level;
+        chip.tick(48); // 3 intervals — not enough to flip
+        assert_eq!(chip.channels[0].level, start);
+        chip.tick(16); // total 64 = 4 intervals — flip
+        assert_eq!(chip.channels[0].level, start ^ 1);
+        chip.tick(64); // next 64 clocks — flip back
+        assert_eq!(chip.channels[0].level, start);
+    }
+
+    #[test]
+    fn s5b_tone_period_zero_behaves_as_one() {
+        // §Sound period-zero note: period 0 acts as period 1, so
+        // the tone flips every 16 clocks.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0, 0x00);
+        s5b_write_reg(&mut chip, 1, 0x00);
+        let start = chip.channels[0].level;
+        chip.tick(16);
+        assert_eq!(chip.channels[0].level, start ^ 1);
+        chip.tick(16);
+        assert_eq!(chip.channels[0].level, start);
+    }
+
+    #[test]
+    fn s5b_noise_lfsr_advances_with_period_one() {
+        // §Noise: new random bit every 32 clocks. With period 1 the
+        // LFSR advances on every 32-clock boundary; ticking 32
+        // clocks must change at least one bit of the LFSR state.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 6, 0x01); // noise period = 1
+        let lfsr0 = chip.noise.lfsr;
+        chip.tick(32);
+        assert_ne!(chip.noise.lfsr, lfsr0);
+    }
+
+    #[test]
+    fn s5b_noise_lfsr_period_is_full_cycle() {
+        // The 17-bit LFSR taps at bits 16 and 13 produce a period
+        // of (2^17 - 1) = 131071 states per the §Noise reference.
+        // Step the LFSR by hand at period=0 (max rate) for one full
+        // expected cycle and confirm we return to the seed exactly
+        // once — no shorter sub-cycle.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 6, 0x00); // period 0 → 1
+        let seed = chip.noise.lfsr;
+        let mut returns = 0u32;
+        // Each LFSR advance takes 32 clocks; 131_071 * 32 = 4_194_272.
+        // Walk 131_071 advances and count how many times we land on
+        // the seed mid-walk (should be exactly once, at the end).
+        for _ in 0..131_071 {
+            chip.tick(32);
+            if chip.noise.lfsr == seed {
+                returns += 1;
+            }
+        }
+        assert_eq!(returns, 1);
+    }
+
+    #[test]
+    fn s5b_envelope_shape_decay_one_shot_holds_silent() {
+        // §Shape `$00..$03` — decay one-shot, attack=0, continue=0:
+        // ramp falls from 31 to 0 and stays at 0 forever. With
+        // period 1 the envelope advances once every 16 clocks. 31
+        // step-downs (31 → 0) take 31 ticks; the 32nd tick lands
+        // at the low edge and engages the hold.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0x0B, 0x01);
+        s5b_write_reg(&mut chip, 0x0C, 0x00);
+        s5b_write_reg(&mut chip, 0x0D, 0x00);
+        assert_eq!(chip.envelope.step, 31);
+        chip.tick(16 * 31);
+        assert_eq!(chip.envelope.step, 0);
+        assert!(!chip.envelope.holding);
+        chip.tick(16); // edge-crossing tick → engages hold
+        assert_eq!(chip.envelope.step, 0);
+        assert!(chip.envelope.holding);
+        chip.tick(16 * 100);
+        assert_eq!(chip.envelope.step, 0);
+    }
+
+    #[test]
+    fn s5b_envelope_shape_sawtooth_falling_wraps_to_top() {
+        // §Shape `$08` — continue + falling sawtooth: ramp falls 31
+        // → 0, then wraps back to 31 on the edge-crossing tick.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0x0B, 0x01);
+        s5b_write_reg(&mut chip, 0x0C, 0x00);
+        s5b_write_reg(&mut chip, 0x0D, 0x08);
+        assert_eq!(chip.envelope.step, 31);
+        chip.tick(16 * 31); // walk to step 0
+        assert_eq!(chip.envelope.step, 0);
+        assert!(!chip.envelope.holding);
+        chip.tick(16); // edge tick — wraps to 31
+        assert_eq!(chip.envelope.step, 31);
+    }
+
+    #[test]
+    fn s5b_envelope_shape_triangle_alternates_direction() {
+        // §Shape `$0A` — continue + falling + alternate (no hold):
+        // ramp falls 31 → 0, then rises back. No hold.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0x0B, 0x01);
+        s5b_write_reg(&mut chip, 0x0C, 0x00);
+        s5b_write_reg(&mut chip, 0x0D, 0x0A);
+        assert_eq!(chip.envelope.step, 31);
+        chip.tick(16 * 31);
+        assert_eq!(chip.envelope.step, 0);
+        // Edge-crossing tick flips direction and starts at step 1.
+        chip.tick(16);
+        assert_eq!(chip.envelope.step, 1);
+        chip.tick(16 * 30);
+        assert_eq!(chip.envelope.step, 31);
+        // High-edge crossing flips direction again.
+        chip.tick(16);
+        assert_eq!(chip.envelope.step, 30);
+    }
+
+    #[test]
+    fn s5b_envelope_shape_attack_hold_stays_at_top() {
+        // §Shape `$0D` — continue + attack + hold (no alternate):
+        // ramp rises 0 → 31 and holds at 31 forever.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0x0B, 0x01);
+        s5b_write_reg(&mut chip, 0x0C, 0x00);
+        s5b_write_reg(&mut chip, 0x0D, 0x0D);
+        assert_eq!(chip.envelope.step, 0);
+        chip.tick(16 * 31); // walk up to 31
+        assert_eq!(chip.envelope.step, 31);
+        chip.tick(16); // edge tick → engage hold
+        assert!(chip.envelope.holding);
+        assert_eq!(chip.envelope.step, 31);
+        chip.tick(16 * 100);
+        assert_eq!(chip.envelope.step, 31);
+    }
+
+    #[test]
+    fn s5b_envelope_shape_attack_alternate_hold_flips_at_end() {
+        // §Shape `$0F` — continue + attack + alternate + hold:
+        // ramp rises 0 → 31, then *immediately flips to 0* per the
+        // §Shape table (`/_______`), then holds.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0x0B, 0x01);
+        s5b_write_reg(&mut chip, 0x0C, 0x00);
+        s5b_write_reg(&mut chip, 0x0D, 0x0F);
+        chip.tick(16 * 31);
+        assert_eq!(chip.envelope.step, 31);
+        chip.tick(16); // edge tick → flip-then-hold
+        assert_eq!(chip.envelope.step, 0);
+        assert!(chip.envelope.holding);
+        chip.tick(16 * 100);
+        assert_eq!(chip.envelope.step, 0);
+    }
+
+    #[test]
+    fn s5b_envelope_shape_write_resets_phase() {
+        // §Shape: writing `$0D` resets the envelope phase to the
+        // start of the selected shape. After walking partway
+        // through a decay, writing `$0D` again should restart at
+        // step 31.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0x0B, 0x01);
+        s5b_write_reg(&mut chip, 0x0C, 0x00);
+        s5b_write_reg(&mut chip, 0x0D, 0x00);
+        chip.tick(16 * 10); // walk down to 21
+        assert_eq!(chip.envelope.step, 21);
+        s5b_write_reg(&mut chip, 0x0D, 0x00);
+        assert_eq!(chip.envelope.step, 31);
+        assert_eq!(chip.envelope.timer, 0);
+        assert!(!chip.envelope.attacked);
+        assert!(!chip.envelope.holding);
+    }
+
+    #[test]
+    fn s5b_envelope_route_overrides_volume_register() {
+        // §Sound: bit 4 of `$08`..=`$0A` routes the envelope DAC
+        // instead of the 4-bit volume. With the envelope held at
+        // step 31 and only channel A enabled, the channel's
+        // amplitude must equal `S5B_ENV_LIN[31]` / 3.
+        let mut chip = Sunsoft5b::new();
+        // Disable noise on every channel + enable tone on channel A
+        // only. R7 layout: bits 0..2 tone-disable, bits 3..5 noise.
+        s5b_write_reg(&mut chip, 7, 0b0011_1110);
+        s5b_write_reg(&mut chip, 8, 0x10);
+        s5b_write_reg(&mut chip, 0x0B, 0x01);
+        s5b_write_reg(&mut chip, 0x0C, 0x00);
+        s5b_write_reg(&mut chip, 0x0D, 0x0D); // attack + hold
+        chip.tick(16 * 32); // walk + edge tick to engage hold
+        assert_eq!(chip.envelope.step, 31);
+        assert!(chip.envelope.holding);
+        chip.channels[0].level = 1;
+        let want = S5B_ENV_LIN[31] / 3.0;
+        let got = chip.output();
+        assert!((got - want).abs() < 1e-6, "want={want:.6}, got={got:.6}",);
+    }
+
+    #[test]
+    fn s5b_mixer_constant_signal_when_both_disabled() {
+        // §Sound: when both tone and noise are disabled on a
+        // channel, the channel emits constant DC at its volume.
+        let mut chip = Sunsoft5b::new();
+        // R7 = 0b00_111_111 — every disable bit set for channel A
+        // (bit 0 tone-dis + bit 3 noise-dis).
+        s5b_write_reg(&mut chip, 7, 0b0011_1111);
+        s5b_write_reg(&mut chip, 8, 0x0F); // channel A volume = 15
+                                           // Channels B and C: tone disabled AND noise disabled both
+                                           // (constant signal), volume = 0 so they contribute zero.
+        s5b_write_reg(&mut chip, 9, 0x00);
+        s5b_write_reg(&mut chip, 0x0A, 0x00);
+        // Regardless of how we tick the chip, channel A's signal is
+        // constant at `LIN_AY_VOL[15]` / 3 (the divide-by-3 happens
+        // in `output()`).
+        let want = LIN_AY_VOL[15] / 3.0;
+        let got = chip.output();
+        assert!((got - want).abs() < 1e-6);
+        chip.tick(10_000);
+        let got2 = chip.output();
+        assert!((got2 - want).abs() < 1e-6);
+    }
+
+    #[test]
+    fn s5b_mixer_noise_only_uses_lfsr_bit() {
+        // §Sound: tone-disable=1, noise-disable=0 → channel signal
+        // is the noise bit. Force the LFSR to a known value and
+        // confirm the channel emits the volume when the LFSR's bit
+        // 0 is high.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 7, 0b0000_0001); // chA tone-dis, noise-en
+        s5b_write_reg(&mut chip, 8, 0x0F);
+        s5b_write_reg(&mut chip, 9, 0x00);
+        s5b_write_reg(&mut chip, 0x0A, 0x00);
+        // LFSR forced with bit 0 = 1
+        chip.noise.lfsr = 0x0000_0001;
+        let want = LIN_AY_VOL[15] / 3.0;
+        let got = chip.output();
+        assert!((got - want).abs() < 1e-6);
+        // Bit 0 = 0 → silent.
+        chip.noise.lfsr = 0x0001_0000;
+        let got = chip.output();
+        assert_eq!(got, 0.0);
     }
 
     #[test]

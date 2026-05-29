@@ -4,8 +4,7 @@ Pure-Rust NSF (Nintendo Sound Format) player for the
 [oxideav](https://github.com/OxideAV) framework. Clean-room from the
 public [nesdev.org wiki](https://www.nesdev.org/wiki/NSF) (mirrored
 under `docs/audio/nsf/`) plus Kevin Horton's original NSF v1.61 spec
-— no NES emulator source (FCEUX / Nestopia / Mesen / nestopia-rs /
-nes-rust / NSFPlay / etc.) was consulted, paraphrased, or
+— no external emulator source was consulted, paraphrased, or
 cross-checked.
 
 Plays NSF v1, NSFe, and NSF v2 — including the NSF2 IRQ timer
@@ -47,7 +46,22 @@ accumulators — one channel update every 15 CPU cycles per
 the full 18-bit-freq / 24-bit-phase walk with modulo-`wave_len<<16`
 wrap, sample-and-hold DAC output, top-down active-channel selection
 from the `$7F` `CCC` field, and the `$F800` no-wrap-at-`$7F`
-address-port behaviour.
+address-port behaviour. Round 12 adds: the Sunsoft 5B noise and
+envelope generators — a 17-bit LFSR with taps at bits 16 and 13
+clocked off the 5-bit `$06` period (one new random bit every 32 CPU
+clocks per `docs/audio/nsf/sunsoft-5b-audio-wiki.html` §Noise), and
+the full 16-bit-period / 32-step envelope with all ten §Shape rows
+(four one-shot decay/attack patterns, falling + rising continued
+sawtooths, falling + rising continued triangles, and four
+attack-then-hold variants with optional end-of-attack flips). Tone
+channels now flip on the documented `counter >= period` boundary so
+period-shortening immediately re-triggers; period 0 behaves as 1 for
+tone, noise and envelope per the §Sound period-zero footnote. The
+`$07` mixer now honours both tone-disable and noise-disable bits per
+channel — emitting tone, noise, tone-AND-noise, or constant-DC as
+documented in §Sound — and bit 4 of `$08`..=`$0A` routes the envelope
+DAC in place of the 4-bit volume per §Output's 0.75 dB-per-step
+envelope-vs-volume mapping.
 
 ## Round 2 scope
 
