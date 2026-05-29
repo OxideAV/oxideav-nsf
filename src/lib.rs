@@ -16,6 +16,7 @@ pub mod cpu;
 pub mod expansion;
 pub mod header;
 pub mod nsfe;
+pub mod opll;
 pub mod player;
 
 #[cfg(feature = "registry")]

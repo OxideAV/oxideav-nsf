@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VRC7 OPLL operator pipeline** (round 14): the round-2 sinusoidal
+  stand-in is replaced with a real OPLL (YM2413) operator chain wired
+  off the newly-staged operator-internals tables in
+  `docs/audio/nsf/opll-ym2413/`. A new `opll` module implements the
+  log-sin and exp ROMs algorithmically per andete's
+  `ym2413-logsin-exp-tables-andete-2015-04-09.txt` (`logsinTable[i] =
+  round(-log2(sin((i+0.5)*π/2/256))*256)` 12-bit, `expTable[i] =
+  round(exp2(i/256)*1024) - 1024` 10-bit) plus the `lookup_sin` /
+  `lookup_exp` algorithm with 1024-step phase periods and
+  sign-magnitude representation. The §3 MUL multiplier table
+  (`½..15`, with the documented duplicate 10/12/15 entries) and
+  the §5 FB feedback π-multiple table are transcribed verbatim from
+  `opll-ym2413-tables.md`. An `Operator` carries a 19-bit phase
+  accumulator (so `(fnum << block) * MUL` divides down cleanly), a
+  7-bit envelope (0..=127, +0.375 dB per step matching andete §
+  "envelope levels"), and the DC/DM half-rectified-sine waveform
+  bit; an `OpllChannel` pairs modulator + carrier with the
+  modulator self-feedback path (averaging the two prior outputs,
+  shifted right by `9 - fb`). The envelope generator runs the
+  documented Idle → Attack → Decay → Sustain → Release state
+  machine with key-on edge resetting phase, EG-TYP percussive vs.
+  sustained semantics, and rate-0 halt. `Vrc7::tick` accumulates
+  CPU cycles in Q8 fixed-point and emits one operator sample every
+  `35.9956` CPU cycles (1.789773 MHz / 49.7163 kHz). `Vrc7::output`
+  reads the latched sum of the 6 channels and normalises to the
+  host mixer's ±1.0 range. The register-level state (`Vrc7Chan`)
+  is unchanged so the round-13 patch-decode tests still pass;
+  key-on / key-off / patch-select / volume-change writes now drive
+  the OPLL channels through edge-detected transitions inside
+  `refresh_from_regs`. +21 unit tests: log-sin table first / last
+  entry against andete's formula, 12-bit fit, exp table first / last
+  entry and 10-bit fit, the §6 row-256 peak-amplitude
+  ground-truth `[255, 180, 127, 90, 63, 45, 31, 22, 15, 11, 7, 5,
+  3, 2, 1, 1]` match (within ±1 LSB across all 16 volumes), MUL
+  table exact match, FB shift table exact match, log-sin
+  quadrant-mirror symmetry, pure-sine peak at phase 256, sine
+  zero-crossings at phase 0 / 512, phase-index wrap modulo 1024,
+  envelope key-on → attack transition, key-off → release
+  transition, rate-0 halt, percussive-mode through-sustain
+  release, channel patch loading from the Trumpet ROM bytes,
+  key-on phase reset, key-off transition to release on both
+  operators, and end-to-end channel sample stream producing
+  non-trivial audio after a Flute-patch key-on. The KSL
+  attenuation table (§4, requires the OPL-family base table that
+  the staging deliberately does not lift from emulator source) and
+  the per-rate envelope-increment numeric arrays (§7, same
+  provenance reason) remain documented followups; rhythm-mode
+  drum operator allocation is also out of scope for this round.
+
 - **VRC7 patch table + per-channel patch selection** (round 13): the
   15-instrument hardwired §"Internal patch set" ROM dumped in
   `docs/audio/nsf/vrc7-audio-wiki.html` is now exposed as the

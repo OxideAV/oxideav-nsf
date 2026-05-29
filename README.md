@@ -70,11 +70,29 @@ output level, KSL per operator, both operator waveforms, feedback,
 attack / decay / sustain-level / release per operator), and each
 channel's `$3X` high nibble + `$2X` sustain bit are now decoded so
 `Vrc7::active_patch(ch)` returns the patch the channel is asking for.
-The audible signal path still uses the sinusoidal stand-in, so VRC7
-output is not yet bit-exact OPLL — but the patch-selection plumbing
-is in place and tested against the wiki's dumped table, which
-unblocks a future OPLL operator implementation (#861) without
-another API break.
+Round 14 lands the real OPLL operator pipeline against the newly
+staged operator-internals tables in `docs/audio/nsf/opll-ym2413/`:
+a per-channel modulator + carrier pair driven by a 19-bit phase
+accumulator + 10-bit-period sine table, the log-sin / exp ROMs from
+andete's `ym2413-logsin-exp-tables-andete-2015-04-09.txt`, the §3
+MUL multiplier table, the §5 FB feedback π-multiple table, half-
+rectified sine waveform support per the DC/DM bit, modulator self-
+feedback with the documented 2-sample averaging shift, and a 7-bit
+envelope generator implementing the Idle → Attack → Decay →
+Sustain → Release state machine with EG-TYP percussive-vs-sustained
+behaviour. `Vrc7::tick` now runs the operator pipeline at the
+OPLL's 49.7163 kHz sample clock (CPU cycles accumulated in Q8 and
+emitted every ~36 CPU cycles) and `Vrc7::output` reads the latched
+6-channel sum normalised to the host mixer's float range; the
+sinusoidal stand-in is gone. The §6 row-256 peak-amplitude
+ground-truth `[255, 180, 127, 90, 63, 45, 31, 22, 15, 11, 7, 5, 3,
+2, 1, 1]` is matched within ±1 LSB across all 16 volumes via the
+log-sin → exp pipeline. The KSL attenuation table (§4) and the
+per-rate envelope-increment numeric arrays (§7) remain documented
+DOCS-GAP followups — both are deliberately not lifted from
+emulator source per the staging's §"Provenance & non-emulator
+sourcing" appendix, and need the OPLx-decapsulated independent-RE
+article transcribed before they can land verbatim.
 
 ## Round 2 scope
 
@@ -178,9 +196,17 @@ another API break.
     `CCC` field selects channels `9-N..=8` top-down, and the `$F800`
     address pointer stops at `$7F` rather than wrapping.
   * **VRC7** — 6 FM channels driven from `$9010` / `$9030` register
-    indirection. Round 2 ships a coarse 2-operator approximation in
-    place of the full OPLL operator chain — sufficient to mix at the
-    right balance, not bit-exact.
+    indirection. Round 14 wires the OPLL operator pipeline from the
+    `docs/audio/nsf/opll-ym2413/` staging: per-channel modulator +
+    carrier with 19-bit phase generator, the andete log-sin / exp
+    tables (12 / 10 bits), the §3 MUL multiplier table, the §5 FB
+    feedback π-multiple table, DC/DM half-rectified sine waveforms,
+    modulator self-feedback with two-sample averaging, and the
+    Idle → Attack → Decay → Sustain → Release envelope state
+    machine honouring EG-TYP percussive-vs-sustained semantics.
+    `Vrc7::tick` runs the OPLL at its 49.7163 kHz sample clock; the
+    §6 row-256 peak-amplitude ground truth is matched within ±1
+    LSB across all 16 volumes.
   * **FDS** — wavetable + frequency modulator (`$4040..=$4089`).
     Round 7 wires the modulation unit per
     `docs/audio/nsf/fds-audio-wiki.html`: the mod accumulator adds the
@@ -327,13 +353,22 @@ another API break.
   batches, not per individual cycle, so sub-tick write-resets land on a
   batch boundary rather than the exact write cycle — adequate for music,
   not cycle-exact.
-* VRC7: replace the 2-operator approximation with a real OPLL operator
-  chain (logarithmic sin / exp tables, 4-bit feedback, full envelope
-  generator). Blocked on OPLL logsin/exp/EG-rate table sizes which
-  are not in the in-tree `docs/audio/nsf/vrc7-audio-wiki.html` —
-  needs an OPLL operator-internals reference added to docs. (Round 4
-  added a typed `NsfeVrc7` patch-table container so the parser is
-  ready when the OPLL ops doc lands.)
+* VRC7 OPLL operator chain (logsin / exp / phase / feedback /
+  envelope) — LANDED round 14 against the new staged tables in
+  `docs/audio/nsf/opll-ym2413/`. Remaining numeric DOCS-GAPs (both
+  flagged by the staging as deliberately not lifted from emulator
+  source): the §4 KSL attenuation table (needs the
+  OPLx-decapsulated independent-RE base table transcribed before
+  KSL contributes attenuation; currently 0 dB) and the §7 per-rate
+  envelope-increment numeric arrays (currently a `2^(rate-1)`
+  Q16-units-per-sample monotonic ladder honouring rate=0 halt +
+  rate=15 fastest semantics but NOT bit-exact against the
+  OPLx-decapsulated per-rate table). Rhythm-mode operator
+  allocation (`$0E` bit 5, drum channels at `$36`/`$37`/`$38`) is
+  also out of scope for round 14 — VRC7 has no rhythm DAC so the
+  drum patches in the ROM are inaudible there, but a future YM2413
+  consumer (an MSX-format crate, say) would need rhythm-mode
+  decoded.
 * N163: round 11 added the per-channel timer accumulators. Remaining
   gap is matching the documented `f = (n * p) / (15 * 65536 * l * c)`
   output frequency in a calibration test against a known fixture (the

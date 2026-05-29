@@ -1092,28 +1092,52 @@ impl Vrc7Patch {
 /// VRC7 is a stripped Yamaha YM2413 (OPLL): 6 FM channels, no rhythm.
 ///
 /// Round 2 shipped a coarse approximation: channel volumes and
-/// fundamental frequencies are honoured; the FM operator math uses a
-/// 2-operator sinusoidal stand-in instead of OPLL's logarithmic LUTs.
+/// fundamental frequencies were honoured but the FM operator math used
+/// a 2-operator sinusoidal stand-in instead of OPLL's logarithmic
+/// LUTs.
 ///
-/// Round 13 adds patch decoding — the hardwired §"Internal patch set"
+/// Round 13 added patch decoding — the hardwired §"Internal patch set"
 /// ROM (15 named instruments + slot 0 user-programmable) is exposed
 /// as [`VRC7_INSTRUMENT_ROM`], the user-programmable patch at
 /// `regs[0x00..=0x07]` and each ROM slot decode to a [`Vrc7Patch`]
 /// struct, and each channel's `$3X` high nibble selects the active
-/// patch. The audible signal path still uses the sinusoidal
-/// stand-in, but [`Vrc7Chan::patch_index`] / [`Vrc7::patch`] /
-/// [`Vrc7::active_patch`] make the patch table testable and unblock
-/// a real OPLL operator implementation (#861) without a further API
-/// break.
+/// patch.
 ///
-/// Real bit-exact OPLL is still deferred; what we ship plays
-/// VRC7-flagged NSFs at the correct pitch and per-channel volume,
-/// with the correct patch-selection plumbing.
+/// Round 14 (this round) wires the actual OPLL operator pipeline from
+/// `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` + the andete
+/// log-sin/exp tables in
+/// `docs/audio/nsf/opll-ym2413/ym2413-logsin-exp-tables-andete-2015-04-09.txt`:
+/// the per-channel phase generator, modulator/carrier pair, modulator
+/// self-feedback, and the envelope generator with key-on/off + sustain
+/// transitions all run through [`crate::opll::OpllChannel`]. The
+/// sinusoidal stand-in is gone — `output()` reads from the OPLL
+/// channels directly. The KSL attenuation table and the per-rate
+/// envelope-increment numeric arrays are left as documented
+/// followups (see crate README §Round 14+ followups for the docs
+/// gap).
 pub struct Vrc7 {
     pub enabled: bool,
     pub addr: u8,
     pub regs: [u8; 0x40],
+    /// Per-channel register-level state (the patch index, volume,
+    /// key-on bit, block / fnum) decoded from the most recent
+    /// register write.
     pub channels: [Vrc7Chan; 6],
+    /// OPLL synthesis engines, one per channel. Driven from the
+    /// register-level state in [`Vrc7::channels`] and the staged
+    /// patch table.
+    pub opll_channels: [crate::opll::OpllChannel; 6],
+    /// Accumulated CPU cycles not yet converted into operator
+    /// samples. The OPLL operator clock is the master 3.579545 MHz
+    /// crystal / 72 = 49.7163 kHz; the NES CPU runs at 1.789773 MHz
+    /// so the operator-tick interval is `1.789773e6 / 49716.3 ≈
+    /// 36.0` CPU cycles per operator sample. We accumulate fractional
+    /// cycles in Q8 fixed-point: `cycles_q8 += cpu_cycles << 8`, then
+    /// emit one operator sample every `OP_CYCLES_Q8` units.
+    pub op_cycles_q8: u32,
+    /// Last operator sample, latched for the host mixer to read via
+    /// [`Vrc7::output`] until the next operator tick.
+    pub latched_output: i32,
 }
 
 impl Default for Vrc7 {
@@ -1123,6 +1147,9 @@ impl Default for Vrc7 {
             addr: 0,
             regs: [0u8; 0x40],
             channels: [Vrc7Chan::default(); 6],
+            opll_channels: [crate::opll::OpllChannel::default(); 6],
+            op_cycles_q8: 0,
+            latched_output: 0,
         }
     }
 }
@@ -1163,17 +1190,49 @@ impl Vrc7 {
 
     fn refresh_from_regs(&mut self) {
         for ch in 0..6 {
-            self.channels[ch].fnum =
+            let new_fnum =
                 (self.regs[0x10 + ch] as u16) | (((self.regs[0x20 + ch] & 0x01) as u16) << 8);
-            self.channels[ch].block = (self.regs[0x20 + ch] >> 1) & 0x07;
+            let new_block = (self.regs[0x20 + ch] >> 1) & 0x07;
             // $2X bitfield --STOOOH: bit 4 = trigger / key-on,
             // bit 5 = sustain override (§Channels).
-            self.channels[ch].key_on = self.regs[0x20 + ch] & 0x10 != 0;
-            self.channels[ch].sustain = self.regs[0x20 + ch] & 0x20 != 0;
+            let new_key_on = self.regs[0x20 + ch] & 0x10 != 0;
+            let new_sustain = self.regs[0x20 + ch] & 0x20 != 0;
             // $3X bitfield IIIIVVVV: high nibble = instrument index,
             // low nibble = inverted volume.
-            self.channels[ch].patch_index = (self.regs[0x30 + ch] >> 4) & 0x0F;
-            self.channels[ch].volume = self.regs[0x30 + ch] & 0x0F;
+            let new_patch_index = (self.regs[0x30 + ch] >> 4) & 0x0F;
+            let new_volume = self.regs[0x30 + ch] & 0x0F;
+
+            let was_key_on = self.channels[ch].key_on;
+            let patch_changed = self.channels[ch].patch_index != new_patch_index;
+            let volume_changed = self.channels[ch].volume != new_volume;
+
+            self.channels[ch].fnum = new_fnum;
+            self.channels[ch].block = new_block;
+            self.channels[ch].key_on = new_key_on;
+            self.channels[ch].sustain = new_sustain;
+            self.channels[ch].patch_index = new_patch_index;
+            self.channels[ch].volume = new_volume;
+
+            // Mirror register-level state into the OPLL synthesis
+            // engines. The patch + volume are reloaded whenever
+            // either changes; the fnum + block are mirrored every
+            // tick so a sweep mid-note is honoured.
+            self.opll_channels[ch].fnum = new_fnum;
+            self.opll_channels[ch].block = new_block;
+            if patch_changed || volume_changed {
+                let p = self.patch(new_patch_index);
+                self.opll_channels[ch].load_patch(&p, new_volume);
+            }
+
+            // Key-on / key-off edge detection. The OPLL channel's
+            // own `key_on` flag tracks whether we've already issued
+            // the edge, so repeat writes of the same state don't
+            // re-trigger.
+            match (was_key_on, new_key_on) {
+                (false, true) => self.opll_channels[ch].trigger_key_on(),
+                (true, false) => self.opll_channels[ch].trigger_key_off(),
+                _ => {}
+            }
         }
     }
 
@@ -1200,35 +1259,36 @@ impl Vrc7 {
     }
 
     pub fn tick(&mut self, cycles: u32) {
-        // The OPLL master clock divides by 72 to reach the 49.7 kHz
-        // operator clock. We approximate by stepping each channel's
-        // phase accumulator linearly here.
-        let dt = cycles as f32 / 1_789_773.0; // seconds
-        for ch in &mut self.channels {
-            if !ch.key_on || ch.fnum == 0 {
-                continue;
+        // NES master CPU clock: 1.789773 MHz. OPLL operator clock:
+        // 3.579545 MHz / 72 ≈ 49.7163 kHz, so the operator-sample
+        // interval is `1_789_773 / 49_716.3 ≈ 35.9956` CPU cycles
+        // per operator sample. We track that in Q8 fixed-point.
+        const OP_CYCLES_Q8: u32 =
+            (1_789_773.0_f64 / crate::opll::OPLL_SAMPLE_RATE_HZ as f64 * 256.0) as u32;
+        self.op_cycles_q8 = self.op_cycles_q8.saturating_add(cycles << 8);
+        while self.op_cycles_q8 >= OP_CYCLES_Q8 {
+            self.op_cycles_q8 -= OP_CYCLES_Q8;
+            // Emit one operator sample: sum the 6 carrier outputs.
+            let mut sum: i32 = 0;
+            for ch in &mut self.opll_channels {
+                if ch.is_active() {
+                    sum = sum.saturating_add(ch.sample());
+                }
             }
-            // f = fnum * (2 ^ block) * 49716 / 2^19 (per OPLL datasheet).
-            let f = ch.fnum as f32 * (1u32 << ch.block) as f32 * 49716.0 / 524288.0;
-            ch.phase = (ch.phase + f * dt).fract();
+            self.latched_output = sum;
         }
     }
 
     pub fn output(&self) -> f32 {
-        let mut sum = 0.0f32;
-        let mut active = 0u32;
-        for ch in &self.channels {
-            if !ch.key_on || ch.volume >= 0x0F {
-                continue;
-            }
-            let amp = (1.0 - ch.volume as f32 / 15.0) * 0.25;
-            sum += (ch.phase * std::f32::consts::TAU).sin() * amp;
-            active += 1;
-        }
-        if active == 0 {
-            return 0.0;
-        }
-        sum / active as f32
+        // Per `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §6
+        // the operator output is a signed 9-bit linear amplitude
+        // (peak ±255 at volume=0; row-256). Summed across 6 channels
+        // the worst-case peak is ±1530. Normalise to the host
+        // mixer's roughly ±1.0 range, with a modest headroom margin
+        // so a many-voice patch doesn't clip the float bus before
+        // the APU mixer's own headroom kicks in.
+        const NORMALIZATION: f32 = 1.0 / 2048.0; // 6 channels × 255 + headroom
+        self.latched_output as f32 * NORMALIZATION
     }
 }
 
