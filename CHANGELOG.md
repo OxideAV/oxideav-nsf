@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.1...v0.0.2) - 2026-05-29
+
+### Other
+
+- real OPLL operator pipeline (round 14)
+- patch table + per-channel patch selection (round 13)
+- Sunsoft 5B: noise + envelope generators (round 12)
+- per-channel timer accumulators (round 11)
+- $4090..=$4097 read-register window (round 10)
+- $4023.D1 master sound-enable / waveform-halt (round 9)
+- $4083 bit 7 also halts the mod-table accumulator (round 8)
+- volume + mod envelope ramp generators (round 8)
+- wire the frequency-modulation unit into the wave pitch
+- region-aware noise period table (NTSC + PAL)
+- Round 5: Dendy region + NSFe mixe gain overrides + plst/psfx player API
+- Round 4: NSFe extended chunks + APU IRQ wiring
+- Round 3: NSF 2.x support — feature byte, IRQ timer, vector overlay, two-phase INIT
+- drop committed Cargo.lock + relax oxideav-core to "0.1"
+- nsf bus: add unit tests for flat load + bankswitching + RAM mirroring
+- Round 2: full unofficial 6502 opcodes, DMC DMA, expansion chips, real-rip cross-check
+
 ### Added
 
 - **VRC7 OPLL operator pipeline** (round 14): the round-2 sinusoidal
