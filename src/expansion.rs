@@ -1138,6 +1138,22 @@ pub struct Vrc7 {
     /// Last operator sample, latched for the host mixer to read via
     /// [`Vrc7::output`] until the next operator tick.
     pub latched_output: i32,
+    /// Decoded `$0F` test-register state. Per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F":
+    /// the low 4 bits override envelope output (bit 0), hold the LFO
+    /// at zero (bit 1), hold the waveform phase at zero (bit 2), and
+    /// run the LFOs much faster (bit 3). Each operator's per-sample
+    /// path consults this struct via
+    /// [`crate::opll::OpllChannel::sample_with_test`].
+    pub test_register: crate::opll::TestRegister,
+    /// Audio Reset (`$E000` bit 6) state per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Audio Reset ($E000)":
+    /// "Setting this bit will silence the expansion audio and clear
+    /// its registers (including tremolo LFO state, but not including
+    /// vibrato LFO state). Writes to $9010 and $9030 are disregarded
+    /// while this bit is set." Default false (BIOS starts the chip
+    /// in the unreset state).
+    pub audio_reset_held: bool,
 }
 
 impl Default for Vrc7 {
@@ -1150,6 +1166,8 @@ impl Default for Vrc7 {
             opll_channels: [crate::opll::OpllChannel::default(); 6],
             op_cycles_q8: 0,
             latched_output: 0,
+            test_register: crate::opll::TestRegister::default(),
+            audio_reset_held: false,
         }
     }
 }
@@ -1178,10 +1196,45 @@ impl Vrc7 {
 
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
-            0x9010 => self.addr = value & 0x3F,
-            0x9030 => {
+            // §"Audio Reset ($E000)": bit 6 (R) is the expansion-audio
+            // reset; the rest of the byte is mapper mirroring/WRAM
+            // control and is not our concern here.
+            0xE000 => {
+                let now = value & 0x40 != 0;
+                let was = self.audio_reset_held;
+                self.audio_reset_held = now;
+                if now && !was {
+                    // Entering reset: "silence the expansion audio
+                    // and clear its registers (including tremolo LFO
+                    // state, but not including vibrato LFO state)."
+                    // We don't model the LFOs yet (§7 DOCS-GAP), so
+                    // the LFO-state qualifier is a no-op today; the
+                    // register clear + silence are observable.
+                    self.regs = [0u8; 0x40];
+                    self.channels = [Vrc7Chan::default(); 6];
+                    self.opll_channels = [crate::opll::OpllChannel::default(); 6];
+                    self.latched_output = 0;
+                    self.op_cycles_q8 = 0;
+                    self.test_register = crate::opll::TestRegister::default();
+                    // §"Test Register $0F" bit 1 reset semantics
+                    // (LFO held + reset) overlap with the audio
+                    // reset's LFO clear; both leave the LFO at
+                    // zero, which is its uninitialised state here.
+                }
+            }
+            // §"Audio Reset ($E000)": "Writes to $9010 and $9030 are
+            // disregarded while this bit is set."
+            0x9010 if !self.audio_reset_held => self.addr = value & 0x3F,
+            0x9030 if !self.audio_reset_held => {
                 let a = self.addr as usize;
                 self.regs[a] = value;
+                if a == 0x0F {
+                    // §"Test Register $0F" — record the decoded
+                    // bitfield in addition to the raw byte. Done
+                    // here (not in refresh_from_regs) because the
+                    // test register is chip-wide, not per-channel.
+                    self.test_register = crate::opll::TestRegister::from_byte(value);
+                }
                 self.refresh_from_regs();
             }
             _ => {}
@@ -1203,8 +1256,10 @@ impl Vrc7 {
             let new_volume = self.regs[0x30 + ch] & 0x0F;
 
             let was_key_on = self.channels[ch].key_on;
+            let was_sustain = self.channels[ch].sustain;
             let patch_changed = self.channels[ch].patch_index != new_patch_index;
             let volume_changed = self.channels[ch].volume != new_volume;
+            let sustain_changed = was_sustain != new_sustain;
 
             self.channels[ch].fnum = new_fnum;
             self.channels[ch].block = new_block;
@@ -1222,6 +1277,17 @@ impl Vrc7 {
             if patch_changed || volume_changed {
                 let p = self.patch(new_patch_index);
                 self.opll_channels[ch].load_patch(&p, new_volume);
+                // Re-apply the channel-level sustain override; the
+                // patch load reset the release rate to the patch's
+                // own value.
+                if new_sustain {
+                    self.opll_channels[ch].set_channel_sustain_override(true, &p);
+                }
+            } else if sustain_changed {
+                // Sustain bit flipped without a patch swap — just
+                // update the release-rate override.
+                let p = self.patch(new_patch_index);
+                self.opll_channels[ch].set_channel_sustain_override(new_sustain, &p);
             }
 
             // Key-on / key-off edge detection. The OPLL channel's
@@ -1259,6 +1325,13 @@ impl Vrc7 {
     }
 
     pub fn tick(&mut self, cycles: u32) {
+        // §"Audio Reset ($E000)": "Setting this bit will silence the
+        // expansion audio…" — while held, the operator pipeline is
+        // pinned at zero and no samples are emitted.
+        if self.audio_reset_held {
+            self.latched_output = 0;
+            return;
+        }
         // NES master CPU clock: 1.789773 MHz. OPLL operator clock:
         // 3.579545 MHz / 72 ≈ 49.7163 kHz, so the operator-sample
         // interval is `1_789_773 / 49_716.3 ≈ 35.9956` CPU cycles
@@ -1269,10 +1342,18 @@ impl Vrc7 {
         while self.op_cycles_q8 >= OP_CYCLES_Q8 {
             self.op_cycles_q8 -= OP_CYCLES_Q8;
             // Emit one operator sample: sum the 6 carrier outputs.
+            // The chip-wide `$0F` test register is consulted per
+            // channel so bits 0/2 (envelope-bypass / phase-hold)
+            // override the synthesis path uniformly.
+            let test = self.test_register;
             let mut sum: i32 = 0;
             for ch in &mut self.opll_channels {
-                if ch.is_active() {
-                    sum = sum.saturating_add(ch.sample());
+                if ch.is_active() || test.envs_zero {
+                    // bit 0 forces full volume even when a channel's
+                    // envelope sits at Idle (because the carrier
+                    // would normally be silenced and we'd skip
+                    // sampling it). Always sample when bit 0 is set.
+                    sum = sum.saturating_add(ch.sample_with_test(&test));
                 }
             }
             self.latched_output = sum;
@@ -3318,5 +3399,179 @@ mod tests {
         let p = chip.patch(20);
         let expected = Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[4]);
         assert_eq!(p, expected);
+    }
+
+    // ----------------------------------------------- $0F test register
+
+    /// Writing a byte to `$0F` via the indirect port should land in
+    /// `regs[0x0F]` AND update the decoded `test_register` struct per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F".
+    #[test]
+    fn vrc7_register_0f_updates_test_register_state() {
+        let mut chip = Vrc7::new();
+        vrc7_write_reg(&mut chip, 0x0F, 0b1111);
+        assert_eq!(chip.regs[0x0F], 0b1111);
+        assert!(chip.test_register.envs_zero);
+        assert!(chip.test_register.hold_lfo);
+        assert!(chip.test_register.hold_phase);
+        assert!(chip.test_register.fast_lfo);
+        // Clear it again.
+        vrc7_write_reg(&mut chip, 0x0F, 0);
+        assert_eq!(chip.test_register, crate::opll::TestRegister::default());
+    }
+
+    /// §"Test Register $0F" bit 2: with the waveform phase held at 0,
+    /// even a keyed-on channel should fall silent. The chip's
+    /// `latched_output` should sit near 0 across a long tick window.
+    #[test]
+    fn vrc7_test_register_bit2_silences_chip() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Flute (patch 4) — fast attack so we hit audible amplitude
+        // quickly. Channel 0, volume 0 (loudest), fnum = 0x100 so the
+        // phase generator actually advances.
+        vrc7_write_reg(&mut chip, 0x30, 0x40);
+        vrc7_write_reg(&mut chip, 0x10, 0x00); // fnum low = 0x00
+        vrc7_write_reg(&mut chip, 0x20, 0x19); // key-on, block 4, fnum-high bit = 1 → fnum = 0x100
+                                               // Accumulate a baseline peak across many ticks so we don't
+                                               // catch a zero-crossing latched value.
+        let mut baseline_peak: i32 = 0;
+        for _ in 0..500 {
+            chip.tick(50);
+            baseline_peak = baseline_peak.max(chip.latched_output.abs());
+        }
+        assert!(
+            baseline_peak > 5,
+            "fixture didn't produce audible signal before the test ran, baseline_peak={}",
+            baseline_peak
+        );
+        // Now hold the phase at 0 — the chip should go silent.
+        vrc7_write_reg(&mut chip, 0x0F, 0b0100);
+        // First flush any samples emitted before the phase-hold took
+        // effect; then sample.
+        chip.tick(2_000);
+        let mut peak: i32 = 0;
+        for _ in 0..500 {
+            chip.tick(50);
+            peak = peak.max(chip.latched_output.abs());
+        }
+        assert!(peak <= 5, "phase-hold must silence chip, got {}", peak);
+    }
+
+    // ----------------------------------------------- $2X.S channel sustain
+
+    /// §Channels: the `$2X.S` override should change the operator's
+    /// `release_rate` even when the patch was loaded with a different
+    /// value.
+    #[test]
+    fn vrc7_channel_sustain_bit_overrides_release_rate_to_five() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Trumpet (patch 7): car_release = 0x07 per the ROM.
+        vrc7_write_reg(&mut chip, 0x30, 0x70);
+        vrc7_write_reg(&mut chip, 0x20, 0x10); // key-on, no sustain
+        let car_rr = chip.opll_channels[0].carrier.env.release_rate;
+        assert_eq!(car_rr, 0x07);
+        // Set sustain bit ($2X.S = 1).
+        vrc7_write_reg(&mut chip, 0x20, 0x30);
+        assert_eq!(chip.opll_channels[0].carrier.env.release_rate, 0x05);
+        assert_eq!(chip.opll_channels[0].modulator.env.release_rate, 0x05);
+        // Clear it again — should revert to the patch value.
+        vrc7_write_reg(&mut chip, 0x20, 0x10);
+        assert_eq!(chip.opll_channels[0].carrier.env.release_rate, 0x07);
+    }
+
+    // ----------------------------------------------- $00.S release disable
+
+    /// §"Custom Patch": the modulator's `$00.S` should set
+    /// `release_disabled` on the OPLL modulator envelope; the carrier
+    /// never has it.
+    #[test]
+    fn vrc7_modulator_sustain_bit_disables_modulator_release() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Slot 0 user patch: $00 = 0x20 (S=1), $01 = 0x00 (S=0).
+        vrc7_write_reg(&mut chip, 0x00, 0x20);
+        vrc7_write_reg(&mut chip, 0x01, 0x00);
+        // Activate the patch on channel 0 (any non-zero volume triggers
+        // the patch reload through volume_changed). Patch index = 0.
+        vrc7_write_reg(&mut chip, 0x30, 0x01);
+        assert!(chip.opll_channels[0].modulator.env.release_disabled);
+        assert!(!chip.opll_channels[0].carrier.env.release_disabled);
+    }
+
+    // ----------------------------------------------- $E000 audio reset
+
+    /// §"Audio Reset ($E000)": bit 6 silences the chip and clears its
+    /// registers. Writes to `$9010` / `$9030` are disregarded while
+    /// it's held.
+    #[test]
+    fn vrc7_audio_reset_clears_registers_and_blocks_writes() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Pre-populate some registers.
+        vrc7_write_reg(&mut chip, 0x30, 0x70);
+        vrc7_write_reg(&mut chip, 0x20, 0x10);
+        assert_eq!(chip.regs[0x30], 0x70);
+        // Now assert audio reset (bit 6 = 0x40).
+        chip.write(0xE000, 0x40);
+        assert!(chip.audio_reset_held);
+        // Registers should be cleared.
+        assert_eq!(chip.regs[0x30], 0);
+        assert_eq!(chip.regs[0x20], 0);
+        // Channel state should be reset.
+        assert_eq!(chip.channels[0].patch_index, 0);
+        assert_eq!(chip.channels[0].volume, 0);
+        assert!(!chip.channels[0].key_on);
+        // Writes through the indirect ports should be ignored.
+        chip.write(0x9010, 0x30);
+        chip.write(0x9030, 0xFF);
+        assert_eq!(
+            chip.regs[0x30], 0,
+            "$9030 write must be ignored when reset is held"
+        );
+        // Clear the reset and confirm writes are honoured again.
+        chip.write(0xE000, 0x00);
+        assert!(!chip.audio_reset_held);
+        vrc7_write_reg(&mut chip, 0x30, 0x42);
+        assert_eq!(chip.regs[0x30], 0x42);
+    }
+
+    /// §"Audio Reset ($E000)": ticking the chip while held outputs
+    /// silence (`latched_output == 0`).
+    #[test]
+    fn vrc7_audio_reset_silences_chip_during_tick() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Get the chip producing audio first.
+        vrc7_write_reg(&mut chip, 0x30, 0x70);
+        vrc7_write_reg(&mut chip, 0x10, 0x00);
+        vrc7_write_reg(&mut chip, 0x20, 0x18);
+        chip.tick(50_000);
+        // Hold reset.
+        chip.write(0xE000, 0x40);
+        chip.tick(1_000);
+        assert_eq!(chip.latched_output, 0);
+        // Multiple ticks: still zero.
+        for _ in 0..100 {
+            chip.tick(50);
+            assert_eq!(chip.latched_output, 0);
+        }
+    }
+
+    /// §"Audio Reset ($E000)": only bit 6 matters for audio. Other
+    /// bits (mirroring/WRAM) should not affect audio state.
+    #[test]
+    fn vrc7_audio_reset_only_reads_bit_six() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Write a value with bit 6 clear but other bits set (e.g.
+        // mirroring control). The audio-reset flag should remain
+        // false.
+        chip.write(0xE000, 0x03); // bit 0-1 = mirroring control bits
+        assert!(!chip.audio_reset_held);
+        // Bit 6 set = reset on, regardless of other bits.
+        chip.write(0xE000, 0x47); // bit 6 + mirroring bits
+        assert!(chip.audio_reset_held);
     }
 }

@@ -253,6 +253,15 @@ pub struct Envelope {
     /// EG-TYP (S bit): true = sustained tone (hold at sustain level
     /// until key-off); false = percussive tone (continue releasing).
     pub egt_sustain: bool,
+    /// `$00.S` (modulator only): per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Custom Patch", "the
+    /// modulator's sustain bit ($00 S) also disables the release
+    /// section of its envelope. If its sustain bit is set, the
+    /// Attack, Decay, and Sustain portions of the envelope are used,
+    /// but when the note is released the modulator will continue to
+    /// sustain while the carrier releases." Set on the modulator's
+    /// envelope only — the carrier ($01.S) always honours key-off.
+    pub release_disabled: bool,
 }
 
 /// Maximum envelope level (silence). Per andete §"envelope levels":
@@ -275,6 +284,18 @@ impl Envelope {
         self.release_rate = rr & 0x0F;
         self.sustain_level = sl & 0x0F;
         self.egt_sustain = egt_sustain;
+        // Note: `release_disabled` is set independently by the channel's
+        // patch loader — only the modulator operator sets it on $00.S.
+    }
+
+    /// Override the release rate. Per `vrc7-audio-wiki.html` §Channels:
+    /// "If the sustain bit is set in the channel control register $2X
+    /// S, the release value in the patch is ignored and replaced with
+    /// $5." This applies to both modulator and carrier of the channel.
+    /// The patch's own release rate is restored by the next
+    /// `load_from_patch` call.
+    pub fn set_release_rate(&mut self, rr: u8) {
+        self.release_rate = rr & 0x0F;
     }
 
     /// Key-on: start the attack phase from whatever level we're at.
@@ -285,7 +306,17 @@ impl Envelope {
     /// Key-off: enter the release phase. The starting level is whatever
     /// the envelope is at when key-off arrives — this matches the
     /// vendor manual's release-from-current-level behaviour.
+    ///
+    /// When [`Envelope::release_disabled`] is set (the modulator's
+    /// `$00.S` per `docs/audio/nsf/vrc7-audio-wiki.html` §"Custom
+    /// Patch"), key-off is suppressed entirely: the envelope holds at
+    /// whichever phase it's in. Spec quote: "the modulator's sustain
+    /// bit ($00 S) also disables the release section of its envelope."
     pub fn key_off(&mut self) {
+        if self.release_disabled {
+            // §"Custom Patch": modulator with $00.S=1 ignores key-off.
+            return;
+        }
         // Idle and Release stay where they are; everything else moves
         // into Release.
         if !matches!(self.phase, EnvPhase::Idle | EnvPhase::Release) {
@@ -435,6 +466,20 @@ impl Operator {
     /// TL step → ×2; multiplied by 8 / 0.375dB-per-env-level... see
     /// the impl below).
     pub fn sample(&self, modulation: i32, extra_atten_env_levels: u32) -> i32 {
+        self.sample_with_env_override(modulation, extra_atten_env_levels, self.env.exp_offset())
+    }
+
+    /// Like [`sample`], but the envelope's per-sample exp-offset is
+    /// substituted with `env_exp_offset` (0 forces full-volume output
+    /// regardless of envelope state — used by the §"Test Register
+    /// $0F" bit-0 override per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html`).
+    pub fn sample_with_env_override(
+        &self,
+        modulation: i32,
+        extra_atten_env_levels: u32,
+        env_exp_offset: u32,
+    ) -> i32 {
         let phase = self.phase_index(modulation);
         let mut logsin = lookup_sin(phase);
         let sign_bit = logsin & 0x8000;
@@ -454,9 +499,50 @@ impl Operator {
         // 128*volume + 16*eg_level). Here we sum the envelope
         // contribution and any extra attenuation, both expressed in
         // 16-units-per-3-dB.
-        let total_atten = self.env.exp_offset() + extra_atten_env_levels;
+        let total_atten = env_exp_offset + extra_atten_env_levels;
         let combined = (logsin & 0x8000) | ((logsin & 0x7FFF) + total_atten).min(0x7FFF);
         lookup_exp(combined)
+    }
+}
+
+// -------------------------------------------------------------- test register
+
+/// Decoded VRC7 / OPLL `$0F` test register state per
+/// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F". All
+/// fields default to inactive (the chip's behaviour at reset / when
+/// `$0F` is its normal value of `0`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TestRegister {
+    /// `$0F` bit 0 — "The envelope generators are replaced with
+    /// constant 0 output (full volume) for both modulator and
+    /// carrier. The envelopes are still running while their output
+    /// is overridden."
+    pub envs_zero: bool,
+    /// `$0F` bit 1 — "Hold LFO phase at zero. This halts, disables,
+    /// and resets both the tremolo and vibrato LFO." We do not yet
+    /// run an LFO (the §7 numeric step arrays are a documented
+    /// DOCS-GAP), so this bit is recorded but has no operator
+    /// effect today.
+    pub hold_lfo: bool,
+    /// `$0F` bit 2 — "Holds and resets waveform phase to zero. The
+    /// envelopes are not halted, though the output will be silent."
+    pub hold_phase: bool,
+    /// `$0F` bit 3 — "Update tremolo and vibrato LFOs every sample
+    /// instead of once every several samples." Same no-op-today
+    /// story as `hold_lfo`.
+    pub fast_lfo: bool,
+}
+
+impl TestRegister {
+    /// Decode the low 4 bits of register `$0F` per §"Test Register
+    /// $0F".
+    pub fn from_byte(value: u8) -> Self {
+        Self {
+            envs_zero: value & 0x01 != 0,
+            hold_lfo: value & 0x02 != 0,
+            hold_phase: value & 0x04 != 0,
+            fast_lfo: value & 0x08 != 0,
+        }
     }
 }
 
@@ -489,6 +575,14 @@ pub struct OpllChannel {
 
 impl OpllChannel {
     /// Load both operators from a patch + the per-channel volume.
+    ///
+    /// Per `docs/audio/nsf/vrc7-audio-wiki.html` §"Custom Patch":
+    /// the modulator's `$00.S` bit has a dual role — it is the
+    /// EG-TYP (sustained vs percussive sustain phase) AND it disables
+    /// the release section of the modulator's envelope entirely
+    /// (key-off becomes a no-op for the modulator). The carrier's
+    /// `$01.S` is only the EG-TYP; its envelope always honours
+    /// key-off.
     pub fn load_patch(&mut self, p: &Vrc7Patch, volume: u8) {
         // Modulator (operator #0).
         self.modulator.mul = p.mod_mult;
@@ -501,6 +595,8 @@ impl OpllChannel {
             p.mod_release,
             p.mod_sustain,
         );
+        // §"Custom Patch": modulator $00.S also disables its release.
+        self.modulator.env.release_disabled = p.mod_sustain;
 
         // Carrier (operator #1).
         self.carrier.mul = p.car_mult;
@@ -513,9 +609,30 @@ impl OpllChannel {
             p.car_release,
             p.car_sustain,
         );
+        // §"Custom Patch" explicitly: "The carrier does not behave
+        // this way: its envelope always enters release when the note
+        // is released."
+        self.carrier.env.release_disabled = false;
 
         self.fb = p.feedback;
         self.volume = volume & 0x0F;
+    }
+
+    /// Apply the per-channel sustain override (`$2X.S`). Per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §Channels: "If the
+    /// sustain bit is set in the channel control register $2X S, the
+    /// release value in the patch is ignored and replaced with $5."
+    /// Reverts to the patch release rate when called with `false`.
+    pub fn set_channel_sustain_override(&mut self, on: bool, patch: &Vrc7Patch) {
+        if on {
+            // Both operators take RR = $5.
+            self.modulator.env.set_release_rate(0x5);
+            self.carrier.env.set_release_rate(0x5);
+        } else {
+            // Restore the per-operator patch release rate.
+            self.modulator.env.set_release_rate(patch.mod_release);
+            self.carrier.env.set_release_rate(patch.car_release);
+        }
     }
 
     /// Key-on edge transition.
@@ -541,13 +658,41 @@ impl OpllChannel {
 
     /// Produce one operator sample. Returns the carrier's signed
     /// linear amplitude, suitable for direct summation into the host
-    /// mixer.
+    /// mixer. `test` carries the chip-wide test-register hooks per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F".
     pub fn sample(&mut self) -> i32 {
+        self.sample_with_test(&TestRegister::default())
+    }
+
+    /// `sample` with the test-register hooks honoured. The 4-bit
+    /// `$0F` field is documented in
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F":
+    ///
+    /// * bit 0 — envelope output forced to 0 (full volume) for both
+    ///   modulator and carrier. The envelopes are still ticked
+    ///   internally, only the per-sample contribution is bypassed.
+    /// * bit 1 — hold LFO phase at 0 (halt + reset both tremolo and
+    ///   vibrato). We don't yet implement the LFO numeric step
+    ///   arrays (a documented §7 DOCS-GAP), so this bit is a no-op
+    ///   from the operator's point of view, but it is recorded on
+    ///   the chip so a future LFO landing inherits the gate.
+    /// * bit 2 — hold + reset waveform phase to 0. Both operator
+    ///   phase accumulators are pinned at 0 (and reset on entry);
+    ///   envelopes keep running but output is silent (sin(0)≈0).
+    /// * bit 3 — LFO speed override (tremolo 64×, vibrato 1024×
+    ///   faster). Same no-op-but-recorded story as bit 1.
+    pub fn sample_with_test(&mut self, test: &TestRegister) -> i32 {
         // Phase generator base rate. The VRC7 vrcvii doc gives:
         //   F = 49722 * fnum / 2^(19 - block)  Hz
         // Equivalent per-49716 Hz sample phase delta:
         //   delta_per_sample = (fnum << block) * MUL_x2 / 2
         let fnum_block = (self.fnum as u32) << (self.block as u32);
+
+        // §"Test Register $0F" bit 2: pin both waveform phases at 0.
+        if test.hold_phase {
+            self.modulator.phase_acc = 0;
+            self.carrier.phase_acc = 0;
+        }
 
         // Modulator feedback. The OPL family averages the last two
         // modulator outputs and shifts them right by `9 - fb` (FB=0
@@ -565,17 +710,31 @@ impl OpllChannel {
         // Modulator TL → envelope-level units. TL is 6 bits @ 0.75 dB
         // per step → 2 envelope-levels per TL step.
         let mod_tl_atten = (self.modulator.tl as u32) * 2;
-        let mod_out = self.modulator.sample(fb_phase, mod_tl_atten);
+        // §"Test Register $0F" bit 0: modulator envelope contribution
+        // forced to 0. We do this by sampling with the env-offset
+        // pre-cancelled (the env is still ticked below).
+        let mod_out = if test.envs_zero {
+            self.modulator
+                .sample_with_env_override(fb_phase, mod_tl_atten, 0)
+        } else {
+            self.modulator.sample(fb_phase, mod_tl_atten)
+        };
 
         // Update modulator feedback history.
         self.fb_prev[1] = self.fb_prev[0];
         self.fb_prev[0] = mod_out;
 
-        // Step both phase generators by one operator sample.
-        self.modulator.step_phase(fnum_block);
-        self.carrier.step_phase(fnum_block);
+        // Step both phase generators by one operator sample — but
+        // §"Test Register $0F" bit 2 also says the phase is *held*,
+        // so we skip the step in that case too.
+        if !test.hold_phase {
+            self.modulator.step_phase(fnum_block);
+            self.carrier.step_phase(fnum_block);
+        }
 
-        // Step the envelopes.
+        // Step the envelopes. Per §"Test Register $0F" bit 0: "The
+        // envelopes are still running while their output is
+        // overridden." — so we tick them regardless.
         self.modulator.env.step(1);
         self.carrier.env.step(1);
 
@@ -589,7 +748,12 @@ impl OpllChannel {
         // volume step (3 dB per volume step ÷ 0.375 dB per env-level
         // = 8).
         let car_volume_atten = (self.volume as u32) * 8;
-        self.carrier.sample(car_mod, car_volume_atten)
+        if test.envs_zero {
+            self.carrier
+                .sample_with_env_override(car_mod, car_volume_atten, 0)
+        } else {
+            self.carrier.sample(car_mod, car_volume_atten)
+        }
     }
 
     /// Whether the carrier is currently producing audio (envelope not
@@ -921,11 +1085,16 @@ mod tests {
     }
 
     /// Key-off edge transition moves both operator envelopes into
-    /// Release.
+    /// Release. Uses a patch with the modulator's `$00.S` clear so the
+    /// modulator honours key-off — see
+    /// `modulator_sustain_disables_release_on_key_off` for the
+    /// opposite case.
     #[test]
     fn channel_key_off_moves_envelopes_to_release() {
         let mut ch = OpllChannel::default();
-        let p = Vrc7Patch::from_bytes(&[0x21, 0x61, 0x1D, 0x07, 0xFF, 0xFF, 0x11, 0x07]);
+        // $00 = 0x01 (S=0, no release-disable), $01 = 0x61 (carrier
+        // bits as before).
+        let p = Vrc7Patch::from_bytes(&[0x01, 0x61, 0x1D, 0x07, 0xFF, 0xFF, 0x11, 0x07]);
         ch.load_patch(&p, 0);
         ch.trigger_key_on();
         // Advance past attack into decay so key-off has something to
@@ -965,6 +1134,198 @@ mod tests {
             "expected non-trivial carrier output after key-on, peak={}",
             peak
         );
+    }
+
+    // ----------------------------------------------- test register $0F
+
+    /// §"Test Register $0F" decoder maps each low bit to its named
+    /// flag.
+    #[test]
+    fn test_register_decodes_low_four_bits() {
+        let t = TestRegister::from_byte(0b0000);
+        assert!(!t.envs_zero && !t.hold_lfo && !t.hold_phase && !t.fast_lfo);
+        let t = TestRegister::from_byte(0b0001);
+        assert!(t.envs_zero && !t.hold_lfo && !t.hold_phase && !t.fast_lfo);
+        let t = TestRegister::from_byte(0b0010);
+        assert!(!t.envs_zero && t.hold_lfo && !t.hold_phase && !t.fast_lfo);
+        let t = TestRegister::from_byte(0b0100);
+        assert!(!t.envs_zero && !t.hold_lfo && t.hold_phase && !t.fast_lfo);
+        let t = TestRegister::from_byte(0b1000);
+        assert!(!t.envs_zero && !t.hold_lfo && !t.hold_phase && t.fast_lfo);
+        // High nibble is ignored.
+        let t = TestRegister::from_byte(0xF7);
+        assert!(t.envs_zero && t.hold_lfo && t.hold_phase && !t.fast_lfo);
+    }
+
+    /// §"Test Register $0F" bit 0: envelopes are bypassed (constant 0
+    /// = full volume), but they keep ticking. A freshly idle channel
+    /// (envelope=127, silent) should emit audible output with bit 0
+    /// set.
+    #[test]
+    fn test_register_bit0_forces_full_volume_output() {
+        let mut ch = OpllChannel::default();
+        // Use a patch with low feedback so the channel produces a
+        // clean sine; volume 0 = loudest.
+        let p = Vrc7Patch::from_bytes(&[0x21, 0x01, 0x00, 0x00, 0xF0, 0xF0, 0x00, 0x00]);
+        ch.load_patch(&p, 0);
+        ch.fnum = 0x100;
+        ch.block = 4;
+        // No key-on yet: envelopes are Idle (level=127, silent).
+        let test = TestRegister {
+            envs_zero: true,
+            ..Default::default()
+        };
+        let mut peak: i32 = 0;
+        for _ in 0..2048 {
+            let s = ch.sample_with_test(&test);
+            peak = peak.max(s.abs());
+        }
+        assert!(
+            peak > 10,
+            "expected audible output with envelopes overridden, peak={}",
+            peak
+        );
+    }
+
+    /// §"Test Register $0F" bit 2: waveform phase is pinned at 0, so
+    /// the operator sits at sin(0) ≈ 0. Even a triggered channel
+    /// should fall silent.
+    #[test]
+    fn test_register_bit2_silences_via_phase_hold() {
+        let mut ch = OpllChannel::default();
+        let p = Vrc7Patch::from_bytes(&[0x21, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
+        ch.load_patch(&p, 0);
+        ch.fnum = 0x100;
+        ch.block = 4;
+        ch.trigger_key_on();
+        let test = TestRegister {
+            hold_phase: true,
+            ..Default::default()
+        };
+        let mut peak: i32 = 0;
+        for _ in 0..2048 {
+            let s = ch.sample_with_test(&test);
+            peak = peak.max(s.abs());
+        }
+        // The +0/-0 1-complement representation of sin(0) gives ±1 LSB
+        // at the boundary; anything within a few LSBs counts as silent.
+        assert!(
+            peak <= 5,
+            "expected near-silence with phase held at 0, got peak={}",
+            peak
+        );
+    }
+
+    /// §"Test Register $0F" bit 0: envelopes continue to tick even
+    /// while overridden. A key-off issued mid-stream should still
+    /// drive the envelope toward Idle.
+    #[test]
+    fn test_register_bit0_envelopes_continue_to_tick() {
+        let mut ch = OpllChannel::default();
+        let p = Vrc7Patch::from_bytes(&[0x21, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF]);
+        ch.load_patch(&p, 0);
+        ch.fnum = 0x100;
+        ch.block = 4;
+        ch.trigger_key_on();
+        let test = TestRegister {
+            envs_zero: true,
+            ..Default::default()
+        };
+        // Advance into Decay/Sustain, then key-off and step until the
+        // carrier envelope is back to Idle (envelopes still ticking).
+        for _ in 0..2000 {
+            let _ = ch.sample_with_test(&test);
+        }
+        ch.trigger_key_off();
+        let mut reached_idle = false;
+        for _ in 0..200_000 {
+            let _ = ch.sample_with_test(&test);
+            if matches!(ch.carrier.env.phase, EnvPhase::Idle) {
+                reached_idle = true;
+                break;
+            }
+        }
+        assert!(
+            reached_idle,
+            "envelopes must keep ticking under test-bit-0 override"
+        );
+    }
+
+    // ----------------------------------------------- channel-S override
+
+    /// §Channels: "If the sustain bit is set in the channel control
+    /// register $2X S, the release value in the patch is ignored and
+    /// replaced with $5."
+    #[test]
+    fn channel_sustain_override_swaps_release_to_five() {
+        let mut ch = OpllChannel::default();
+        // Patch with release rate $C (fast) for both operators.
+        let p = Vrc7Patch::from_bytes(&[0x21, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x0C, 0x0C]);
+        ch.load_patch(&p, 0);
+        assert_eq!(ch.carrier.env.release_rate, 0x0C);
+        assert_eq!(ch.modulator.env.release_rate, 0x0C);
+        ch.set_channel_sustain_override(true, &p);
+        assert_eq!(ch.carrier.env.release_rate, 0x05);
+        assert_eq!(ch.modulator.env.release_rate, 0x05);
+        // Clearing the override restores the patch value.
+        ch.set_channel_sustain_override(false, &p);
+        assert_eq!(ch.carrier.env.release_rate, 0x0C);
+        assert_eq!(ch.modulator.env.release_rate, 0x0C);
+    }
+
+    // ----------------------------------------------- modulator-S release-disable
+
+    /// §"Custom Patch": "the modulator's sustain bit ($00 S) also
+    /// disables the release section of its envelope." Key-off should
+    /// leave the modulator envelope sitting wherever it is, while
+    /// the carrier moves to Release.
+    #[test]
+    fn modulator_sustain_disables_release_on_key_off() {
+        let mut ch = OpllChannel::default();
+        // $00 = 0x21: T=0 V=0 S=1 K=0 M=1 — modulator $00.S=1.
+        // $01 = 0x01: carrier S=0.
+        let p = Vrc7Patch::from_bytes(&[0x21, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF]);
+        ch.load_patch(&p, 0);
+        assert!(ch.modulator.env.release_disabled);
+        assert!(!ch.carrier.env.release_disabled);
+        ch.trigger_key_on();
+        // Advance past attack.
+        for _ in 0..2000 {
+            ch.modulator.env.step(1);
+            ch.carrier.env.step(1);
+            if matches!(ch.carrier.env.phase, EnvPhase::Sustain) {
+                break;
+            }
+        }
+        ch.trigger_key_off();
+        // Carrier transitioned to Release; modulator did not.
+        assert_eq!(ch.carrier.env.phase, EnvPhase::Release);
+        assert_ne!(ch.modulator.env.phase, EnvPhase::Release);
+    }
+
+    /// Counter-test: a patch with $01.S=1 (carrier sustain enabled)
+    /// is the EG-TYP bit only; the carrier still enters Release on
+    /// key-off per §"Custom Patch" — "The carrier does not behave
+    /// this way: its envelope always enters release when the note
+    /// is released."
+    #[test]
+    fn carrier_sustain_bit_does_not_disable_release() {
+        let mut ch = OpllChannel::default();
+        // $01 = 0x21: T=0 V=0 S=1 K=0 M=1 — carrier $01.S=1.
+        let p = Vrc7Patch::from_bytes(&[0x01, 0x21, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF]);
+        ch.load_patch(&p, 0);
+        assert!(!ch.modulator.env.release_disabled);
+        assert!(!ch.carrier.env.release_disabled);
+        ch.trigger_key_on();
+        for _ in 0..2000 {
+            ch.modulator.env.step(1);
+            ch.carrier.env.step(1);
+            if matches!(ch.carrier.env.phase, EnvPhase::Sustain) {
+                break;
+            }
+        }
+        ch.trigger_key_off();
+        assert_eq!(ch.carrier.env.phase, EnvPhase::Release);
     }
 
     /// Sanity: phase_index wraps modulo 1024.

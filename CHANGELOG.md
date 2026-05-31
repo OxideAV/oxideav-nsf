@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **VRC7 test register `$0F` + per-channel sustain override + modulator
+  release-disable + audio reset** (round 15): four fully-spec'd VRC7
+  semantics from `docs/audio/nsf/vrc7-audio-wiki.html` land without
+  needing any of the missing OPL-family numeric tables. (1) §"Test
+  Register $0F" — the new `opll::TestRegister` decodes the low 4 bits
+  (bit 0 envelopes-forced-zero / full volume, bit 1 LFO-phase-hold,
+  bit 2 waveform-phase-hold, bit 3 LFO-speed override), the chip
+  caches it as `Vrc7::test_register`, and per-operator sampling
+  consults it via the new `OpllChannel::sample_with_test`. Bit 0
+  bypasses the envelope's exp-offset on both modulator and carrier
+  while envelopes keep ticking; bit 2 pins both operator phase
+  accumulators at 0 (output goes silent without halting envelopes);
+  bits 1 and 3 are recorded so a future LFO landing inherits the
+  gate. (2) §Channels — `$2X.S` now drives both operators' release
+  rate to `$5` (overriding the patch) via the new
+  `OpllChannel::set_channel_sustain_override`, with revert-to-patch
+  on clear. The patch-load path re-applies the override so a patch
+  swap mid-sustain doesn't lose it. (3) §"Custom Patch" — the
+  modulator's `$00.S` is dual-role per the wiki; in addition to
+  EG-TYP it disables the release section of the modulator's
+  envelope entirely. The new `Envelope::release_disabled` flag is
+  set from `p.mod_sustain` on patch load (and explicitly cleared on
+  the carrier per the wiki's "the carrier does not behave this
+  way" carve-out); `Envelope::key_off` is a no-op when set. (4)
+  §"Audio Reset ($E000)" — `Vrc7::write(0xE000, …)` now reads bit 6
+  (R); setting it silences the chip (`latched_output` pinned to 0,
+  no operator ticks), clears all registers + channel state, and
+  blocks subsequent writes to `$9010` / `$9030`; clearing it
+  restores writes. The §LFO clear qualifier is a no-op since the
+  LFO isn't yet ticked (§7 DOCS-GAP). +14 new unit tests covering
+  the TestRegister bitfield decode, bit-0-forces-full-volume + still
+  ticks, bit-2-silences-via-phase-hold, channel sustain override
+  swap + revert, modulator-S release-disable on key-off + carrier
+  not affected, `$0F` indirect-port write updates the cached
+  struct, chip-level phase-hold silences, `$2X.S` channel-level
+  release-rate override, modulator-only release-disable, `$E000`
+  bit 6 clears registers + blocks indirect-port writes, tick
+  silenced during reset, and the bit-6-only-bit-matters check. The
+  existing `channel_key_off_moves_envelopes_to_release` regression
+  was updated to use a non-modulator-sustained patch so the
+  modulator's new release-disable behaviour doesn't contaminate the
+  unrelated carrier+modulator transition assertion.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.1...v0.0.2) - 2026-05-29
 
 ### Other

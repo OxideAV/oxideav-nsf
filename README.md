@@ -94,6 +94,27 @@ emulator source per the staging's §"Provenance & non-emulator
 sourcing" appendix, and need the OPLx-decapsulated independent-RE
 article transcribed before they can land verbatim.
 
+Round 15 lands four VRC7 register-level semantics that are fully
+spec'd in `docs/audio/nsf/vrc7-audio-wiki.html` (no numeric tables
+needed). 1) §"Test Register $0F" decodes the low 4 bits into a
+`TestRegister` struct (bit 0 envelopes-forced-zero / full volume,
+bit 1 LFO-phase-hold, bit 2 waveform-phase-hold, bit 3 LFO-speed
+override) and the per-operator sample path consults it via the new
+`OpllChannel::sample_with_test`: bit 0 bypasses the envelope's
+exp-offset (envelopes still tick), bit 2 pins both phase
+accumulators at 0 (silences output without halting envelopes), bits
+1+3 are recorded for the future LFO landing. 2) §Channels' `$2X.S`
+sustain bit now overrides both operators' release rate with `$5`
+when set and reverts on clear, via the new
+`OpllChannel::set_channel_sustain_override`. 3) §"Custom Patch"'s
+modulator-only `$00.S` release-disable behaviour wires through a
+new `Envelope::release_disabled` flag — the modulator's envelope
+ignores key-off entirely while the carrier ($01.S) honours it
+unconditionally per the spec's "the carrier does not behave this
+way" carve-out. 4) §"Audio Reset ($E000)" bit 6 clears all VRC7
+registers, silences `latched_output`, blocks writes to `$9010` /
+`$9030` while held, and re-enables writes when cleared.
+
 ## Round 2 scope
 
 * **Header parser** ([`parse_nsf`]):
@@ -355,20 +376,25 @@ article transcribed before they can land verbatim.
   not cycle-exact.
 * VRC7 OPLL operator chain (logsin / exp / phase / feedback /
   envelope) — LANDED round 14 against the new staged tables in
-  `docs/audio/nsf/opll-ym2413/`. Remaining numeric DOCS-GAPs (both
-  flagged by the staging as deliberately not lifted from emulator
-  source): the §4 KSL attenuation table (needs the
-  OPLx-decapsulated independent-RE base table transcribed before
-  KSL contributes attenuation; currently 0 dB) and the §7 per-rate
-  envelope-increment numeric arrays (currently a `2^(rate-1)`
-  Q16-units-per-sample monotonic ladder honouring rate=0 halt +
-  rate=15 fastest semantics but NOT bit-exact against the
-  OPLx-decapsulated per-rate table). Rhythm-mode operator
+  `docs/audio/nsf/opll-ym2413/`. Round 15 wired the `$0F` test
+  register (envelope/phase/LFO holds), the `$2X.S` channel-level
+  release-rate-to-5 override, the modulator `$00.S` release-disable
+  carve-out, and the `$E000` bit-6 audio reset / silence / write
+  block. Remaining numeric DOCS-GAPs (both flagged by the staging
+  as deliberately not lifted from emulator source): the §4 KSL
+  attenuation table (needs the OPLx-decapsulated independent-RE
+  base table transcribed before KSL contributes attenuation;
+  currently 0 dB) and the §7 per-rate envelope-increment numeric
+  arrays (currently a `2^(rate-1)` Q16-units-per-sample monotonic
+  ladder honouring rate=0 halt + rate=15 fastest semantics but NOT
+  bit-exact against the OPLx-decapsulated per-rate table). LFO
+  numeric step arrays (§7) are the third DOCS-GAP; the test
+  register `$0F` bits 1 + 3 are wired and recorded but have no
+  audible effect until the LFO lands. Rhythm-mode operator
   allocation (`$0E` bit 5, drum channels at `$36`/`$37`/`$38`) is
-  also out of scope for round 14 — VRC7 has no rhythm DAC so the
-  drum patches in the ROM are inaudible there, but a future YM2413
-  consumer (an MSX-format crate, say) would need rhythm-mode
-  decoded.
+  also out of scope — VRC7 has no rhythm DAC so the drum patches
+  in the ROM are inaudible there, but a future YM2413 consumer (an
+  MSX-format crate, say) would need rhythm-mode decoded.
 * N163: round 11 added the per-channel timer accumulators. Remaining
   gap is matching the documented `f = (n * p) / (15 * 65536 * l * c)`
   output frequency in a calibration test against a known fixture (the
