@@ -1272,6 +1272,8 @@ impl Vrc7 {
             // engines. The patch + volume are reloaded whenever
             // either changes; the fnum + block are mirrored every
             // tick so a sweep mid-note is honoured.
+            let pitch_changed = self.opll_channels[ch].fnum != new_fnum
+                || self.opll_channels[ch].block != new_block;
             self.opll_channels[ch].fnum = new_fnum;
             self.opll_channels[ch].block = new_block;
             if patch_changed || volume_changed {
@@ -1288,6 +1290,13 @@ impl Vrc7 {
                 // update the release-rate override.
                 let p = self.patch(new_patch_index);
                 self.opll_channels[ch].set_channel_sustain_override(new_sustain, &p);
+            }
+            // §III-1-2 KSR — when the pitch changes the Rks offset
+            // changes, so re-derive it for both operators. `load_patch`
+            // above already does this; only call again on a pure
+            // pitch-only write.
+            if pitch_changed && !(patch_changed || volume_changed) {
+                self.opll_channels[ch].refresh_rks();
             }
 
             // Key-on / key-off edge detection. The OPLL channel's
@@ -3427,10 +3436,25 @@ mod tests {
     fn vrc7_test_register_bit2_silences_chip() {
         let mut chip = Vrc7::new();
         chip.enabled = true;
-        // Flute (patch 4) — fast attack so we hit audible amplitude
-        // quickly. Channel 0, volume 0 (loudest), fnum = 0x100 so the
-        // phase generator actually advances.
-        vrc7_write_reg(&mut chip, 0x30, 0x40);
+        // Programme the slot-0 user patch with both KSR bits clear,
+        // a fast-but-not-instant attack, a long sustain level so the
+        // carrier holds an audible amplitude, and an EG-TYP=1
+        // (sustained) tone on the carrier so it doesn't release
+        // through sustain. Modulator $00 = 0x21 (T=0 V=0 S=1 K=0 M=1
+        // → EG-TYP=sustained, KSR=0). Carrier $01 = 0x21 (same).
+        // $04 = 0xF7 (AR=15, DR=7 — slow enough to dwell), $05 same.
+        // $06 / $07 = 0x10 (SL=1 = loud, RR=0 — release halts).
+        vrc7_write_reg(&mut chip, 0x00, 0x21);
+        vrc7_write_reg(&mut chip, 0x01, 0x21);
+        vrc7_write_reg(&mut chip, 0x02, 0x00);
+        vrc7_write_reg(&mut chip, 0x03, 0x00);
+        vrc7_write_reg(&mut chip, 0x04, 0xF7);
+        vrc7_write_reg(&mut chip, 0x05, 0xF7);
+        vrc7_write_reg(&mut chip, 0x06, 0x10);
+        vrc7_write_reg(&mut chip, 0x07, 0x10);
+        // Channel 0: patch=0 (user), volume=0 (loudest), block=4,
+        // fnum=0x100 (so the phase generator advances).
+        vrc7_write_reg(&mut chip, 0x30, 0x00);
         vrc7_write_reg(&mut chip, 0x10, 0x00); // fnum low = 0x00
         vrc7_write_reg(&mut chip, 0x20, 0x19); // key-on, block 4, fnum-high bit = 1 → fnum = 0x100
                                                // Accumulate a baseline peak across many ticks so we don't
@@ -3573,5 +3597,111 @@ mod tests {
         // Bit 6 set = reset on, regardless of other bits.
         chip.write(0xE000, 0x47); // bit 6 + mirroring bits
         assert!(chip.audio_reset_held);
+    }
+
+    /// YM2413 Application Manual §III-1-2 Table III-2 — when a
+    /// program writes `$1X` / `$2X` to change the channel's pitch
+    /// mid-note, both operators' `Rks` offsets re-derive from the
+    /// new `(block, fnum_msb)` so the next envelope step picks up
+    /// the new rate amplification. This is the
+    /// `refresh_from_regs` → `refresh_rks` path on a pitch-only
+    /// write.
+    #[test]
+    fn vrc7_pitch_only_write_refreshes_rks_on_both_operators() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Pick patch 4 ("Flute") which has carrier KSR=1 (`$01.D4`
+        // set in the dumped instrument byte) — easy to verify the
+        // KSR-on row.
+        // Flute = 23 11 25 00 89 89 26 18 per the ROM dump.
+        let flute = Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[4]);
+        // Sanity: carrier KSR bit is what we expect.
+        let expected_mod_ksr = flute.mod_ksr;
+        let expected_car_ksr = flute.car_ksr;
+        // Program channel 0 with patch 4, volume 0, block=2, fnum=0x100
+        // (fnum_msb=1, fnum_low=0).
+        vrc7_write_reg(&mut chip, 0x30, 0x40); // patch=4, vol=0
+        vrc7_write_reg(&mut chip, 0x10, 0x00); // fnum low = 0
+                                               // $20 layout: ---STBBB H. Want key-on, block=2 (BBB=010),
+                                               // fnum-high=1 (H=1) → 0b0001_0101 = 0x15.
+        vrc7_write_reg(&mut chip, 0x20, 0x15);
+        let pre_mod_rks = chip.opll_channels[0].modulator.env.rks;
+        let pre_car_rks = chip.opll_channels[0].carrier.env.rks;
+        // Sanity vs Table III-2 at (block=2, fnum_msb=1):
+        //   KSR=0 row → Rks = 2>>1 = 1
+        //   KSR=1 row → Rks = (2<<1)|1 = 5
+        let expected_pre_mod = if expected_mod_ksr {
+            (2 << 1) | 1
+        } else {
+            2 >> 1
+        };
+        let expected_pre_car = if expected_car_ksr {
+            (2 << 1) | 1
+        } else {
+            2 >> 1
+        };
+        assert_eq!(pre_mod_rks, expected_pre_mod);
+        assert_eq!(pre_car_rks, expected_pre_car);
+
+        // Now do a pitch-only write that bumps the block to 6 while
+        // keeping the same key-on + sustain bits.
+        // $20 with block=6 (BBB=110), fnum-high=1, key-on=1 →
+        // 0b0001_1101 = 0x1D.
+        vrc7_write_reg(&mut chip, 0x20, 0x1D);
+        // Same fnum_msb (1), new block (6).
+        let post_mod_rks = chip.opll_channels[0].modulator.env.rks;
+        let post_car_rks = chip.opll_channels[0].carrier.env.rks;
+        let expected_post_mod = if expected_mod_ksr {
+            (6 << 1) | 1
+        } else {
+            6 >> 1
+        };
+        let expected_post_car = if expected_car_ksr {
+            (6 << 1) | 1
+        } else {
+            6 >> 1
+        };
+        assert_eq!(
+            post_mod_rks, expected_post_mod,
+            "mod Rks should re-derive against new block=6: pre={pre_mod_rks} post={post_mod_rks}"
+        );
+        assert_eq!(
+            post_car_rks, expected_post_car,
+            "car Rks should re-derive against new block=6: pre={pre_car_rks} post={post_car_rks}"
+        );
+    }
+
+    /// A patch swap that changes the KSR bit must update `Rks` at
+    /// the moment of the swap (without needing a subsequent pitch
+    /// write). The `refresh_from_regs` → `load_patch` →
+    /// `refresh_rks` path covers this.
+    #[test]
+    fn vrc7_patch_swap_updates_rks_via_load_patch() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // Channel 0 pitch: block=3, fnum=0x100 (msb=1).
+        // $20 = 0b0001_0111 = 0x17 (key-on + block=3 + fnum-high=1).
+        vrc7_write_reg(&mut chip, 0x10, 0x00);
+        vrc7_write_reg(&mut chip, 0x20, 0x17);
+
+        // Patch 1 "Buzzy Bell": $00=0x03 (K=0), $01=0x21 (K=0). Both
+        // operators KSR=0 → Rks = 3>>1 = 1.
+        vrc7_write_reg(&mut chip, 0x30, 0x10);
+        assert_eq!(chip.opll_channels[0].modulator.env.rks, 1);
+        assert_eq!(chip.opll_channels[0].carrier.env.rks, 1);
+
+        // Swap to patch $A "Vibes" (`B5 01 ...`) which has mod K=1
+        // (`$00 = 0xB5` → bit 4 set) and carrier K=0 (`$01 = 0x01`).
+        // After the swap, mod Rks should jump to (3<<1)|1 = 7 while
+        // carrier Rks stays on the KSR=0 row at 3>>1 = 1.
+        let vibes = Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[0x0A]);
+        assert!(
+            vibes.mod_ksr,
+            "patch $A modulator KSR must be set for this test"
+        );
+        assert!(!vibes.car_ksr);
+        vrc7_write_reg(&mut chip, 0x30, 0xA0); // patch=A, vol=0
+        assert_eq!(chip.opll_channels[0].modulator.env.rks, 7);
+        assert_eq!(chip.opll_channels[0].carrier.env.rks, 1);
     }
 }

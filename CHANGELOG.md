@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VRC7 OPLL KSR (Key Scale of RATE)** (round 16): the per-operator
+  `KSR` bit (`$00`/`$01` D4) on every channel now amplifies the
+  envelope's per-stage RATE by the pitch-derived `Rks` offset per
+  the YM2413 Application Manual §III-1-2 + Table III-2 in
+  `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`.
+  Each operator's `Envelope::ksr` is loaded from the patch's
+  `mod_ksr` / `car_ksr` field on every `OpllChannel::load_patch`,
+  and `Envelope::update_rks(block, fnum_msb)` computes the cached
+  `Rks` offset: `KSR=0` → `Rks = block >> 1` (the D4=0 row reads
+  `0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3` across the 16 (block,
+  fnum-MSB) columns); `KSR=1` → `Rks = (block << 1) | fnum_msb`
+  (D4=1 row reads `0..15`). The 4-bit per-stage R from the patch
+  is widened to a 6-bit RATE via the manual's `RATE = 4·R + Rks`
+  formula in the new `Envelope::effective_rate(r)`, with the
+  explicit "Note that when R=0, RATE=0" carve-out honoured (any R
+  field set to 0 still halts the envelope regardless of pitch).
+  A pure pitch-only `$1X` / `$2X` register write (no patch or
+  volume change) re-derives both operators' `Rks` via the new
+  `OpllChannel::refresh_rks` so a glide-mid-note honours the new
+  pitch's rate amplification on the very next envelope step. The
+  Q16 step shift caps at 31 (RATE values beyond that saturate the
+  envelope against `ENV_MAX_LEVEL` in one sample anyway). The
+  per-RATE numeric increment table from the OPLx-decapsulated §7
+  array remains the documented DOCS-GAP followup — KSR's
+  contribution to per-rate amplification is now bit-correct, but
+  the absolute per-RATE step magnitude is still the coarse
+  `2^(rate-1)` Q16-units-per-sample approximation from round 14.
+- 7 new unit tests covering: the §III-1-2 Table III-2 D4=0 row
+  (`Rks = block >> 1` across all 16 (block, fnum_msb) columns),
+  the D4=1 row (`Rks = (block << 1) | fnum_msb`), the
+  `RATE = 4·R + Rks` formula with the `R=0 → RATE=0` halt
+  carve-out and the 63-cap, the end-to-end behavioural check that
+  KSR=1 at (block=7, fnum_msb=1) reaches the sustain level
+  strictly faster than at (block=0, fnum_msb=0), the
+  smaller-but-non-zero sensitivity of the KSR=0 row, the
+  `OpllChannel::refresh_rks` per-operator KSR-bit selection, and
+  the `OpllChannel::load_patch` path that picks up the patch's
+  KSR bit and immediately re-derives Rks against the channel's
+  current pitch. +2 new integration tests in `expansion.rs`
+  covering the pitch-only `$2X` register write path that calls
+  `refresh_from_regs` → `refresh_rks` on both operators, and the
+  patch-swap path that updates Rks via `refresh_from_regs` →
+  `load_patch` → `refresh_rks` (verified against the dumped
+  `$A` "Vibes" preset whose `$00 = 0xB5` has the modulator KSR
+  bit set and `$01 = 0x01` does not).
+
 - **VRC7 test register `$0F` + per-channel sustain override + modulator
   release-disable + audio reset** (round 15): four fully-spec'd VRC7
   semantics from `docs/audio/nsf/vrc7-audio-wiki.html` land without

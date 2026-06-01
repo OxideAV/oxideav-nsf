@@ -36,6 +36,15 @@
 //! KSL)` formula documented in §4 against a base table that has not
 //! been transcribed — KSL therefore currently contributes 0 dB and
 //! is also a documented followup.
+//!
+//! KSR (Key Scale of RATE) IS fully specified by the YM2413
+//! Application Manual §III-1-2 + Table III-2 (mirrored in
+//! `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`)
+//! — no emulator source required. The §"RATE = 4·R + Rks" formula
+//! and the two key-scale offset tables (`KSR=0`: `Rks = block >> 1`,
+//! `KSR=1`: `Rks = (block << 1) | fnum_msb`) are implemented below,
+//! gated on the patch's per-operator KSR bit. When R=0 the manual
+//! is explicit that RATE=0 (halt) regardless of Rks.
 
 use crate::expansion::Vrc7Patch;
 
@@ -262,6 +271,19 @@ pub struct Envelope {
     /// sustain while the carrier releases." Set on the modulator's
     /// envelope only — the carrier ($01.S) always honours key-off.
     pub release_disabled: bool,
+    /// KSR (Key Scale of RATE, `$00`/`$01` D4) — when set, the
+    /// effective envelope rate is amplified by the pitch-derived
+    /// offset `Rks = (block << 1) | fnum_msb`; when clear by
+    /// `Rks = block >> 1`. Per the YM2413 Application Manual,
+    /// §III-1-2 and Table III-2, in
+    /// `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`.
+    pub ksr: bool,
+    /// Cached `Rks` offset (0..=15) derived from the channel's
+    /// current `block` + F-Num MSB and the operator's KSR bit. Mixed
+    /// into the per-stage rate at step time as `RATE = 4·R + Rks`.
+    /// Updated via [`Envelope::update_rks`] whenever the channel's
+    /// fnum / block changes.
+    pub rks: u8,
 }
 
 /// Maximum envelope level (silence). Per andete §"envelope levels":
@@ -284,8 +306,47 @@ impl Envelope {
         self.release_rate = rr & 0x0F;
         self.sustain_level = sl & 0x0F;
         self.egt_sustain = egt_sustain;
-        // Note: `release_disabled` is set independently by the channel's
-        // patch loader — only the modulator operator sets it on $00.S.
+        // Note: `release_disabled` and `ksr` are set independently by
+        // the channel's patch loader: `release_disabled` is the
+        // modulator-only $00.S behaviour; `ksr` is the per-operator
+        // $00/$01.D4 bit.
+    }
+
+    /// Recompute the `Rks` offset from the channel's current pitch.
+    /// `block` is the 3-bit BLOCK Data (0..=7); `fnum_msb` is the
+    /// top bit of the 9-bit F-Num.
+    ///
+    /// Per the YM2413 Application Manual §III-1-2 Table III-2 in
+    /// `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`:
+    ///
+    /// * `KSR = 0` (D4 = 0 key scale row): `Rks = block >> 1`
+    ///   (the table reads `0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3` across
+    ///   the 16 (block, fnum-MSB) columns; the F-Num MSB is ignored).
+    /// * `KSR = 1` (D4 = 1 key scale row): `Rks = (block << 1) | fnum_msb`
+    ///   (the table reads `0,1,2,…,15` across the same 16 columns).
+    pub fn update_rks(&mut self, block: u8, fnum_msb: u8) {
+        let b = block & 0x07;
+        let m = fnum_msb & 0x01;
+        self.rks = if self.ksr { (b << 1) | m } else { b >> 1 };
+    }
+
+    /// Effective 6-bit RATE for a 4-bit R per the manual's
+    /// `RATE = 4·R + Rks` formula. `R = 0` always yields `RATE = 0`
+    /// (envelope halt) regardless of Rks — per the explicit "Note
+    /// that when R=0, RATE=0" remark in §III-1-2.
+    #[inline]
+    pub fn effective_rate(&self, r: u8) -> u8 {
+        let r = r & 0x0F;
+        if r == 0 {
+            0
+        } else {
+            // `4·R + Rks`: R ∈ 1..=15, Rks ∈ 0..=15 → RATE ∈ 4..=75.
+            // The manual's table caps at 4·15 + 15 = 75 (fits in 7
+            // bits); we clamp at 63 for the step() shift below since
+            // beyond rate 63 the Q16 step already saturates the
+            // envelope in <1 sample.
+            (4u8.saturating_mul(r).saturating_add(self.rks)).min(63)
+        }
     }
 
     /// Override the release rate. Per `vrc7-audio-wiki.html` §Channels:
@@ -327,19 +388,30 @@ impl Envelope {
     /// Step the envelope by one operator sample. `samples` is typically
     /// 1; multi-sample stepping is allowed for bulk advance.
     ///
-    /// The per-rate step magnitude is the coarse approximation flagged
-    /// in the module docstring: rate 0 halts, rate `n>0` advances by
-    /// `2^(n-1)` Q16 units per sample. This produces a monotonic
-    /// rate ladder that is faithful to the manual's rate=0..=15
-    /// semantics but is NOT bit-exact against the OPLx-decapsulated
-    /// per-rate increment arrays.
+    /// Each stage's 4-bit R is widened to a 6-bit RATE via the
+    /// manual's `RATE = 4·R + Rks` formula (see [`effective_rate`]).
+    /// The per-RATE step magnitude is the coarse approximation
+    /// flagged in the module docstring: rate 0 halts, rate `n>0`
+    /// advances by `2^(n-1)` Q16 units per sample. This widening
+    /// preserves the monotonic rate ladder faithful to the manual's
+    /// `R=0..=15` × `KSR={0,1}` × `(block, fnum_msb)` semantics but
+    /// is NOT bit-exact against the OPLx-decapsulated per-RATE
+    /// increment arrays — that exact transcription remains a
+    /// documented DOCS-GAP followup.
+    ///
+    /// [`effective_rate`]: Envelope::effective_rate
     pub fn step(&mut self, samples: u32) {
         let advance = |rate: u8, s: u32| -> u32 {
             if rate == 0 {
                 0
             } else {
-                // (1 << (rate-1)) Q16-units per sample
-                (1u32 << (rate as u32 - 1)).saturating_mul(s)
+                // (1 << (rate-1)) Q16-units per sample. Clamp the
+                // shift at 31 to avoid overflow on rate=63 — the
+                // envelope saturates against ENV_MAX_LEVEL within
+                // the same sample once the shift exceeds the level
+                // span anyway.
+                let shift = (rate as u32 - 1).min(31);
+                (1u32 << shift).saturating_mul(s)
             }
         };
 
@@ -348,7 +420,7 @@ impl Envelope {
                 self.level_q16 = ENV_MAX_LEVEL << 16;
             }
             EnvPhase::Attack => {
-                let step = advance(self.attack_rate, samples);
+                let step = advance(self.effective_rate(self.attack_rate), samples);
                 // Attack ramps DOWN to 0 (= loudest).
                 self.level_q16 = self.level_q16.saturating_sub(step);
                 if self.level_q16 == 0 {
@@ -356,7 +428,7 @@ impl Envelope {
                 }
             }
             EnvPhase::Decay => {
-                let step = advance(self.decay_rate, samples);
+                let step = advance(self.effective_rate(self.decay_rate), samples);
                 self.level_q16 = self.level_q16.saturating_add(step);
                 // Sustain level: 8 envelope-levels per SL-step (3 dB
                 // per SL-step ÷ 0.375 dB per env-level = 8). SL=15
@@ -371,7 +443,7 @@ impl Envelope {
                 if !self.egt_sustain {
                     // Percussive: continue toward silence at the
                     // release rate.
-                    let step = advance(self.release_rate, samples);
+                    let step = advance(self.effective_rate(self.release_rate), samples);
                     self.level_q16 = self.level_q16.saturating_add(step).min(ENV_MAX_LEVEL << 16);
                     if self.level_q16 >= ENV_MAX_LEVEL << 16 {
                         self.phase = EnvPhase::Idle;
@@ -380,7 +452,7 @@ impl Envelope {
                 // Sustained tone: hold here until key-off.
             }
             EnvPhase::Release => {
-                let step = advance(self.release_rate, samples);
+                let step = advance(self.effective_rate(self.release_rate), samples);
                 self.level_q16 = self.level_q16.saturating_add(step).min(ENV_MAX_LEVEL << 16);
                 if self.level_q16 >= ENV_MAX_LEVEL << 16 {
                     self.phase = EnvPhase::Idle;
@@ -597,6 +669,9 @@ impl OpllChannel {
         );
         // §"Custom Patch": modulator $00.S also disables its release.
         self.modulator.env.release_disabled = p.mod_sustain;
+        // §III-1-2 KSR — per-operator D4 bit; the Rks offset is
+        // computed against the channel's current pitch below.
+        self.modulator.env.ksr = p.mod_ksr;
 
         // Carrier (operator #1).
         self.carrier.mul = p.car_mult;
@@ -613,9 +688,28 @@ impl OpllChannel {
         // this way: its envelope always enters release when the note
         // is released."
         self.carrier.env.release_disabled = false;
+        self.carrier.env.ksr = p.car_ksr;
 
         self.fb = p.feedback;
         self.volume = volume & 0x0F;
+
+        // Re-derive each operator's Rks against the channel's
+        // current (block, fnum) — a patch swap mid-note honours the
+        // new KSR bit immediately.
+        self.refresh_rks();
+    }
+
+    /// Refresh both operators' `Rks` offset from the channel's
+    /// current `block` + F-Num MSB. Call this after any `fnum` /
+    /// `block` change so the next envelope step picks up the new
+    /// pitch-derived rate amplification per §III-1-2 Table III-2.
+    pub fn refresh_rks(&mut self) {
+        // F-Num is 9 bits in `self.fnum` (low 8 bits + the BLOCK's
+        // D0 high bit folded in by the register layer). The KSR
+        // table uses the top bit of the 9-bit F-Num.
+        let fnum_msb = ((self.fnum >> 8) & 0x01) as u8;
+        self.modulator.env.update_rks(self.block, fnum_msb);
+        self.carrier.env.update_rks(self.block, fnum_msb);
     }
 
     /// Apply the per-channel sustain override (`$2X.S`). Per
@@ -1340,5 +1434,190 @@ mod tests {
         // Adding 1 modulation step at position 1023 → wraps to 0.
         let p2 = op.phase_index(1);
         assert_eq!(p2, 0);
+    }
+
+    // ------------------------------------------------------- KSR
+
+    /// YM2413 Application Manual §III-1-2 Table III-2 D4=0 row: the
+    /// `Rks` offset for KSR=0 reads `0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3`
+    /// across the 16 columns indexed by (block, fnum_msb). The F-Num
+    /// MSB is ignored — `Rks = block >> 1` matches every column.
+    #[test]
+    fn ksr_disabled_matches_app_manual_table_iii_2_d4_zero_row() {
+        let expected: [u8; 16] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3];
+        let mut e = Envelope {
+            ksr: false,
+            ..Default::default()
+        };
+        for col in 0..16u8 {
+            let block = col >> 1;
+            let fnum_msb = col & 0x01;
+            e.update_rks(block, fnum_msb);
+            assert_eq!(
+                e.rks, expected[col as usize],
+                "KSR=0 col={col} block={block} fnum_msb={fnum_msb}: Rks={} expected={}",
+                e.rks, expected[col as usize]
+            );
+        }
+    }
+
+    /// YM2413 Application Manual §III-1-2 Table III-2 D4=1 row: the
+    /// `Rks` offset for KSR=1 reads `0,1,2,3,4,5,6,7,8,9,10,11,12,
+    /// 13,14,15` across the 16 columns — i.e. `Rks = (block << 1) |
+    /// fnum_msb`.
+    #[test]
+    fn ksr_enabled_matches_app_manual_table_iii_2_d4_one_row() {
+        let mut e = Envelope {
+            ksr: true,
+            ..Default::default()
+        };
+        for col in 0..16u8 {
+            let block = col >> 1;
+            let fnum_msb = col & 0x01;
+            e.update_rks(block, fnum_msb);
+            assert_eq!(
+                e.rks, col,
+                "KSR=1 col={col} block={block} fnum_msb={fnum_msb}: Rks={} expected={col}",
+                e.rks,
+            );
+        }
+    }
+
+    /// §III-1-2: `RATE = 4·R + Rks`, with the explicit "Note that
+    /// when R=0, RATE=0" carve-out. Verify both the formula and the
+    /// halt.
+    #[test]
+    fn effective_rate_matches_4r_plus_rks_with_zero_halt() {
+        let mut e = Envelope {
+            rks: 7,
+            ..Default::default()
+        };
+        // R=0 always halts regardless of Rks.
+        assert_eq!(e.effective_rate(0), 0);
+        // R=1, Rks=7 → 4·1 + 7 = 11.
+        assert_eq!(e.effective_rate(1), 11);
+        // R=15, Rks=15 → 4·15 + 15 = 75 → clamped to 63 (the §step()
+        // shift cap; the manual is silent on the upper bound but our
+        // Q16 step saturates the envelope within one sample beyond
+        // RATE 31 anyway).
+        e.rks = 15;
+        assert_eq!(e.effective_rate(15), 63);
+        // Mid case: R=3, Rks=2 → 14.
+        e.rks = 2;
+        assert_eq!(e.effective_rate(3), 14);
+    }
+
+    /// End-to-end: with the same patch + R but KSR=1, a higher block
+    /// makes the envelope's per-sample step strictly larger (and
+    /// therefore the decay reaches the sustain level strictly faster)
+    /// than the low-block case. Per the §III-1-2 "envelope speeds up
+    /// as the pitch rises" semantic.
+    ///
+    /// We use the decay phase rather than attack because the
+    /// envelope's `level_q16` starts at 0 (default) — attack at any
+    /// rate immediately saturates to 0 and transitions out in one
+    /// step. Decay starts at 0 and ramps up to `sustain_level << 3`
+    /// envelope-levels, exercising the per-rate step magnitude.
+    #[test]
+    fn ksr_enabled_higher_pitch_reaches_decay_sustain_faster() {
+        let make = |block: u8, fnum_msb: u8| -> Envelope {
+            let mut e = Envelope {
+                ksr: true,
+                ..Default::default()
+            };
+            // AR=15 (so attack saturates instantly), DR=2 (slow
+            // enough that KSR amplification produces a clear step
+            // count difference), SL=8 (mid-range sustain).
+            e.load_from_patch(15, 2, 8, 0, true);
+            e.update_rks(block, fnum_msb);
+            e.key_on();
+            e
+        };
+        let count_decay_steps = |mut e: Envelope| -> u32 {
+            // Walk through Attack (1 step at AR=15) then Decay.
+            for i in 0..2_000_000 {
+                e.step(1);
+                if matches!(e.phase, EnvPhase::Sustain) {
+                    return i + 1;
+                }
+            }
+            u32::MAX
+        };
+        let low_pitch = count_decay_steps(make(0, 0));
+        let high_pitch = count_decay_steps(make(7, 1));
+        assert!(
+            high_pitch < low_pitch,
+            "KSR=1 with block=7,fnum_msb=1 should reach sustain \
+             strictly faster than block=0,fnum_msb=0: high={high_pitch} \
+             low={low_pitch}"
+        );
+    }
+
+    /// End-to-end: with KSR=0, the same change in (block, fnum_msb)
+    /// across a 2-block boundary changes Rks by 1 (not 7 as in the
+    /// KSR=1 case), confirming the `Rks = block >> 1` table from the
+    /// D4=0 row matches the implementation when run through the
+    /// envelope.
+    #[test]
+    fn ksr_disabled_pitch_sensitivity_is_smaller() {
+        let mut e0 = Envelope {
+            ksr: false,
+            ..Default::default()
+        };
+        e0.update_rks(0, 0);
+        let mut e1 = Envelope {
+            ksr: false,
+            ..Default::default()
+        };
+        e1.update_rks(7, 1);
+        // Block 0..1 → 0; block 6..7 → 3. Difference is 3.
+        assert_eq!(e0.rks, 0);
+        assert_eq!(e1.rks, 3);
+    }
+
+    /// `OpllChannel::refresh_rks` derives both operators' Rks from
+    /// the channel's current `block` and the top bit of the 9-bit
+    /// `fnum`. Smoke check: when the carrier has KSR=1 and the
+    /// modulator has KSR=0, only the carrier's Rks tracks the
+    /// per-column index — the modulator's Rks stays on the `block >> 1`
+    /// ladder.
+    #[test]
+    fn opll_channel_refresh_rks_uses_per_operator_ksr_bit() {
+        // block=5, fnum_msb=1 → KSR=0 row: 5>>1 = 2; KSR=1 row:
+        // (5<<1)|1 = 11. The top bit of fnum=0x180 makes fnum_msb=1.
+        let mut ch = OpllChannel {
+            block: 5,
+            fnum: 0x180,
+            ..Default::default()
+        };
+        ch.modulator.env.ksr = false;
+        ch.carrier.env.ksr = true;
+        ch.refresh_rks();
+        assert_eq!(ch.modulator.env.rks, 2);
+        assert_eq!(ch.carrier.env.rks, 11);
+    }
+
+    /// `OpllChannel::load_patch` pulls the per-operator KSR bit from
+    /// the patch byte and immediately re-derives Rks against the
+    /// channel's current pitch. This is the path
+    /// `Vrc7::refresh_from_regs` uses on a patch-swap mid-note.
+    #[test]
+    fn opll_channel_load_patch_picks_up_ksr_and_refreshes_rks() {
+        // block=4, fnum_msb=1 from fnum=0x100. Hand-crafted patch:
+        // modulator $00 = 0x10 (K=1, all else 0); carrier $01 = 0x00
+        // (K=0). Other bytes zero so no side effects.
+        let mut ch = OpllChannel {
+            block: 4,
+            fnum: 0x100,
+            ..Default::default()
+        };
+        let p = Vrc7Patch::from_bytes(&[0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert!(p.mod_ksr);
+        assert!(!p.car_ksr);
+        ch.load_patch(&p, 0);
+        // Modulator KSR=1 → Rks = (block<<1) | fnum_msb = (4<<1)|1 = 9.
+        assert_eq!(ch.modulator.env.rks, 9);
+        // Carrier KSR=0 → Rks = block>>1 = 2.
+        assert_eq!(ch.carrier.env.rks, 2);
     }
 }

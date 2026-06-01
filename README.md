@@ -115,6 +115,28 @@ way" carve-out. 4) §"Audio Reset ($E000)" bit 6 clears all VRC7
 registers, silences `latched_output`, blocks writes to `$9010` /
 `$9030` while held, and re-enables writes when cleared.
 
+Round 16 lands the OPLL KSR (Key Scale of RATE) pipeline per
+`docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`
+§III-1-2 + Table III-2 — a fully-spec'd table that needs no
+emulator source. Each operator's KSR bit (`$00`/`$01` D4) is
+loaded from the patch on every `OpllChannel::load_patch`, and the
+new `Envelope::update_rks(block, fnum_msb)` derives the cached
+`Rks` offset from the channel's pitch: `KSR=0` → `Rks = block >> 1`
+(D4=0 row reads `0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3`); `KSR=1` →
+`Rks = (block << 1) | fnum_msb` (D4=1 row reads `0..15`). The
+4-bit per-stage R from the patch is widened to a 6-bit
+`RATE = 4·R + Rks` via the new `Envelope::effective_rate(r)`
+helper, with the explicit "Note that when R=0, RATE=0" carve-out
+honoured (R=0 still halts the envelope regardless of pitch). A
+pure pitch-only `$1X` / `$2X` register write that doesn't change
+the patch or volume now re-derives both operators' Rks via the
+new `OpllChannel::refresh_rks`, so a glide mid-note honours the
+new pitch's rate amplification on the very next envelope step.
+KSR's *contribution* to the per-stage rate is now bit-correct
+against §III-1-2; the absolute per-RATE step magnitude is still
+the coarse `2^(rate-1)` Q16-units-per-sample approximation that
+remains the documented §7 DOCS-GAP followup.
+
 ## Round 2 scope
 
 * **Header parser** ([`parse_nsf`]):
@@ -380,21 +402,28 @@ registers, silences `latched_output`, blocks writes to `$9010` /
   register (envelope/phase/LFO holds), the `$2X.S` channel-level
   release-rate-to-5 override, the modulator `$00.S` release-disable
   carve-out, and the `$E000` bit-6 audio reset / silence / write
-  block. Remaining numeric DOCS-GAPs (both flagged by the staging
-  as deliberately not lifted from emulator source): the §4 KSL
-  attenuation table (needs the OPLx-decapsulated independent-RE
-  base table transcribed before KSL contributes attenuation;
-  currently 0 dB) and the §7 per-rate envelope-increment numeric
-  arrays (currently a `2^(rate-1)` Q16-units-per-sample monotonic
-  ladder honouring rate=0 halt + rate=15 fastest semantics but NOT
-  bit-exact against the OPLx-decapsulated per-rate table). LFO
-  numeric step arrays (§7) are the third DOCS-GAP; the test
-  register `$0F` bits 1 + 3 are wired and recorded but have no
-  audible effect until the LFO lands. Rhythm-mode operator
-  allocation (`$0E` bit 5, drum channels at `$36`/`$37`/`$38`) is
-  also out of scope — VRC7 has no rhythm DAC so the drum patches
-  in the ROM are inaudible there, but a future YM2413 consumer (an
-  MSX-format crate, say) would need rhythm-mode decoded.
+  block. Round 16 wired KSR (Key Scale of RATE) per the §III-1-2
+  Table III-2 — fully spec'd, no emulator source needed — so the
+  `RATE = 4·R + Rks` widening is now bit-correct against the
+  application-manual table even though the per-RATE step magnitude
+  remains the coarse approximation. Remaining numeric DOCS-GAPs
+  (all flagged by the staging as deliberately not lifted from
+  emulator source): the §4 KSL attenuation table (needs the
+  OPLx-decapsulated independent-RE base table transcribed before
+  KSL contributes attenuation; currently 0 dB) and the §7 per-RATE
+  envelope-increment numeric arrays (the underlying per-RATE step
+  magnitude is still a `2^(rate-1)` Q16-units-per-sample monotonic
+  ladder honouring R=0 halt + RATE=63 saturating-fast semantics
+  but NOT bit-exact against the OPLx-decapsulated per-rate table;
+  KSR now widens the rate correctly into this table even though
+  the table itself is the approximation). LFO numeric step arrays
+  (§7) are the third DOCS-GAP; the test register `$0F` bits 1 + 3
+  are wired and recorded but have no audible effect until the LFO
+  lands. Rhythm-mode operator allocation (`$0E` bit 5, drum
+  channels at `$36`/`$37`/`$38`) is also out of scope — VRC7 has
+  no rhythm DAC so the drum patches in the ROM are inaudible
+  there, but a future YM2413 consumer (an MSX-format crate, say)
+  would need rhythm-mode decoded.
 * N163: round 11 added the per-channel timer accumulators. Remaining
   gap is matching the documented `f = (n * p) / (15 * 65536 * l * c)`
   output frequency in a calibration test against a known fixture (the
