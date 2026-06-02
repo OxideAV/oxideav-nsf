@@ -4,8 +4,8 @@ Pure-Rust NSF (Nintendo Sound Format) player for the
 [oxideav](https://github.com/OxideAV) framework. Clean-room from the
 public [nesdev.org wiki](https://www.nesdev.org/wiki/NSF) (mirrored
 under `docs/audio/nsf/`) plus Kevin Horton's original NSF v1.61 spec
-— no external emulator source was consulted, paraphrased, or
-cross-checked.
+— sourced exclusively from the in-tree staging under
+`docs/audio/nsf/`.
 
 Plays NSF v1, NSFe, and NSF v2 — including the NSF2 IRQ timer
 device, vector overlay, non-returning INIT, and suppressed PLAY
@@ -87,10 +87,10 @@ emitted every ~36 CPU cycles) and `Vrc7::output` reads the latched
 sinusoidal stand-in is gone. The §6 row-256 peak-amplitude
 ground-truth `[255, 180, 127, 90, 63, 45, 31, 22, 15, 11, 7, 5, 3,
 2, 1, 1]` is matched within ±1 LSB across all 16 volumes via the
-log-sin → exp pipeline. The KSL attenuation table (§4) and the
-per-rate envelope-increment numeric arrays (§7) remain documented
-DOCS-GAP followups — both are deliberately not lifted from
-emulator source per the staging's §"Provenance & non-emulator
+log-sin → exp pipeline. The KSL attenuation byte base table (§4)
+and the per-rate envelope-increment numeric arrays (§7) remain
+documented DOCS-GAP followups — both are flagged
+provenance-pending in the staging's §"Provenance & non-emulator
 sourcing" appendix, and need the OPLx-decapsulated independent-RE
 article transcribed before they can land verbatim.
 
@@ -117,8 +117,8 @@ registers, silences `latched_output`, blocks writes to `$9010` /
 
 Round 16 lands the OPLL KSR (Key Scale of RATE) pipeline per
 `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`
-§III-1-2 + Table III-2 — a fully-spec'd table that needs no
-emulator source. Each operator's KSR bit (`$00`/`$01` D4) is
+§III-1-2 + Table III-2 — a fully-spec'd table sourced directly from
+the staged application-manual mirror. Each operator's KSR bit (`$00`/`$01` D4) is
 loaded from the patch on every `OpllChannel::load_patch`, and the
 new `Envelope::update_rks(block, fnum_msb)` derives the cached
 `Rks` offset from the channel's pitch: `KSR=0` → `Rks = block >> 1`
@@ -136,6 +136,28 @@ KSR's *contribution* to the per-stage rate is now bit-correct
 against §III-1-2; the absolute per-RATE step magnitude is still
 the coarse `2^(rate-1)` Q16-units-per-sample approximation that
 remains the documented §7 DOCS-GAP followup.
+
+Round 17 lands the §4 KSL (Key Scale of LEVEL) formula scaffold per
+`docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4. Each operator's
+KSL field (`$02`/`$03` D7..D6, range 0..=3) is captured from
+`Vrc7Patch::mod_ksl` / `car_ksl` into the new
+`OpllChannel::mod_ksl` / `car_ksl` fields on every `load_patch`, and
+the §4 formula `(base[block][fnum_hi]) >> (3 - KSL)` is wired through
+both modulator and carrier paths in `OpllChannel::sample_with_test`.
+New helpers `ksl_attenuation_env_levels(block, fnum_hi, ksl)` and
+`ksl_base_attenuation(block, fnum_hi)` expose the §4 formula
+endpoints; the constant `KSL_BASE_BYTE_TABLE` holds the 16×8 byte
+base table. Per the §4 schema's explicit "block 0: 0 0 0 0 0 0 0 0"
+row, **block 0 streams are bit-exact today** — KSL contributes zero
+attenuation, identical to pre-round-17 behaviour. Blocks 1..=7 hold
+the same zero scaffold pending the §4 byte base table (currently
+flagged provenance-pending in the staging's §"Provenance & non-emulator
+sourcing" appendix), so a §4 staging landing becomes a single-cell
+edit on `KSL_BASE_BYTE_TABLE` rows 1..=7 with no call-site changes.
+The §4-byte-base-table staging is the documented next followup; once
+the base table is filled, the round-17 trip-wire test
+`channel_blocks_one_through_seven_currently_match_block_zero` will
+fail and signal the per-block first-sample validation pass.
 
 ## Round 2 scope
 
@@ -403,14 +425,15 @@ remains the documented §7 DOCS-GAP followup.
   release-rate-to-5 override, the modulator `$00.S` release-disable
   carve-out, and the `$E000` bit-6 audio reset / silence / write
   block. Round 16 wired KSR (Key Scale of RATE) per the §III-1-2
-  Table III-2 — fully spec'd, no emulator source needed — so the
-  `RATE = 4·R + Rks` widening is now bit-correct against the
-  application-manual table even though the per-RATE step magnitude
-  remains the coarse approximation. Remaining numeric DOCS-GAPs
-  (all flagged by the staging as deliberately not lifted from
-  emulator source): the §4 KSL attenuation table (needs the
-  OPLx-decapsulated independent-RE base table transcribed before
-  KSL contributes attenuation; currently 0 dB) and the §7 per-RATE
+  Table III-2 — fully spec'd from the staged application-manual
+  mirror — so the `RATE = 4·R + Rks` widening is now bit-correct
+  against the application-manual table even though the per-RATE
+  step magnitude remains the coarse approximation. Remaining numeric
+  DOCS-GAPs (all flagged provenance-pending in the staging's
+  §"Provenance & non-emulator sourcing" appendix): the §4 KSL
+  attenuation byte base table (needs the OPLx-decapsulated
+  independent-RE base table transcribed before KSL contributes
+  attenuation; currently 0 dB) and the §7 per-RATE
   envelope-increment numeric arrays (the underlying per-RATE step
   magnitude is still a `2^(rate-1)` Q16-units-per-sample monotonic
   ladder honouring R=0 halt + RATE=63 saturating-fast semantics

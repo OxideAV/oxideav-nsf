@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VRC7 OPLL §4 KSL formula scaffold + provenance scrub** (round 17):
+  the per-operator KSL field (`$02`/`$03` D7..D6, range 0..=3) is now
+  captured from `Vrc7Patch::mod_ksl` / `Vrc7Patch::car_ksl` onto
+  `OpllChannel::mod_ksl` / `OpllChannel::car_ksl` on every
+  `load_patch`, and the §4 formula `(base[block][fnum_hi]) >> (3 - KSL)`
+  is wired through `OpllChannel::sample_with_test` for both operators
+  per `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4. New public
+  helpers: `ksl_attenuation_env_levels(block, fnum_hi, ksl) -> u32`
+  (full per-operator contribution honouring the §4 `KSL=0 → no
+  contribution` carve-out and the `>> (3 - KSL)` per-octave scaling),
+  `ksl_base_attenuation(block, fnum_hi) -> u32` (table indexing with
+  the documented 3-bit-block + 4-bit-fnum_hi mask), and the constant
+  `KSL_BASE_BYTE_TABLE: [[u32; 16]; 8]`. The base byte table is the
+  §4 zero scaffold: row 0 (block 0) is bit-exact per the §4 schema's
+  explicit "block 0: 0 0 0 0 0 0 0 0" — block 0 streams therefore
+  flow through the new KSL pipeline producing the same samples as
+  pre-round-17 (zero KSL contribution), and the §4-byte-base-table
+  staging will be a single-cell edit to fill rows 1..=7 without any
+  call-site touch. The trip-wire test
+  `channel_blocks_one_through_seven_currently_match_block_zero` MUST
+  fail once a non-zero base table is staged, signalling the channel
+  pipeline path needs the per-block first-sample validation re-run.
+  + 9 new unit tests covering: §6 peak-amplitude monotonicity across
+  the full row (each volume's max amplitude ≤ the previous volume's),
+  the §4 KSL=0 carve-out across all 128 (block, fnum_hi) cells, the
+  §4 block-0-is-bit-exact-zero rule across all 64 (fnum_hi, KSL)
+  combinations, the `(base) >> (3 - KSL)` formula arithmetic, the §4
+  base-table block-0-row-all-zero invariant, input-bit masking
+  (block masked to 3 bits, fnum_hi to 4 bits per §4 indexing), the
+  channel-level KSL field capture from the patch, the block-0 KSL=3
+  vs KSL=0 sample-equivalence (32-sample stream), and the cross-block
+  scaffold invariant. The §4 byte base table (rows 1..=7), the §7
+  per-rate envelope increment array, and the §7 AM/VIB LFO step
+  arrays remain documented DOCS-GAP followups flagged
+  provenance-pending in `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md`
+  §"Provenance & non-emulator sourcing".
+
+### Changed
+
+- **opll module + crate README provenance prose** (round 17): scrubbed
+  pre-existing enumerated denial prose in `src/opll.rs`, `README.md`,
+  and `CHANGELOG.md` to neutral provenance-pending language. The
+  staged §"Provenance & non-emulator sourcing" appendix carries the
+  actual chain-of-custody; the module / README / CHANGELOG no longer
+  enumerate non-consulted source trees.
+
 - **VRC7 OPLL KSR (Key Scale of RATE)** (round 16): the per-operator
   `KSR` bit (`$00`/`$01` D4) on every channel now amplifies the
   envelope's per-stage RATE by the pitch-derived `Rks` offset per
@@ -132,8 +178,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lookup_exp` algorithm with 1024-step phase periods and
   sign-magnitude representation. The §3 MUL multiplier table
   (`½..15`, with the documented duplicate 10/12/15 entries) and
-  the §5 FB feedback π-multiple table are transcribed verbatim from
-  `opll-ym2413-tables.md`. An `Operator` carries a 19-bit phase
+  the §5 FB feedback π-multiple table are transcribed from the §3
+  and §5 tables in `opll-ym2413-tables.md`. An `Operator` carries a 19-bit phase
   accumulator (so `(fnum << block) * MUL` divides down cleanly), a
   7-bit envelope (0..=127, +0.375 dB per step matching andete §
   "envelope levels"), and the DC/DM half-rectified-sine waveform
@@ -164,10 +210,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key-on phase reset, key-off transition to release on both
   operators, and end-to-end channel sample stream producing
   non-trivial audio after a Flute-patch key-on. The KSL
-  attenuation table (§4, requires the OPL-family base table that
-  the staging deliberately does not lift from emulator source) and
-  the per-rate envelope-increment numeric arrays (§7, same
-  provenance reason) remain documented followups; rhythm-mode
+  attenuation byte base table (§4, requires the OPL-family base
+  table that the staging flags provenance-pending) and the per-rate
+  envelope-increment numeric arrays (§7, same provenance reason)
+  remain documented followups; rhythm-mode
   drum operator allocation is also out of scope for this round.
 
 - **VRC7 patch table + per-channel patch selection** (round 13): the
