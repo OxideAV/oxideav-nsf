@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MMC5 PCM Mode / IRQ register + read-mode write-by-read** (round 18):
+  the `$5010` PCM Mode/IRQ register now decodes bit 7 (PCM IRQ enable)
+  alongside the existing bit 0 (mode select) on writes, and `$5010`
+  reads return the `(irqTrip AND irqEnable)` bit per the
+  `docs/audio/nsf/mmc5-audio-wiki.html` §"IRQ operation" pseudocode
+  while acknowledge-clearing the `irqTrip` flag. `$5011` writes in
+  write mode now honour the documented `value == 0 → irqTrip = 1,
+  DAC unchanged` side-effect (and the symmetric non-zero → DAC
+  update + irqTrip clear) instead of dropping the byte. A new
+  `Mmc5::observe_prg_read(byte)` and bus hook on the
+  `$8000..=$FFFF` read path implements the "Write-by-read writes to
+  this register in PCM read-mode" semantic from §"Raw PCM ($5011)";
+  the bus restricts the side-effect to the inclusive `$8000..=$BFFF`
+  window per §"PCM description"'s explicit `$8000-BFFF` window.
+  `Mmc5::irq_line()` exposes the `(irqTrip AND irqEnable)` cart-IRQ
+  line, `Expansion::irq_line()` ORs it into the chip-aggregate, and
+  `Apu2A03::irq_line()` ORs that into the existing frame-counter /
+  DMC sources so `NesBus::irq_line` is now a 4-way OR (frame-counter,
+  DMC, NSF2 timer, MMC5 PCM). New public surface: `Mmc5::irq_enable`,
+  `Mmc5::irq_trip`, `Mmc5::observe_prg_read`, `Mmc5::irq_line`,
+  `Expansion::irq_line`, `Expansion::observe_prg_read`,
+  `Apu2A03::observe_prg_read`; `Mmc5::read` widened to `&mut self`,
+  `Expansion::read` widened to `&mut self`, `Apu2A03::read_expansion`
+  widened to `&mut self`. 16 new unit + bus integration tests cover
+  the `$5010` write/read bit layout (including the §"MMC5A default
+  power-on read value = $01" bit-0-mirror semantic), `$5011`
+  zero / non-zero in write mode, `$5011` write inert in read mode,
+  irq-trip acknowledge-on-read, the full `(irqTrip, irqEnable)`
+  truth table, `observe_prg_read` in / out of read-mode and the
+  chip-disabled defence-in-depth gate, the bus-level routing through
+  the four-way IRQ OR, the inclusive `$8000..=$BFFF` window for
+  write-by-read, and the no-op for write-mode reads in the same
+  window.
+
 - **VRC7 OPLL §4 KSL formula scaffold + provenance scrub** (round 17):
   the per-operator KSL field (`$02`/`$03` D7..D6, range 0..=3) is now
   captured from `Vrc7Patch::mod_ksl` / `Vrc7Patch::car_ksl` onto

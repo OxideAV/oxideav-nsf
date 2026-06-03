@@ -137,6 +137,34 @@ against §III-1-2; the absolute per-RATE step magnitude is still
 the coarse `2^(rate-1)` Q16-units-per-sample approximation that
 remains the documented §7 DOCS-GAP followup.
 
+Round 18 lands the MMC5 PCM Mode / IRQ register + `$8000..=$BFFF`
+read-mode write-by-read per `docs/audio/nsf/mmc5-audio-wiki.html`
+§"PCM Mode/IRQ ($5010)" + §"Raw PCM ($5011)" + §"PCM description" +
+§"IRQ operation". `$5010` writes now decode bit 7 (PCM IRQ enable)
+alongside the existing bit 0 (mode select); `$5011` writes in write
+mode honour the documented `value == 0 → irqTrip = 1, DAC unchanged`
+side-effect (and the symmetric non-zero → DAC update + irqTrip clear)
+instead of dropping the byte; `$5010` reads return the
+`(irqTrip AND irqEnable)` bit and acknowledge-clear `irqTrip` per the
+§"IRQ operation" pseudocode. A new `Mmc5::observe_prg_read` and bus
+hook on the `$8000..=$FFFF` read path implements the
+"Write-by-read writes to this register in PCM read-mode" semantic —
+the bus restricts the side-effect to `$8000..=$BFFF` per §"PCM
+description"'s explicit window. `Mmc5::irq_line()` exposes the
+`(irqTrip AND irqEnable)` line, `Expansion::irq_line()` ORs it into
+the chip-aggregate IRQ surface, and `Apu2A03::irq_line()` ORs that
+into the existing frame-counter + DMC sources so the bus's single
+`NesBus::irq_line` is now a 4-way OR (frame / DMC / NSF2 timer /
+MMC5 PCM). 16 new unit + bus integration tests cover the `$5010`
+write/read bit layout (including the §"MMC5A default power-on read
+value = $01" bit-0-mirror semantic), `$5011` zero / non-zero in
+write mode, `$5011` write inert in read mode, irq-trip
+acknowledge-on-read, the full `(irqTrip, irqEnable)` truth table,
+`observe_prg_read` in / out of read-mode and the chip-disabled
+defence-in-depth gate, the bus-level routing through the four-way
+IRQ OR, the inclusive `$8000..=$BFFF` window for write-by-read, and
+the no-op for write-mode reads in the same window.
+
 Round 17 lands the §4 KSL (Key Scale of LEVEL) formula scaffold per
 `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4. Each operator's
 KSL field (`$02`/`$03` D7..D6, range 0..=3) is captured from
@@ -460,8 +488,18 @@ fail and signal the per-block first-sample validation pass.
   cycle-exact envelope timer phase on register-write resets (the timers
   are stepped in CPU-cycle batches, so a sub-tick write-reset lands on a
   batch boundary rather than the exact write cycle).
-* MMC5 PCM: round 4 leaves the channel decoded at register-level only;
-  needs a software-mode timer + read-mode wiring.
+* MMC5 PCM: round 4 decoded the channel at register-level only; round
+  18 wired the `$5010` PCM Mode/IRQ register (IRQ enable + mode
+  select), the `$5011` zero-write IRQ-trip side effect, the `$5010`
+  acknowledge-on-read semantics, and the `$8000..=$BFFF` read-mode
+  write-by-read DAC update path per
+  `docs/audio/nsf/mmc5-audio-wiki.html` §"PCM Mode/IRQ ($5010)" +
+  §"Raw PCM ($5011)" + §"PCM description" + §"IRQ operation". The
+  PCM IRQ line is now ORed into `NesBus::irq_line` alongside the
+  existing frame-counter / DMC / NSF2-timer sources. A purely
+  software-driven PCM streaming consumer (using $5010 IRQ + the
+  $00-terminator pattern from §"PCM description") is now fully
+  spec-compliant.
 * RIFF-NSF container variant.
 * `oxideav-source` magic-detection registration so the framework
   auto-dispatches `*.nsf` and `*.nsfe` URIs.

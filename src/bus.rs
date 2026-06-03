@@ -421,11 +421,22 @@ impl NesBus {
                 self.vector_overlay[(addr - 0xFFFA) as usize]
             }
             0x8000..=0xFFFF => {
-                if self.bankswitched {
+                let byte = if self.bankswitched {
                     self.bank_read(addr)
                 } else {
                     self.prg[(addr - 0x8000) as usize]
-                }
+                };
+                // `docs/audio/nsf/mmc5-audio-wiki.html` §"Raw PCM ($5011)":
+                // when MMC5 is enabled and in PCM read-mode, a CPU read
+                // from `$8000..=$BFFF` "writes-by-read" the observed
+                // byte into the MMC5 DAC update path (a `$00` byte
+                // sets irqTrip instead of changing the DAC; non-zero
+                // updates the DAC and clears irqTrip). The router is
+                // a no-op outside that window and when read-mode is
+                // off, and runs after the byte has been resolved so
+                // the DAC sees the same byte the CPU observed.
+                self.apu.observe_prg_read(addr, byte);
+                byte
             }
         }
     }
@@ -696,5 +707,110 @@ mod tests {
         assert_eq!(bus.read(0x0810), 0x42);
         assert_eq!(bus.read(0x1010), 0x42);
         assert_eq!(bus.read(0x1810), 0x42);
+    }
+
+    // -------- Round 18: MMC5 PCM IRQ + read-mode write-by-read --------
+    //
+    // Spec source: `docs/audio/nsf/mmc5-audio-wiki.html`
+    // §"PCM Mode/IRQ ($5010)" + §"Raw PCM ($5011)" + §"PCM description"
+    // + §"IRQ operation".
+
+    fn mmc5_header_with_program(prog: Vec<u8>) -> NsfHeader {
+        let mut h = fake_header(0x8000, prog, [0u8; 8]);
+        // §"Expansion bits" in `docs/audio/nsf/nsfspec-kevtris-v1.61.txt`:
+        // bit 3 (0x08) selects MMC5.
+        h.expansion = ExpansionChips(0x08);
+        h
+    }
+
+    #[test]
+    fn bus_routes_mmc5_pcm_irq_into_cpu_irq_line() {
+        // §"IRQ operation" final line `Cart IRQ line = (irqTrip AND
+        // irqEnable)` — verifies the chain
+        // Mmc5 -> Expansion::irq_line -> Apu2A03::irq_line ->
+        // NesBus::irq_line.
+        let mut bus = NesBus::new();
+        let h = mmc5_header_with_program(vec![0x60]);
+        bus.configure_from_header(&h);
+        assert!(!bus.irq_line());
+        // Enable PCM IRQ and trip it.
+        bus.write(0x5010, 0x80); // I=1, M=0
+        bus.write(0x5011, 0x00); // trip
+        assert!(
+            bus.irq_line(),
+            "MMC5 PCM trip + enable must surface on the bus IRQ line"
+        );
+        // Acknowledge via $5010 read.
+        let v = bus.read(0x5010);
+        assert_eq!(v & 0x80, 0x80, "ack read returns the IRQ status bit");
+        assert!(!bus.irq_line(), "$5010 read clears the trip");
+    }
+
+    #[test]
+    fn bus_8000_bfff_read_in_read_mode_writes_dac_via_observe() {
+        // §"PCM description": "MMC5's DAC is changed either by
+        // writing a value to $5011 (in write mode) or reading a value
+        // from $8000-BFFF (in read mode)." A flat-load NSF with a
+        // $42 byte at $8000 must update the DAC when the CPU reads
+        // it under MMC5 PCM read-mode.
+        let mut bus = NesBus::new();
+        // Two distinct non-zero bytes so we can show the DAC follows.
+        let h = mmc5_header_with_program(vec![0x42, 0x88, 0x00, 0x55]);
+        bus.configure_from_header(&h);
+        bus.write(0x5010, 0x81); // I=1, M=1 (read mode + IRQ enable)
+        assert_eq!(bus.read(0x8000), 0x42);
+        // The DAC must have followed.
+        assert_eq!(bus.apu.expansion.mmc5.pcm, 0x42);
+        // A second read updates the DAC again.
+        assert_eq!(bus.read(0x8001), 0x88);
+        assert_eq!(bus.apu.expansion.mmc5.pcm, 0x88);
+        // A read of a $00 byte trips the IRQ without changing the DAC.
+        assert!(!bus.apu.expansion.mmc5.irq_trip);
+        assert_eq!(bus.read(0x8002), 0x00);
+        assert_eq!(
+            bus.apu.expansion.mmc5.pcm, 0x88,
+            "DAC stays put on $00 byte"
+        );
+        assert!(bus.apu.expansion.mmc5.irq_trip);
+        assert!(bus.irq_line(), "trip propagates to the bus IRQ line");
+        // A subsequent non-zero byte clears the trip.
+        assert_eq!(bus.read(0x8003), 0x55);
+        assert!(!bus.apu.expansion.mmc5.irq_trip);
+    }
+
+    #[test]
+    fn bus_c000_to_ffff_read_does_not_touch_dac() {
+        // §"PCM description" window stops at $BFFF. A read on
+        // $C000..=$FFFF must not update the MMC5 DAC even in read
+        // mode — the wiki window is exclusive of the upper half of
+        // PRG ROM.
+        let mut bus = NesBus::new();
+        // Fill PRG so $C000 (offset 0x4000) holds a known byte.
+        let mut prog = vec![0u8; PRG_ROM_SIZE];
+        prog[0x4000] = 0xAB;
+        let h = mmc5_header_with_program(prog);
+        bus.configure_from_header(&h);
+        bus.write(0x5010, 0x01); // read mode
+        assert_eq!(bus.read(0xC000), 0xAB);
+        assert_eq!(
+            bus.apu.expansion.mmc5.pcm, 0x00,
+            "$C000 read must NOT trigger write-by-read"
+        );
+    }
+
+    #[test]
+    fn bus_8000_read_in_write_mode_does_not_touch_dac() {
+        // The wiki gates write-by-read on PCM read-mode being active.
+        // Verify the bus respects that gate: write mode + a non-zero
+        // ROM byte must leave the DAC at its prior value.
+        let mut bus = NesBus::new();
+        let h = mmc5_header_with_program(vec![0x77]);
+        bus.configure_from_header(&h);
+        bus.write(0x5010, 0x80); // I=1, M=0 (write mode)
+        assert_eq!(bus.read(0x8000), 0x77);
+        assert_eq!(
+            bus.apu.expansion.mmc5.pcm, 0x00,
+            "write-mode reads must not update the DAC"
+        );
     }
 }

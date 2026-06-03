@@ -724,8 +724,16 @@ impl Apu2A03 {
         self.expansion.write(addr, value);
     }
 
-    pub fn read_expansion(&self, addr: u16) -> u8 {
+    pub fn read_expansion(&mut self, addr: u16) -> u8 {
         self.expansion.read(addr)
+    }
+
+    /// Bus hook for `$8000..=$BFFF` reads — routed through to the
+    /// expansion router so chips like MMC5 can implement the
+    /// "Write-by-read writes to this register in PCM read-mode"
+    /// semantic (`docs/audio/nsf/mmc5-audio-wiki.html` §"Raw PCM").
+    pub fn observe_prg_read(&mut self, addr: u16, byte: u8) {
+        self.expansion.observe_prg_read(addr, byte);
     }
 
     /// Bus pulls this every tick to see if a DMC sample byte is needed.
@@ -816,11 +824,14 @@ impl Apu2A03 {
     }
 
     /// True iff the APU is currently asserting the CPU's IRQ line.
-    /// Two sources: the frame-counter (clocked from `$4017`'s
-    /// inhibit bit + 4-step mode) and the DMC (end-of-sample +
-    /// `$4010` bit 7 set).
+    /// Three sources: the frame-counter (clocked from `$4017`'s
+    /// inhibit bit + 4-step mode), the DMC (end-of-sample +
+    /// `$4010` bit 7 set), and the MMC5 PCM IRQ line wired through
+    /// the expansion router per `docs/audio/nsf/mmc5-audio-wiki.html`
+    /// §"IRQ operation" (round 18). The non-MMC5 expansion chips
+    /// have no IRQ source.
     pub fn irq_line(&self) -> bool {
-        self.frame_irq_flag || self.dmc.irq_flag
+        self.frame_irq_flag || self.dmc.irq_flag || self.expansion.irq_line()
     }
 
     /// `$4017` write — frame-counter mode + IRQ inhibit.

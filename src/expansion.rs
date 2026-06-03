@@ -188,6 +188,29 @@ impl Vrc6 {
 /// MMC5 audio has 2 pulses (almost identical to 2A03 pulses but no
 /// sweep) at `$5000..=$5007` plus a raw 8-bit PCM channel at `$5011`
 /// and a status register at `$5015`.
+///
+/// Round 18 wires the `$5010` PCM Mode / IRQ register per
+/// `docs/audio/nsf/mmc5-audio-wiki.html` §"PCM Mode/IRQ ($5010)" +
+/// §"PCM description" + §"IRQ operation":
+///
+/// * `$5010` write: bit 7 = PCM IRQ enable, bit 0 = mode select
+///   (0 = write mode, 1 = read mode).
+/// * `$5010` read: bit 7 = (irq_trip AND irq_enable); reading
+///   acknowledges and clears irq_trip. Bit 0 mirrors the configured
+///   mode bit (the wiki notes only the MMC5A revision implements a
+///   `$5010.0` read bit and its function is undocumented; the
+///   `MMC5A default power-on read value = $01` note is captured by
+///   resetting `pcm_read_mode = false` and OR-ing bit 0 from the
+///   current mode write — read mode therefore reads back `1`).
+/// * `$5011` write in write mode: if value=0 → DAC unchanged,
+///   irq_trip=1; else DAC=value, irq_trip=0. Write in read mode is
+///   ignored from the CPU side; the same DAC update path runs from
+///   `Mmc5::observe_prg_read` whenever the bus reads `$8000..=$BFFF`
+///   while read mode is active (the "Write-by-read writes to this
+///   register in PCM read-mode" semantic from §"Raw PCM ($5011)").
+/// * `Mmc5::irq_line()` exposes `(irq_trip AND irq_enable)` so the
+///   bus can OR it into the CPU's IRQ line alongside the APU
+///   frame-counter / DMC / NSF2 timer sources.
 #[derive(Default)]
 pub struct Mmc5 {
     pub enabled: bool,
@@ -195,6 +218,13 @@ pub struct Mmc5 {
     pub pcm: u8,
     pub pcm_read_mode: bool,
     pub status: u8,
+    /// `$5010` bit 7 — PCM IRQ enable.
+    pub irq_enable: bool,
+    /// Internal "DAC saw a zero-byte write" flag. Set whenever the
+    /// active DAC update path (CPU `$5011` write in write mode, or
+    /// `$8000..=$BFFF` read in read mode) sees a `$00` byte; cleared
+    /// on any non-zero DAC update or a `$5010` read.
+    pub irq_trip: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -255,10 +285,16 @@ impl Mmc5 {
                 self.pulse[1].step = 0;
             }
             0x5010 => {
+                // §"PCM Mode/IRQ ($5010)" — write:
+                //   Ixxx xxxM, I = IRQ enable, M = mode (0 write, 1 read).
+                self.irq_enable = value & 0x80 != 0;
                 self.pcm_read_mode = value & 0x01 != 0;
             }
             0x5011 if !self.pcm_read_mode => {
-                self.pcm = value;
+                // §"Raw PCM ($5011)" + §"IRQ operation":
+                //   value == 0 → irqTrip = 1, DAC unchanged;
+                //   value != 0 → irqTrip = 0, DAC = value.
+                self.dac_update_from_pcm_byte(value);
             }
             0x5015 => {
                 self.status = value;
@@ -269,8 +305,28 @@ impl Mmc5 {
         }
     }
 
-    pub fn read(&self, addr: u16) -> u8 {
+    pub fn read(&mut self, addr: u16) -> u8 {
         match addr {
+            0x5010 => {
+                // §"PCM Mode/IRQ ($5010)" — read:
+                //   bit 7 = (irqTrip AND irqEnable); the read also
+                //   clears irqTrip per §"IRQ operation" pseudocode.
+                //   bit 0 is the documented MMC5A-only "unknown"
+                //   readback; we mirror the configured mode bit so
+                //   software polling `$5010.0` after a mode write
+                //   observes its own write back (the wiki's
+                //   "MMC5A default power-on read value = $01" note
+                //   matches read-mode=true → bit 0 = 1 here).
+                let mut s = 0u8;
+                if self.irq_trip && self.irq_enable {
+                    s |= 0x80;
+                }
+                if self.pcm_read_mode {
+                    s |= 0x01;
+                }
+                self.irq_trip = false;
+                s
+            }
             0x5015 => {
                 let mut s = 0u8;
                 if self.pulse[0].length > 0 {
@@ -283,6 +339,43 @@ impl Mmc5 {
             }
             _ => 0xFF,
         }
+    }
+
+    /// Apply a DAC-update byte coming from either a write-mode CPU
+    /// write to `$5011` or a read-mode write-by-read on
+    /// `$8000..=$BFFF` per `docs/audio/nsf/mmc5-audio-wiki.html`
+    /// §"IRQ operation" pseudocode.
+    fn dac_update_from_pcm_byte(&mut self, value: u8) {
+        if value == 0 {
+            // §"Raw PCM ($5011)": "Writing $00 to this register will
+            // have no effect on the output sound, and does not change
+            // the PCM counter." + §"PCM description": "If you try to
+            // assign a value of $00, the DAC is not changed; an IRQ
+            // is generated instead."
+            self.irq_trip = true;
+        } else {
+            self.pcm = value;
+            self.irq_trip = false;
+        }
+    }
+
+    /// Bus hook for `$8000..=$BFFF` reads while PCM read-mode is
+    /// active — the wiki's §"Raw PCM ($5011)" "Write-by-read writes
+    /// to this register in PCM read-mode" semantic. Called by
+    /// `NesBus::read` after the byte has been fetched from PRG ROM
+    /// / bank-pool, so the DAC sees the actual byte the CPU
+    /// observed. No-op outside read mode.
+    pub fn observe_prg_read(&mut self, byte: u8) {
+        if !self.enabled || !self.pcm_read_mode {
+            return;
+        }
+        self.dac_update_from_pcm_byte(byte);
+    }
+
+    /// CPU IRQ line contribution per §"IRQ operation" final line —
+    /// `Cart IRQ line = (irqTrip AND irqEnable)`.
+    pub fn irq_line(&self) -> bool {
+        self.irq_trip && self.irq_enable
     }
 
     pub fn tick(&mut self, cycles: u32) {
@@ -2026,7 +2119,7 @@ impl Expansion {
         }
     }
 
-    pub fn read(&self, addr: u16) -> u8 {
+    pub fn read(&mut self, addr: u16) -> u8 {
         if self.mmc5.enabled {
             let v = self.mmc5.read(addr);
             if v != 0xFF {
@@ -2046,6 +2139,26 @@ impl Expansion {
             }
         }
         0xFF
+    }
+
+    /// True iff any enabled expansion chip is currently asserting its
+    /// own IRQ line. Round 18 wires the MMC5 PCM IRQ source per
+    /// `docs/audio/nsf/mmc5-audio-wiki.html` §"IRQ operation"; the
+    /// other expansion chips do not raise CPU IRQs.
+    pub fn irq_line(&self) -> bool {
+        self.mmc5.enabled && self.mmc5.irq_line()
+    }
+
+    /// Bus hook for CPU reads on `$8000..=$BFFF`. When the MMC5 is
+    /// enabled and in PCM read-mode, the byte the CPU just observed
+    /// is also routed into the MMC5 DAC update path per the
+    /// "Write-by-read writes to this register in PCM read-mode"
+    /// note in the MMC5-audio wiki §"Raw PCM ($5011)". No-op
+    /// otherwise.
+    pub fn observe_prg_read(&mut self, addr: u16, byte: u8) {
+        if (0x8000..=0xBFFF).contains(&addr) {
+            self.mmc5.observe_prg_read(byte);
+        }
     }
 
     pub fn output(&self) -> f32 {
@@ -2122,6 +2235,220 @@ mod tests {
         chip.write(0x5003, 0x08); // pulse 0 length set
         let s = chip.read(0x5015);
         assert_eq!(s & 0x03, 0x01);
+    }
+
+    // ---------------- Round 18: MMC5 PCM IRQ + read-mode tests ----------------
+    //
+    // Spec source: `docs/audio/nsf/mmc5-audio-wiki.html`
+    //   §"PCM Mode/IRQ ($5010)"  — write/read bit layout.
+    //   §"Raw PCM ($5011)"       — write-only + write-by-read.
+    //   §"PCM description"       — DAC update + $00 → IRQ side effect.
+    //   §"IRQ operation"         — pseudocode for irqTrip / irqEnable.
+
+    #[test]
+    fn mmc5_5010_write_decodes_irq_enable_and_mode_bits() {
+        // §"PCM Mode/IRQ ($5010)" write layout: Ixxx xxxM.
+        let mut chip = Mmc5::new();
+        chip.write(0x5010, 0x80); // I=1, M=0
+        assert!(chip.irq_enable);
+        assert!(!chip.pcm_read_mode);
+        chip.write(0x5010, 0x01); // I=0, M=1
+        assert!(!chip.irq_enable);
+        assert!(chip.pcm_read_mode);
+        chip.write(0x5010, 0x81); // both set
+        assert!(chip.irq_enable);
+        assert!(chip.pcm_read_mode);
+    }
+
+    #[test]
+    fn mmc5_5011_zero_write_sets_irq_trip_without_changing_dac() {
+        // §"Raw PCM ($5011)": "Writing $00 to this register will have
+        // no effect on the output sound, and does not change the PCM
+        // counter." §"PCM description": "If you try to assign a value
+        // of $00, the DAC is not changed; an IRQ is generated instead."
+        let mut chip = Mmc5::new();
+        chip.write(0x5011, 0xC0); // seed DAC.
+        assert_eq!(chip.pcm, 0xC0);
+        assert!(!chip.irq_trip);
+        chip.write(0x5011, 0x00); // zero write → trip.
+        assert_eq!(chip.pcm, 0xC0, "DAC must NOT change on $00 write");
+        assert!(chip.irq_trip);
+    }
+
+    #[test]
+    fn mmc5_5011_nonzero_write_updates_dac_and_clears_irq_trip() {
+        // §"IRQ operation" pseudocode: non-zero write → irqTrip = 0,
+        // DAC = value.
+        let mut chip = Mmc5::new();
+        chip.write(0x5011, 0x00); // arm trip first.
+        assert!(chip.irq_trip);
+        chip.write(0x5011, 0x7F);
+        assert_eq!(chip.pcm, 0x7F);
+        assert!(!chip.irq_trip);
+    }
+
+    #[test]
+    fn mmc5_5011_write_ignored_in_read_mode() {
+        // §"Raw PCM ($5011)": "Write-by-read writes to this register
+        // in PCM read-mode" — i.e. the CPU's direct $5011 write path
+        // is inert; updates only arrive via observe_prg_read.
+        let mut chip = Mmc5::new();
+        chip.write(0x5010, 0x01); // read mode on.
+        chip.write(0x5011, 0x55);
+        assert_eq!(chip.pcm, 0x00, "$5011 write must be ignored in read mode");
+        assert!(
+            !chip.irq_trip,
+            "and must not trip the IRQ either (the wiki's write path is gated on !read_mode)"
+        );
+    }
+
+    #[test]
+    fn mmc5_5010_read_returns_irq_status_and_clears_trip() {
+        // §"IRQ operation" pseudocode (on $5010 read):
+        //   value.bit7 = (irqTrip AND irqEnable);
+        //   irqTrip = 0;
+        let mut chip = Mmc5::new();
+        chip.write(0x5010, 0x80); // enable IRQ.
+        chip.write(0x5011, 0x00); // trip.
+        assert!(chip.irq_trip);
+        let v = chip.read(0x5010);
+        assert_eq!(v & 0x80, 0x80, "bit 7 reads back the asserted IRQ");
+        assert!(
+            !chip.irq_trip,
+            "read of $5010 acknowledges + clears the trip"
+        );
+        // A second read with no new trip reads back 0.
+        let v2 = chip.read(0x5010);
+        assert_eq!(v2 & 0x80, 0x00);
+    }
+
+    #[test]
+    fn mmc5_5010_read_masks_with_irq_enable() {
+        // §"IRQ operation": value.bit7 = (irqTrip AND irqEnable).
+        // A trip without an enabled IRQ reads back zero (and the
+        // cleared-on-read semantics still apply).
+        let mut chip = Mmc5::new();
+        chip.write(0x5010, 0x00); // I=0, M=0
+        chip.write(0x5011, 0x00); // trip.
+        let v = chip.read(0x5010);
+        assert_eq!(
+            v & 0x80,
+            0x00,
+            "disabled IRQ must not surface in the readback"
+        );
+        assert!(!chip.irq_trip, "read still acknowledges + clears the trip");
+    }
+
+    #[test]
+    fn mmc5_5010_read_mirrors_mode_bit() {
+        // §"PCM Mode/IRQ ($5010)" read note + MMC5A default power-on
+        // read value = $01 — read mode reads back bit 0 = 1.
+        let mut chip = Mmc5::new();
+        chip.write(0x5010, 0x01); // read mode.
+        assert_eq!(chip.read(0x5010) & 0x01, 0x01);
+        chip.write(0x5010, 0x00); // write mode.
+        assert_eq!(chip.read(0x5010) & 0x01, 0x00);
+    }
+
+    #[test]
+    fn mmc5_irq_line_tracks_trip_and_enable() {
+        // §"IRQ operation" final line: Cart IRQ line = (irqTrip AND
+        // irqEnable). Validates `Mmc5::irq_line()` against the four
+        // truth-table cells.
+        let mut chip = Mmc5::new();
+        assert!(!chip.irq_line());
+        chip.write(0x5011, 0x00); // trip, but I=0
+        assert!(!chip.irq_line());
+        chip.write(0x5010, 0x80); // enable IRQ
+        assert!(chip.irq_line());
+        let _ = chip.read(0x5010); // ack
+        assert!(!chip.irq_line());
+        // Drop enable while a trip is pending — line must drop too.
+        chip.write(0x5011, 0x00);
+        assert!(chip.irq_line());
+        chip.write(0x5010, 0x00); // disable IRQ (I=0)
+        assert!(!chip.irq_line());
+    }
+
+    #[test]
+    fn mmc5_observe_prg_read_updates_dac_in_read_mode_only() {
+        // §"Raw PCM ($5011)": "Write-by-read writes to this register
+        // in PCM read-mode" — the bus's `$8000..=$BFFF` read path is
+        // routed through `observe_prg_read`. Outside read-mode it's
+        // inert; inside read-mode it updates the DAC + clears trip on
+        // non-zero, sets trip on zero.
+        let mut chip = Mmc5::new();
+        chip.enabled = true;
+        // Write mode: observe_prg_read is a no-op.
+        chip.observe_prg_read(0x42);
+        assert_eq!(chip.pcm, 0x00);
+        assert!(!chip.irq_trip);
+        // Read mode + non-zero → DAC updates, trip stays clear.
+        chip.write(0x5010, 0x01);
+        chip.observe_prg_read(0x42);
+        assert_eq!(chip.pcm, 0x42);
+        assert!(!chip.irq_trip);
+        // Read mode + zero → trip set, DAC unchanged.
+        chip.observe_prg_read(0x00);
+        assert_eq!(chip.pcm, 0x42, "DAC must NOT change on $00 byte");
+        assert!(chip.irq_trip);
+        // A subsequent non-zero byte clears trip and updates DAC.
+        chip.observe_prg_read(0x80);
+        assert_eq!(chip.pcm, 0x80);
+        assert!(!chip.irq_trip);
+    }
+
+    #[test]
+    fn mmc5_observe_prg_read_inert_when_chip_disabled() {
+        // The bus only routes the write-by-read when MMC5 is enabled
+        // in the expansion mask; `Mmc5::observe_prg_read` guards on
+        // its own `enabled` flag as defence-in-depth.
+        let mut chip = Mmc5::new();
+        chip.enabled = false;
+        chip.write(0x5010, 0x01); // read mode
+        chip.observe_prg_read(0x42);
+        assert_eq!(chip.pcm, 0x00);
+        assert!(!chip.irq_trip);
+    }
+
+    #[test]
+    fn expansion_irq_line_surfaces_mmc5_pcm_irq() {
+        // `Expansion::irq_line()` must OR the MMC5 PCM IRQ line into
+        // the bus's view per §"IRQ operation" — without it the APU's
+        // own irq_line() would never see the MMC5 contribution.
+        let mut ex = Expansion::new();
+        // bit 3 (0x08) = MMC5 per Kevtris v1.61 spec §expansion bits.
+        ex.set_flags(crate::header::ExpansionChips(0x08));
+        assert!(ex.mmc5.enabled);
+        assert!(!ex.irq_line());
+        // Enable IRQ + trip via $5010 + $5011.
+        ex.write(0x5010, 0x80);
+        ex.write(0x5011, 0x00);
+        assert!(ex.irq_line());
+        // Ack via $5010 read.
+        let _ = ex.read(0x5010);
+        assert!(!ex.irq_line());
+    }
+
+    #[test]
+    fn expansion_observe_prg_read_window_is_8000_to_bfff() {
+        // §"PCM description": "MMC5's DAC is changed either by
+        // writing a value to $5011 (in write mode) or reading a value
+        // from $8000-BFFF (in read mode)." The bus's hook must
+        // restrict the side effect to that window — reads of
+        // $C000..=$FFFF are also PRG-ROM reads, but the wiki window
+        // stops at $BFFF.
+        let mut ex = Expansion::new();
+        ex.set_flags(crate::header::ExpansionChips(0x08));
+        ex.write(0x5010, 0x01); // read mode
+        ex.observe_prg_read(0xC000, 0x55); // outside window → no DAC change
+        assert_eq!(ex.mmc5.pcm, 0x00);
+        ex.observe_prg_read(0x8000, 0x77); // start of window
+        assert_eq!(ex.mmc5.pcm, 0x77);
+        ex.observe_prg_read(0xBFFF, 0x33); // end of window inclusive
+        assert_eq!(ex.mmc5.pcm, 0x33);
+        ex.observe_prg_read(0xC000, 0x11); // just outside
+        assert_eq!(ex.mmc5.pcm, 0x33);
     }
 
     #[test]
