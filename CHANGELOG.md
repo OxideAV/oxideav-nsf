@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OPLL §4 KSL byte base table — Yamaha YM2413 Application Manual
+  Table III-5** (round 228): the §4 KSL attenuation byte base table,
+  previously a zero scaffold for blocks 1..=7, is now sourced from
+  the staged vendor application manual at
+  `docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` page 11
+  (Table III-5 "Attenuation at each F-Number at 3 dB/OCT"; matching
+  HTML transcription `ym2413-application-manual-smspower.html`
+  modulo two PDF→HTML typos at `2.625`/`14.625` — the PDF is the
+  authoritative source). The 8×16 manual matrix is staged as
+  `opll::KSL_BASE_BYTE_TABLE` with each dB entry scaled by `16/3`
+  so the §4 right-shift `(base) >> (3 - KSL)` recovers env-level
+  units (8 levels = 3 dB per the §6 / andete envelope-level
+  relation) directly at KSL=2 — the manual's tabulated 3 dB/OCT
+  rate. KSL=1 (`>> 2`) matches the manual's "Half of the above
+  data at 1.5 dB/oct" note; KSL=3 (`>> 0`) matches "Double of the
+  above at 6 dB/oct". The §4 formula plumbing already lit up in
+  round 17 (`OpllChannel::sample_with_test`,
+  `ksl_attenuation_env_levels`) consumes the filled table without
+  any call-site changes. Round 17's "block 0 row bit-exact /
+  blocks 1..=7 zero scaffold" carve-out is now obsolete: all 128
+  cells are bit-correct against the manual. 4 new unit tests
+  cover Table III-5 row entries at six spot-check (block, fnum_hi)
+  cells, the manual's 3 dB/oct block-doubling property across all
+  8 OCT rows at F-Num=15, the §4 right-shift formula at the
+  non-zero block-7 corner (`KSL=3 → 112`, `KSL=2 → 56`,
+  `KSL=1 → 28`, `KSL=0 → 0`), and a channel-pipeline KSL=3 vs
+  KSL=0 attenuation contrast at block=5 / fnum_hi=15 that pins
+  the post-Table-III-5 audio difference. Round 17's
+  `channel_blocks_one_through_seven_currently_match_block_zero`
+  scaffold trip-wire is REPLACED by
+  `channel_ksl_high_attenuates_versus_ksl_zero`.
+
+  Followup (docs collaborator): the staging
+  `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4 prose
+  still describes the KSL byte table as "intentionally NOT
+  reproduced verbatim here" and points at the OPLx-decapsulated
+  independent-RE article — predating this round's observation that
+  Table III-5 in the staged Yamaha application manual already
+  tabulates the per-(OCT, F-Number) attenuation in dB units. A docs
+  update to point §4 at Table III-5 directly would tighten the
+  staging's own paper trail.
+
 - **VRC6 sawtooth 14-step cycle + E-clear accumulator zero** (round 223):
   the §"Sawtooth Channel" 14-clock cycle in
   `docs/audio/nsf/vrc6-audio-wiki.html` is now matched bit-for-bit

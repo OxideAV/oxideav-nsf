@@ -87,12 +87,17 @@ emitted every ~36 CPU cycles) and `Vrc7::output` reads the latched
 sinusoidal stand-in is gone. The §6 row-256 peak-amplitude
 ground-truth `[255, 180, 127, 90, 63, 45, 31, 22, 15, 11, 7, 5, 3,
 2, 1, 1]` is matched within ±1 LSB across all 16 volumes via the
-log-sin → exp pipeline. The KSL attenuation byte base table (§4)
-and the per-rate envelope-increment numeric arrays (§7) remain
-documented DOCS-GAP followups — both are flagged
-provenance-pending in the staging's §"Provenance & non-emulator
-sourcing" appendix, and need the OPLx-decapsulated independent-RE
-article transcribed before they can land verbatim.
+log-sin → exp pipeline. The §4 KSL attenuation byte base table
+LANDED round 228 from Yamaha YM2413 Application Manual **Table
+III-5 "Attenuation at each F-Number at 3 dB/OCT"**
+(`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` p. 11).
+The §7 per-RATE envelope-increment numeric arrays and the §7
+AM/VIB LFO step arrays remain documented DOCS-GAP followups —
+both are flagged provenance-pending in the staging's §"Provenance
+& non-emulator sourcing" appendix, and need the application
+manual's scanned timing diagrams transcribed (or the
+OPLx-decapsulated independent-RE article cited) before they can
+land verbatim.
 
 Round 15 lands four VRC7 register-level semantics that are fully
 spec'd in `docs/audio/nsf/vrc7-audio-wiki.html` (no numeric tables
@@ -186,6 +191,34 @@ divider-preservation, the §"Output" 5-bit DAC mapping
 field's `..AA AAAA` 6-bit masking, the re-enable phase reset, the
 §"Frequency Control ($9003)" halt-overrides-everything rule, and
 the disabled-tick holds-zero invariant.
+
+Round 228 fills the §4 KSL byte base table from
+**Yamaha YM2413 Application Manual Table III-5 "Attenuation at
+each F-Number at 3 dB/OCT"**
+(`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` p. 11;
+also `ym2413-application-manual-smspower.html`'s HTML
+transcription, modulo two PDF→HTML typos at `2.625`/`14.625` —
+the PDF is authoritative). The 8×16 manual matrix is staged as
+`KSL_BASE_BYTE_TABLE`, with each dB entry scaled by `16/3` so the
+§4 right-shift `(base) >> (3 - KSL)` recovers env-level units
+(8 levels = 3 dB) directly at KSL=2 — the manual's tabulated
+3 dB/OCT rate. KSL=1 (`>> 2`) matches the manual's "Half of the
+above data at 1.5 dB/oct" note; KSL=3 (`>> 0`) matches "Double
+of the above at 6 dB/oct". Round 17's "block 0 row bit-exact /
+blocks 1..=7 zero scaffold" carve-out is now obsolete: all 128
+cells are bit-correct against the manual. The round-17 trip-wire
+test `channel_blocks_one_through_seven_currently_match_block_zero`
+is replaced by `channel_ksl_high_attenuates_versus_ksl_zero`,
+which pins the post-Table-III-5 invariant (same patch + block +
+fnum: KSL=3 carrier peak < KSL=0 peak). 4 new helper tests
+spot-check Table III-5 row entries (`row 7 F-Num 15 = 21.000 dB`,
+`row 1 F-Num 9 = 0.750 dB`, `row 3 F-Num 8 = 6.000 dB`,
+`row 5 F-Num 4 = 9.000 dB`, `row 2 F-Num 7 = 2.625 dB`,
+`row 6 F-Num 7 = 14.625 dB`), assert the manual's
+"3 dB/oct doubling between blocks" property at column F-Num=15
+across all 8 OCT rows, and exercise the §4 right-shift at the
+non-zero block-7 corner (`KSL=3 → 112`, `KSL=2 → 56`,
+`KSL=1 → 28`, `KSL=0 → 0`).
 
 Round 17 lands the §4 KSL (Key Scale of LEVEL) formula scaffold per
 `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4. Each operator's
@@ -478,19 +511,17 @@ fail and signal the per-block first-sample validation pass.
   Table III-2 — fully spec'd from the staged application-manual
   mirror — so the `RATE = 4·R + Rks` widening is now bit-correct
   against the application-manual table even though the per-RATE
-  step magnitude remains the coarse approximation. Remaining numeric
-  DOCS-GAPs (all flagged provenance-pending in the staging's
-  §"Provenance & non-emulator sourcing" appendix): the §4 KSL
-  attenuation byte base table (needs the OPLx-decapsulated
-  independent-RE base table transcribed before KSL contributes
-  attenuation; currently 0 dB) and the §7 per-RATE
-  envelope-increment numeric arrays (the underlying per-RATE step
-  magnitude is still a `2^(rate-1)` Q16-units-per-sample monotonic
-  ladder honouring R=0 halt + RATE=63 saturating-fast semantics
-  but NOT bit-exact against the OPLx-decapsulated per-rate table;
-  KSR now widens the rate correctly into this table even though
-  the table itself is the approximation). LFO numeric step arrays
-  (§7) are the third DOCS-GAP; the test register `$0F` bits 1 + 3
+  step magnitude remains the coarse approximation. Round 228 filled
+  the §4 KSL attenuation byte base table from the application
+  manual's Table III-5. Remaining numeric DOCS-GAPs (flagged
+  provenance-pending in the staging's §"Provenance & non-emulator
+  sourcing" appendix): the §7 per-RATE envelope-increment numeric
+  arrays (the underlying per-RATE step magnitude is still a
+  `2^(rate-1)` Q16-units-per-sample monotonic ladder honouring
+  R=0 halt + RATE=63 saturating-fast semantics; KSR widens the
+  rate correctly into this table even though the table itself is
+  the approximation), and the §7 LFO numeric step arrays for AM
+  (tremolo) + VIB (vibrato) — the test register `$0F` bits 1 + 3
   are wired and recorded but have no audible effect until the LFO
   lands. Rhythm-mode operator allocation (`$0E` bit 5, drum
   channels at `$36`/`$37`/`$38`) is also out of scope — VRC7 has

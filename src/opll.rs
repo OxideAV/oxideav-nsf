@@ -22,19 +22,18 @@
 //! anything beyond that appendix is out-of-scope for this module.
 //!
 //! Numeric tables flagged as provenance-pending in the §"Provenance"
-//! appendix of `opll-ym2413-tables.md` — the §4 KSL byte base table,
-//! the §7 AM/VIB LFO step arrays, and the §7 per-rate envelope
-//! increment array — are not transcribed in this file. The envelope
-//! generator therefore runs a coarse linear-rate approximation against
-//! the manual's documented semantics (rate 0 = halt, rate 1 = slowest,
-//! rate 15 = fastest); a precise per-RATE increment table remains a
+//! appendix of `opll-ym2413-tables.md` — the §7 AM/VIB LFO step
+//! arrays and the §7 per-rate envelope increment array — are not
+//! transcribed in this file. The envelope generator therefore runs
+//! a coarse linear-rate approximation against the manual's
+//! documented semantics (rate 0 = halt, rate 1 = slowest, rate 15
+//! = fastest); a precise per-RATE increment table remains a
 //! DOCS-GAP followup tracked in the crate README. The §4 KSL pipeline
 //! is wired through the operator path using the documented
-//! `(block_fnum_KSL_base) >> (3 - KSL)` formula; block 0 is bit-exact
-//! (the manual's §4 schema is explicit that block-0 base attenuation
-//! is zero for every F-Num column), while blocks 1..=7 fall through
-//! the same zero-base scaffold until the §4 base byte table is
-//! staged.
+//! `(block_fnum_KSL_base) >> (3 - KSL)` formula, and the base byte
+//! table is now sourced from Yamaha YM2413 Application Manual
+//! **Table III-5 "Attenuation at each F-Number at 3 dB/OCT"**
+//! (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` p. 11).
 //!
 //! KSR (Key Scale of RATE) IS fully specified by the YM2413
 //! Application Manual §III-1-2 + Table III-2 (mirrored in
@@ -109,60 +108,80 @@ pub fn feedback_shift(fb: u8) -> u32 {
 // F-Num top bits) pair. Per
 // `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4 the per-cell
 // attenuation is computed as `(base[block][fnum_hi]) >> (3 - KSL)`
-// with KSL=0 disabling the contribution entirely (the right-shift
-// of `>> 3` reduces the §4 base byte to zero for the documented
-// integer base values).
+// with KSL=0 disabling the contribution entirely.
 //
-// Spec status: §4 documents the **schema** of the base byte table
-// in 1.5 dB-per-step units ("block 0: all zeros; block 1: 0,0,0,0,
-// 3.0,4.5,6.0,7.5; ... block 7: each step +6 dB saturating") and
-// the dB-per-octave scaling that KSL applies on top of it
-// (`{0, 1.5, 3, 6}` dB per octave for KSL in 0..=3). The numeric
-// byte base table itself is flagged provenance-pending in the
-// §"Provenance & non-emulator sourcing" appendix and is NOT
-// transcribed in the staged docs. The scaffold below provides:
+// Spec status: the per-(OCT, F-Number) attenuation values are
+// tabulated in the **Yamaha YM2413 Application Manual Table III-5
+// ("Attenuation at each F-Number at 3 dB/OCT")**, staged at
+// `docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` page
+// 11 (also transcribed in `ym2413-application-manual-smspower.html`).
+// The manual's table is in dB units at the KSL=2 (3 dB/oct) baseline;
+// the §4 staging README's prior "graph (scan)" note predated this
+// transcription pass.
 //
-//   * `KSL_BASE_BYTE_TABLE` — the §4 byte base table, currently a
-//     16×8 zero placeholder. Block 0 IS bit-exact (the schema is
-//     explicit that block-0 base attenuation is zero for every
-//     F-Num column); blocks 1..=7 fall through the zero scaffold
-//     until the §4 byte base table is staged. The next §4 doc
-//     extension fills only this constant, no callsite touch
-//     required.
-//   * `ksl_base_attenuation(block, fnum_hi)` — indexes the base
-//     table with the doc's `fnum_hi = F-Num >> 5` (the top 4 bits
-//     of the 9-bit F-Num).
-//   * `ksl_attenuation_env_levels(block, fnum_hi, ksl)` — applies
-//     the §4 formula `(base) >> (3 - ksl)` with the documented
-//     `ksl=0 → no contribution` carve-out. Returns the contribution
-//     expressed in the same envelope-level units the rest of the
-//     operator pipeline uses (8 envelope-levels = 3 dB per the
-//     §6 / andete §"envelope levels" relation).
+// The §4 right-shift formula scales the same base for the other KSL
+// rates: KSL=1 (1.5 dB/oct) → `base >> 2`, KSL=2 (3 dB/oct) →
+// `base >> 1`, KSL=3 (6 dB/oct) → `base >> 0`. To make all three
+// rates produce integer envelope-level (0.375 dB) results, we store
+// each Table III-5 dB entry as `dB * 16 / 3` envelope-half-units
+// (i.e. units of 0.1875 dB). The KSL=2 right-shift then recovers
+// the 0.375 dB-step env-level units the rest of the operator
+// pipeline consumes (where 8 levels = 3 dB per the §6 / andete
+// §"envelope levels" relation).
 
-/// §4 KSL base byte table — currently a 16×8 zero placeholder.
+/// §4 KSL base byte table from
+/// **Yamaha YM2413 Application Manual Table III-5**
+/// (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` p. 11;
+/// matching HTML transcription
+/// `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`).
 ///
 /// Indexed by `(block, fnum_hi)` where `block` is the 3-bit BLOCK
-/// (0..=7) and `fnum_hi` is the top 4 bits of the 9-bit F-Num
-/// (i.e. `(F-Num >> 5) & 0x0F`). Units are envelope-levels (where
-/// 8 levels = 3 dB per the §6 / andete §"envelope levels"
-/// relation), so that the `(base) >> (3 - ksl)` formula and the
-/// per-operator pipeline arithmetic line up.
+/// (0..=7, manual OCT row) and `fnum_hi` is the top 4 bits of the
+/// 9-bit F-Num (`(F-Num >> 5) & 0x0F`, the manual's "F-Number"
+/// column — per Table III-5 Notes "F-Number is the value of the
+/// four MSBs.").
 ///
-/// Per `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4 the
-/// numeric byte values for blocks 1..=7 are flagged
-/// provenance-pending in the §"Provenance & non-emulator
-/// sourcing" appendix and are not transcribed here. **Row 0
-/// (block 0) is bit-exact** — the §4 schema is explicit that
-/// block 0 contributes zero attenuation for every F-Num column,
-/// regardless of KSL.
+/// Each cell stores the manual's dB value scaled by `16/3` so the
+/// integer arithmetic in [`ksl_attenuation_env_levels`] recovers
+/// envelope-level units (8 = 3 dB) after the `>> (3 - ksl)`
+/// right-shift. The KSL=2 column (`base >> 1`) reproduces Table
+/// III-5's dB values in env-level form bit-for-bit; KSL=1 / KSL=3
+/// follow from the manual's notes "Half of the above data at 1.5
+/// dB/oct" / "Double of the above at 6 dB/oct".
 ///
-/// When the §4 byte base table is staged, only this constant
-/// needs an edit; the formula plumbing and call sites already
-/// consume it via [`ksl_base_attenuation`].
+/// Row 0 (BLOCK = 0) is the manual's all-zero row; the §4 KSL=0
+/// carve-out is independently honoured in
+/// [`ksl_attenuation_env_levels`].
 pub const KSL_BASE_BYTE_TABLE: [[u32; 16]; 8] = [
-    // block 0: zero for every column — bit-exact per §4 schema.
-    [0; 16], // blocks 1..=7: zero scaffold pending §4 base byte table.
-    [0; 16], [0; 16], [0; 16], [0; 16], [0; 16], [0; 16], [0; 16],
+    // OCT 0: all zeros per Table III-5 row 0.
+    [0; 16],
+    // OCT 1: 0,0,0,0,0,0,0,0,  0.750,1.125,1.500,1.875,2.250,2.625,3.000 dB
+    //                          (manual row 1, columns F-Num 0..15).
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 6, 8, 10, 12, 14, 16],
+    // OCT 2: 0,0,0,0,0,1.125,1.875,2.625,
+    //        3.000,3.750,4.125,4.500,4.875,5.250,5.625,6.000 dB.
+    [0, 0, 0, 0, 0, 6, 10, 14, 16, 20, 22, 24, 26, 28, 30, 32],
+    // OCT 3: 0,0,0,1.875,3.000,4.125,4.875,5.625,
+    //        6.000,6.750,7.125,7.500,7.875,8.250,8.625,9.000 dB.
+    [0, 0, 0, 10, 16, 22, 26, 30, 32, 36, 38, 40, 42, 44, 46, 48],
+    // OCT 4: 0,0,3.000,4.875,6.000,7.125,7.875,8.625,
+    //        9.000,9.750,10.125,10.500,10.875,11.250,11.625,12.000 dB.
+    [0, 0, 16, 26, 32, 38, 42, 46, 48, 52, 54, 56, 58, 60, 62, 64],
+    // OCT 5: 0,3.000,6.000,7.875,9.000,10.125,10.875,11.625,
+    //        12.000,12.750,13.125,13.500,13.875,14.250,14.625,15.000 dB.
+    [
+        0, 16, 32, 42, 48, 54, 58, 62, 64, 68, 70, 72, 74, 76, 78, 80,
+    ],
+    // OCT 6: 0,6.000,9.000,10.875,12.000,13.125,13.875,14.625,
+    //        15.000,15.750,16.125,16.500,16.875,17.250,17.625,18.000 dB.
+    [
+        0, 32, 48, 58, 64, 70, 74, 78, 80, 84, 86, 88, 90, 92, 94, 96,
+    ],
+    // OCT 7: 0,9.000,12.000,13.875,15.000,16.125,16.875,17.625,
+    //        18.000,18.750,19.125,19.500,19.875,20.250,20.625,21.000 dB.
+    [
+        0, 48, 64, 74, 80, 86, 90, 94, 96, 100, 102, 104, 106, 108, 110, 112,
+    ],
 ];
 
 /// Look up the §4 KSL base attenuation for a given `(block, fnum_hi)`
@@ -189,14 +208,15 @@ pub fn ksl_base_attenuation(block: u8, fnum_hi: u8) -> u32 {
 /// contribution regardless of the base table. The right-shift
 /// implements the §4 dB-per-octave scaling: `KSL=0` → off,
 /// `KSL=1` → `>> 2` (¼ of the base, i.e. 1.5 dB per octave),
-/// `KSL=2` → `>> 1` (3 dB per octave), `KSL=3` → `>> 0`
-/// (6 dB per octave — the steepest).
+/// `KSL=2` → `>> 1` (3 dB per octave — Table III-5's tabulated
+/// rate), `KSL=3` → `>> 0` (6 dB per octave, the steepest).
 ///
-/// Block 0 is bit-correct (the base table's block-0 row is zero
-/// per the §4 schema). Blocks 1..=7 currently return 0 from
-/// [`ksl_base_attenuation`] pending the §4 byte base table; once
-/// staged the base table edit flows through this function and the
-/// operator pipeline automatically.
+/// The base table is sourced from
+/// **Yamaha YM2413 Application Manual Table III-5**
+/// (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf`
+/// p. 11). Block 0 is the manual's all-zero row, so this function
+/// returns zero for `block=0` regardless of (fnum_hi, KSL); blocks
+/// 1..=7 use the per-cell attenuation tabulated in Table III-5.
 #[inline]
 pub fn ksl_attenuation_env_levels(block: u8, fnum_hi: u8, ksl: u8) -> u32 {
     let k = ksl & 0x03;
@@ -1198,19 +1218,16 @@ mod tests {
         assert_eq!(synthetic_base, 48); // ksl=3
     }
 
-    /// §4 base byte table: block 0 row must be all-zero exactly
-    /// (the only row that is bit-exact today). The other rows are
-    /// the provenance-pending scaffold and currently zero; this
-    /// test asserts the BLOCK-0-IS-ZERO invariant so a future §4
-    /// table edit cannot accidentally clobber the documented
-    /// block-0 carve-out.
+    /// §4 base byte table: BLOCK = 0 row must be all-zero per
+    /// Table III-5 row 0 — the manual's "0,0,0,0,0,0,0,0,0,0,0,0,
+    /// 0,0,0,0" listing for OCT=0.
     #[test]
     fn ksl_base_table_block_zero_row_is_all_zero() {
         for fnum_hi in 0u8..16 {
             assert_eq!(
                 ksl_base_attenuation(0, fnum_hi),
                 0,
-                "§4: block 0 row must read all zero; fnum_hi={fnum_hi}"
+                "Table III-5 row 0 must read all zero; fnum_hi={fnum_hi}"
             );
         }
     }
@@ -1224,6 +1241,69 @@ mod tests {
         assert_eq!(ksl_base_attenuation(0xF0, 0), ksl_base_attenuation(0, 0));
         // fnum_hi input bits above D3 are discarded.
         assert_eq!(ksl_base_attenuation(0, 0xF0), ksl_base_attenuation(0, 0));
+    }
+
+    /// Yamaha YM2413 Application Manual **Table III-5** spot-checks.
+    /// The base table stores each manual dB entry scaled by 16/3 so
+    /// the integer right-shift in `ksl_attenuation_env_levels`
+    /// recovers env-level units (8 levels = 3 dB).
+    ///
+    /// For KSL=2 (Table III-5's tabulated 3 dB/oct rate), the
+    /// `>> 1` shift produces the manual value in env-level units
+    /// directly: 3 dB → 8 levels, 6 dB → 16 levels, etc.
+    #[test]
+    fn ksl_base_table_matches_table_iii_5_spot_checks() {
+        // Manual row 7, F-Num 15 = 21.000 dB → base entry = 112.
+        assert_eq!(ksl_base_attenuation(7, 15), 112);
+        // Manual row 1, F-Num 9 = 0.750 dB → base entry = 4.
+        assert_eq!(ksl_base_attenuation(1, 9), 4);
+        // Manual row 3, F-Num 8 = 6.000 dB → base entry = 32.
+        assert_eq!(ksl_base_attenuation(3, 8), 32);
+        // Manual row 5, F-Num 4 = 9.000 dB → base entry = 48.
+        assert_eq!(ksl_base_attenuation(5, 4), 48);
+        // Manual row 2, F-Num 7 = 2.625 dB → base entry = 14.
+        assert_eq!(ksl_base_attenuation(2, 7), 14);
+        // Manual row 6, F-Num 7 = 14.625 dB → base entry = 78.
+        assert_eq!(ksl_base_attenuation(6, 7), 78);
+    }
+
+    /// Table III-5 Notes: "F-Number is the value of the four MSBs."
+    /// — F-Num 0..7 with all-zero MSBs share the same row entry as
+    /// the column-index lookup; F-Num 8..15 add the +3 dB/oct steps.
+    /// Verifies the manual's "double of the above at 6 dB/oct" note:
+    /// every row's column-15 entry is exactly twice the BLOCK-shift
+    /// of the previous block's column 0 + 3 dB increments.
+    #[test]
+    fn ksl_base_table_block_doubling_matches_three_db_per_oct() {
+        // Manual gives row N at F-Num 15: 0, 3, 6, 9, 12, 15, 18,
+        // 21 dB for blocks 0..=7. In our env-level-scaled base
+        // units (×16/3), these are 0, 16, 32, 48, 64, 80, 96, 112.
+        let expected_col15 = [0, 16, 32, 48, 64, 80, 96, 112];
+        for (block, &v) in expected_col15.iter().enumerate() {
+            assert_eq!(
+                ksl_base_attenuation(block as u8, 15),
+                v,
+                "Table III-5 col F-Num=15 row OCT={block} should be \
+                 {} dB ({v} base units)",
+                v * 3 / 16
+            );
+        }
+    }
+
+    /// §4 KSL right-shift formula at a non-zero base. Table III-5
+    /// row 7 column 15 = 21.000 dB; at KSL=3 (no shift) the
+    /// env-level contribution is the full base = 112 env-levels
+    /// (42.000 dB extra atten — Table III-5 + 6 dB/oct doubling).
+    /// At KSL=2 the shift halves it → 56 levels (21.000 dB —
+    /// matches the manual's tabulated value). At KSL=1 the shift
+    /// quarters it → 28 levels (10.500 dB — half of 21 dB per
+    /// manual's "Half of the above data at 1.5 dB/oct").
+    #[test]
+    fn ksl_formula_matches_table_iii_5_at_block_seven() {
+        assert_eq!(ksl_attenuation_env_levels(7, 15, 3), 112);
+        assert_eq!(ksl_attenuation_env_levels(7, 15, 2), 56);
+        assert_eq!(ksl_attenuation_env_levels(7, 15, 1), 28);
+        assert_eq!(ksl_attenuation_env_levels(7, 15, 0), 0);
     }
 
     /// §5 FB feedback shifts — table maps to phase shifts of
@@ -1464,38 +1544,65 @@ mod tests {
         }
     }
 
-    /// §4 KSL — at block > 0 with the current zero scaffold the KSL
-    /// contribution is also zero across the §4 byte base table.
-    /// This test pins the SCAFFOLD invariant so that, when the §4
-    /// byte base table is staged, the test must be UPDATED in the
-    /// same change — it is the trip-wire that flags the staging
-    /// landing for verification at the channel pipeline level.
+    /// §4 KSL — with the Table III-5 base table now filled, two
+    /// channels at the same BLOCK but different KSL fields must
+    /// differ: the KSL=3 channel attenuates more than the KSL=0
+    /// reference whenever the (block, fnum_hi) cell is non-zero.
+    /// At block=5, fnum_hi=15 the manual gives `15.000 dB` for
+    /// Table III-5's KSL=2 baseline; KSL=3 doubles to 30 dB extra
+    /// atten on the carrier vs the same patch with KSL=0.
     #[test]
-    fn channel_blocks_one_through_seven_currently_match_block_zero() {
-        let bytes = [0x21, 0x61, 0b11_011101, 0b11_000111, 0x82, 0x81, 0x11, 0x07];
-        let p = Vrc7Patch::from_bytes(&bytes);
+    fn channel_ksl_high_attenuates_versus_ksl_zero() {
+        // Constant-output patch: AR=$F (instant attack), DR=$0,
+        // SL=$0, RR=$0. Two patches that differ only in their
+        // KSL bits ($02/$03 D7..D6).
+        let bytes_ksl3 = [0x21, 0x61, 0b11_000000, 0b11_000000, 0xF0, 0xF0, 0x00, 0x00];
+        let bytes_ksl0 = [0x21, 0x61, 0b00_000000, 0b00_000000, 0xF0, 0xF0, 0x00, 0x00];
+        let p_ksl3 = Vrc7Patch::from_bytes(&bytes_ksl3);
+        let p_ksl0 = Vrc7Patch::from_bytes(&bytes_ksl0);
         let mut ch_a = OpllChannel::default();
         let mut ch_b = OpllChannel::default();
-        ch_a.load_patch(&p, 0);
-        ch_b.load_patch(&p, 0);
-        ch_a.block = 0;
-        ch_b.block = 3;
-        ch_a.fnum = 0x100; // fnum_hi = 8
-        ch_b.fnum = 0x100;
+        ch_a.load_patch(&p_ksl0, 0);
+        ch_b.load_patch(&p_ksl3, 0);
+        // Same (block, fnum) on both channels so the phase
+        // generator is identical; KSL is the only difference.
+        ch_a.block = 5;
+        ch_b.block = 5;
+        ch_a.fnum = 0x1E0; // fnum_hi = (0x1E0 >> 5) & 0x0F = 15
+        ch_b.fnum = 0x1E0;
         ch_a.refresh_rks();
         ch_b.refresh_rks();
         ch_a.trigger_key_on();
         ch_b.trigger_key_on();
-        // Note: phase generators differ (block scales fnum << block),
-        // so we sample only enough to exercise the KSL contribution
-        // on the FIRST sample — when both channels have phase 0 and
-        // identical envelope state — to isolate the KSL-pipeline
-        // path from the phase-generator difference.
-        assert_eq!(
-            ch_a.sample(),
-            ch_b.sample(),
-            "with §4 byte base table at zero scaffold, blocks 0 and 3 \
-             must produce identical first samples"
+        // Step envelopes to the attack target so the per-sample
+        // output reflects the steady-state attenuation.
+        for _ in 0..256 {
+            ch_a.modulator.env.step(1);
+            ch_a.carrier.env.step(1);
+            ch_b.modulator.env.step(1);
+            ch_b.carrier.env.step(1);
+        }
+        // Peak absolute amplitude over a few cycles. With identical
+        // phase generators (same block + fnum) the peaks are the
+        // KSL-only contrast.
+        let mut peak_ksl0 = 0i32;
+        let mut peak_ksl3 = 0i32;
+        for _ in 0..2048 {
+            let a = ch_a.sample().abs();
+            let b = ch_b.sample().abs();
+            if a > peak_ksl0 {
+                peak_ksl0 = a;
+            }
+            if b > peak_ksl3 {
+                peak_ksl3 = b;
+            }
+        }
+        assert!(peak_ksl0 > 0, "KSL=0 reference must produce audio");
+        assert!(
+            peak_ksl3 < peak_ksl0,
+            "Table III-5 row 5 fnum_hi=15 KSL=3 should attenuate \
+             vs same patch with KSL=0: peak_ksl3={peak_ksl3} \
+             peak_ksl0={peak_ksl0}"
         );
     }
 
