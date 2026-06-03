@@ -104,7 +104,21 @@ impl Vrc6 {
             0xB002 => {
                 self.saw.timer_period =
                     (self.saw.timer_period & 0x00FF) | (((value & 0x0F) as u16) << 8);
-                self.saw.enabled = value & 0x80 != 0;
+                let now_enabled = value & 0x80 != 0;
+                // §Sawtooth Channel: "If E is clear, the accumulator is
+                // forced to zero until E is again set. The phase of the
+                // saw generator can be mostly reset by clearing and
+                // immediately setting E. Clearing E does not reset the
+                // frequency divider, however, so the first step of the
+                // reset saw may appear shortened."
+                //
+                // A falling edge on E forces accum=0 + resets the
+                // 14-step phase counter; the timer divider is preserved.
+                if !now_enabled && self.saw.enabled {
+                    self.saw.accum = 0;
+                    self.saw.step = 0;
+                }
+                self.saw.enabled = now_enabled;
             }
             _ => {}
         }
@@ -136,12 +150,34 @@ impl Vrc6 {
             }
         }
         if self.saw.enabled {
+            // §Sawtooth Channel: 14-step internal cycle. Each timer
+            // expiry advances `step` by 1 modulo 14:
+            //   * even-step positions 2, 4, 6, 8, 10, 12 each add the
+            //     6-bit rate value A to the 8-bit accumulator
+            //     ("when clocked, the rate value A is added to an
+            //     internal 8-bit accumulator"),
+            //   * odd-step positions 1, 3, 5, 7, 9, 11, 13 are
+            //     no-ops ("the accumulator only reacts on every 2
+            //     clocks"),
+            //   * step 0 (reached on the 14th clock from the previous
+            //     step 0) resets the accumulator to zero ("after A has
+            //     been added 6 times, on the 7th clock, instead of A
+            //     being added, the internal accumulator is reset to
+            //     zero").
+            //
+            // The walked example in the wiki (A=$08) reads
+            //   step 0 →$00, 2→$08, 4→$10, 6→$18, 8→$20, 10→$28,
+            //   12→$30, then back to step 0 → $00.
             let mut left = cycles;
             while left > 0 {
                 let take = left.min(scale);
                 if self.saw.timer == 0 {
                     self.saw.timer = self.saw.timer_period;
-                    self.saw.step = (self.saw.step + 1) & 0x0D;
+                    // 14-step modulo cycle (NOT a power-of-two mask;
+                    // the previous `& 0x0D` bit-mask gave a malformed
+                    // 1/2/3/8/9/12/13 sequence rather than the §example
+                    // 0..13 walk).
+                    self.saw.step = (self.saw.step + 1) % 14;
                     if self.saw.step == 0 {
                         self.saw.accum = 0;
                     } else if self.saw.step & 0x01 == 0 {
@@ -2226,6 +2262,270 @@ mod tests {
         assert!(chip.pulse[0].enabled);
         assert_eq!(chip.pulse[0].volume, 15);
         assert_eq!(chip.pulse[0].timer_period, 0x340);
+    }
+
+    // ---------------- Round 223: VRC6 sawtooth 14-step cycle ----------------
+    //
+    // Spec source: `docs/audio/nsf/vrc6-audio-wiki.html`
+    //   §"Sawtooth Channel" — 14-step internal cycle, "after A has been
+    //                         added 6 times, on the 7th clock, instead
+    //                         of A being added, the internal
+    //                         accumulator is reset to zero" + the
+    //                         walked example for A=$08 producing
+    //                         accumulator $00, $00, $08, $08, $10, $10,
+    //                         $18, $18, $20, $20, $28, $28, $30, $30
+    //                         then resetting to $00.
+    //   §"Sawtooth Channel" — E-clear forces the accumulator to zero;
+    //                         the frequency divider is preserved on
+    //                         falling edge of E.
+    //
+    // The previous bit-mask `step & 0x0D` produced 1/2/3/8/9/12/13
+    // rather than the §example walk; modulo 14 now matches.
+
+    /// Drive the saw chip until `step` returns to the same position the
+    /// next timer expiry would land it on, emitting one accumulator
+    /// reading after every timer expiry — i.e. one reading per saw
+    /// "clock" in the §"Sawtooth Channel" walkthrough.
+    fn vrc6_saw_walk(chip: &mut Vrc6, n_clocks: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_clocks);
+        for _ in 0..n_clocks {
+            // chip.tick consumes one cycle at a time so the timer
+            // walks predictably; we tick exactly (timer + 1) cycles
+            // (or `timer_period + 1` after a load) to step the saw
+            // by one. The +1 absorbs the "0 → reload + step" tick.
+            let period = chip.saw.timer_period;
+            chip.tick(period as u32 + 1);
+            out.push(chip.saw.accum);
+        }
+        out
+    }
+
+    #[test]
+    fn vrc6_saw_walk_a_08_matches_example_table() {
+        // §"Sawtooth Channel" example: A=$08, expected accumulator
+        // sequence beginning at step 0:
+        //   step 0..13 → $00, $00, $08, $08, $10, $10, $18, $18, $20,
+        //   $20, $28, $28, $30, $30, then (step 0 again) $00.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08); // A = $08
+        chip.write(0xB001, 0x10); // period low
+        chip.write(0xB002, 0x80); // E=1, period high = 0
+                                  // The chip starts on step 0 — the first tick we observe
+                                  // advances to step 1 (no-op), so we read $00. Walk 14 clocks
+                                  // to reach the full cycle plus the reset wrap.
+        let walk = vrc6_saw_walk(&mut chip, 14);
+        // step 1=odd→$00, 2=add→$08, 3=$08, 4=$10, 5=$10, 6=$18,
+        // 7=$18, 8=$20, 9=$20, 10=$28, 11=$28, 12=$30, 13=$30,
+        // 0=reset→$00.
+        assert_eq!(
+            walk,
+            vec![
+                0x00, 0x08, 0x08, 0x10, 0x10, 0x18, 0x18, 0x20, 0x20, 0x28, 0x28, 0x30, 0x30, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn vrc6_saw_resets_after_seventh_clock_per_spec() {
+        // §"Sawtooth Channel": "after A has been added 6 times, on
+        // the 7th clock, instead of A being added, the internal
+        // accumulator is reset to zero." A=$01 makes each add
+        // visible without aliasing.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x01);
+        chip.write(0xB001, 0x00);
+        chip.write(0xB002, 0x80);
+        let walk = vrc6_saw_walk(&mut chip, 28);
+        // Two full cycles: first cycle peaks at $06, second cycle
+        // also peaks at $06 after the reset.
+        assert_eq!(walk[12], 0x06, "1st cycle final add reaches A * 6");
+        assert_eq!(walk[13], 0x00, "step 0 of 2nd cycle resets to 0");
+        assert_eq!(walk[26], 0x06, "2nd cycle final add reaches A * 6");
+        assert_eq!(walk[27], 0x00, "step 0 of 3rd cycle resets to 0");
+    }
+
+    #[test]
+    fn vrc6_saw_output_is_top_five_accumulator_bits() {
+        // §"Output": "The final mix is a 6-bit DAC summing the two
+        // 4-bit pulse outputs and the high 5 bits of the saw
+        // accumulator."
+        //
+        // A=$08 produces an accumulator that maxes at $30; the high
+        // 5 bits are accum >> 3, so the §example "Output" column
+        // reads 0,0,1,1,2,2,3,3,4,4,5,5,6,6,0.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08);
+        chip.write(0xB001, 0x10);
+        chip.write(0xB002, 0x80);
+        // Walk through one full cycle and verify the output
+        // contribution at each step matches the §example.
+        let mut samples = Vec::with_capacity(14);
+        for _ in 0..14 {
+            let period = chip.saw.timer_period;
+            chip.tick(period as u32 + 1);
+            samples.push((chip.saw.accum >> 3) as u32);
+        }
+        assert_eq!(samples, vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 0]);
+    }
+
+    #[test]
+    fn vrc6_saw_e_clear_forces_accumulator_to_zero() {
+        // §"Sawtooth Channel": "If E is clear, the accumulator is
+        // forced to zero until E is again set."
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08);
+        chip.write(0xB001, 0x04);
+        chip.write(0xB002, 0x80); // E=1
+                                  // Drive a few clocks to put the accumulator above zero.
+        let _ = vrc6_saw_walk(&mut chip, 4);
+        assert!(
+            chip.saw.accum > 0,
+            "accumulator must have ramped above zero"
+        );
+        // Falling edge on E forces accumulator + step to 0.
+        chip.write(0xB002, 0x00); // E=0
+        assert_eq!(chip.saw.accum, 0);
+        assert_eq!(chip.saw.step, 0);
+        // Output path also reads zero while disabled (saw block in
+        // `output()` is gated on `saw.enabled`).
+        assert_eq!(chip.output(), 0.0);
+    }
+
+    #[test]
+    fn vrc6_saw_e_clear_preserves_frequency_divider() {
+        // §"Sawtooth Channel": "Clearing E does not reset the
+        // frequency divider, however, so the first step of the
+        // reset saw may appear shortened."
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08);
+        chip.write(0xB001, 0xFF);
+        chip.write(0xB002, 0x80); // E=1, period = $0FF
+                                  // Tick partway through the timer so the divider is mid-count.
+        chip.tick(50);
+        let timer_before = chip.saw.timer;
+        assert!(timer_before > 0 && timer_before < chip.saw.timer_period);
+        // Clearing E zeroes the accumulator + step but leaves the
+        // running divider untouched.
+        chip.write(0xB002, 0x00);
+        assert_eq!(chip.saw.timer, timer_before, "frequency divider preserved");
+    }
+
+    #[test]
+    fn vrc6_saw_disabled_chip_holds_accumulator_at_zero_under_tick() {
+        // §"Sawtooth Channel": "If E is clear, the accumulator is
+        // forced to zero **until E is again set**." A `tick` while
+        // E is clear must not advance the accumulator.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x20); // a non-trivial rate
+        chip.write(0xB001, 0x00); // tight period
+        chip.write(0xB002, 0x00); // E=0
+        chip.tick(10_000);
+        assert_eq!(chip.saw.accum, 0);
+        assert_eq!(chip.saw.step, 0);
+    }
+
+    #[test]
+    fn vrc6_saw_distorts_when_rate_exceeds_42() {
+        // §"Sawtooth Channel" footnote: "If A is more than 42
+        // (floor(255 / 6)), the accumulator will wrap, resulting in
+        // distorted sound."
+        //
+        // A=43 makes 43 * 6 = 258 → wraps past the 8-bit accumulator
+        // ceiling (255) by 3 on the final add. Walk through one
+        // cycle and confirm the wrap happens (the §footnote labels
+        // it "distorted").
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 43); // A = 43, > 42 threshold
+        chip.write(0xB001, 0x00);
+        chip.write(0xB002, 0x80);
+        // Step through the 6 adds + reset.
+        let walk = vrc6_saw_walk(&mut chip, 14);
+        // Final add lands at 43*6 = 258, wrapped to 258 - 256 = 2.
+        assert_eq!(walk[12], 2, "6th add wraps past 255 → distortion");
+        assert_eq!(walk[13], 0, "step-0 reset still fires on the next clock");
+    }
+
+    #[test]
+    fn vrc6_saw_a_zero_rate_silences_channel() {
+        // §"Saw Accum Rate ($B000)" sets a 6-bit rate field with no
+        // special-case carve-out — A=0 simply never adds anything,
+        // so the accumulator stays at zero (and is reset back to
+        // zero every 14th clock anyway).
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x00); // A = 0
+        chip.write(0xB001, 0x00);
+        chip.write(0xB002, 0x80);
+        let walk = vrc6_saw_walk(&mut chip, 28);
+        assert!(walk.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn vrc6_saw_rate_masked_to_six_bits() {
+        // §"Saw Accum Rate ($B000)" layout `..AA AAAA`: the top two
+        // bits of the byte are documented as inert.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0xC8); // top bits set, A = $08
+        assert_eq!(chip.saw.rate, 0x08);
+    }
+
+    #[test]
+    fn vrc6_saw_re_enable_restarts_phase_at_step_zero() {
+        // §"Sawtooth Channel": clearing then immediately setting E
+        // "mostly resets" the phase. Our model resets step + accum
+        // on E falling edge so a re-enable starts a fresh 14-step
+        // cycle from step 0.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08);
+        chip.write(0xB001, 0x00);
+        chip.write(0xB002, 0x80);
+        // Walk into the middle of a cycle.
+        let _ = vrc6_saw_walk(&mut chip, 5);
+        assert!(chip.saw.step > 0);
+        // Clear E, then set E: step + accum back to 0.
+        chip.write(0xB002, 0x00);
+        chip.write(0xB002, 0x80);
+        assert_eq!(chip.saw.step, 0);
+        assert_eq!(chip.saw.accum, 0);
+        // Walk one full cycle; first non-zero accumulator hit must
+        // be $08 (the first add at step 2).
+        let walk = vrc6_saw_walk(&mut chip, 14);
+        assert_eq!(walk[0], 0x00); // step 1
+        assert_eq!(walk[1], 0x08); // step 2
+    }
+
+    #[test]
+    fn vrc6_saw_period_zero_still_ticks_step_each_cycle() {
+        // §"Sawtooth Channel": the divider counts down from `t`
+        // until it reaches zero, at which point it reloads. With
+        // period_low+high both 0, the timer reloads with 0 on every
+        // expiry — so a single CPU cycle advances one step in the
+        // 14-clock cycle.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08);
+        chip.write(0xB001, 0x00);
+        chip.write(0xB002, 0x80); // period = 0
+        chip.tick(1);
+        assert_eq!(chip.saw.step, 1);
+        chip.tick(1);
+        assert_eq!(chip.saw.step, 2);
+        assert_eq!(chip.saw.accum, 0x08); // first add fires at step 2
+    }
+
+    #[test]
+    fn vrc6_halt_overrides_all_other_freq_control_bits() {
+        // §"Frequency Control ($9003)": "The halt flag overrides
+        // the other flags." H=1 must freeze the saw + pulses
+        // regardless of A/B.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08);
+        chip.write(0xB001, 0x00);
+        chip.write(0xB002, 0x80);
+        // H=1, B=1, A=1 — A/B would otherwise turn the saw into
+        // 256x; halt overrides.
+        chip.write(0x9003, 0b0000_0111);
+        chip.tick(10_000);
+        assert_eq!(chip.saw.step, 0);
+        assert_eq!(chip.saw.accum, 0);
     }
 
     #[test]

@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VRC6 sawtooth 14-step cycle + E-clear accumulator zero** (round 223):
+  the §"Sawtooth Channel" 14-clock cycle in
+  `docs/audio/nsf/vrc6-audio-wiki.html` is now matched bit-for-bit
+  against the walked §example for A=$08. Previously the saw step
+  counter used a `& 0x0D` bit mask that produced a malformed
+  1/2/3/8/9/12/13 sequence; the new modulo-14 cycle produces the
+  documented step 0..13 walk so the accumulator climbs 0,0,8,8,16,
+  16,24,24,32,32,40,40,48,48 and resets back to 0 on the 14th clock
+  matching the §"after A has been added 6 times, on the 7th clock,
+  instead of A being added, the internal accumulator is reset to
+  zero" rule. The §footnote "If A is more than 42 (floor(255 / 6)),
+  the accumulator will wrap, resulting in distorted sound" is also
+  covered — A=43 wraps the 8-bit accumulator past 255 on the 6th
+  add. The §"Sawtooth Channel" E-clear rule ("If E is clear, the
+  accumulator is forced to zero until E is again set") now triggers
+  on the falling edge of the `$B002` E bit: `Vrc6Saw::accum` +
+  `Vrc6Saw::step` are zeroed, the frequency divider is preserved
+  per the §note "Clearing E does not reset the frequency divider,
+  however, so the first step of the reset saw may appear
+  shortened". A ticked-while-disabled chip holds the accumulator at
+  zero (no spurious ramping when the saw is muted). 12 new unit
+  tests in `expansion::tests` cover: the §example A=$08 14-step
+  walk, the A=$01 two-cycle 6-add-then-reset pattern, the §"Output"
+  5-bit DAC contribution (accum >> 3) over one full cycle, the
+  E-clear forces-zero rule, the §note that E-clear preserves the
+  frequency divider, the disabled-tick holds-zero invariant, the
+  A=43 wrap-around distortion footnote, the A=0 silence guarantee,
+  the `$B000` 6-bit rate field masking the top two bits (`..AA
+  AAAA` layout), the re-enable phase-at-step-0 reset, the
+  period-zero per-cycle step advance, and the §"Frequency Control
+  ($9003)" halt-overrides-everything rule across the saw walker.
+
 - **MMC5 PCM Mode / IRQ register + read-mode write-by-read** (round 18):
   the `$5010` PCM Mode/IRQ register now decodes bit 7 (PCM IRQ enable)
   alongside the existing bit 0 (mode select) on writes, and `$5010`

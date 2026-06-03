@@ -165,6 +165,28 @@ defence-in-depth gate, the bus-level routing through the four-way
 IRQ OR, the inclusive `$8000..=$BFFF` window for write-by-read, and
 the no-op for write-mode reads in the same window.
 
+Round 223 lands the VRC6 sawtooth 14-step cycle per
+`docs/audio/nsf/vrc6-audio-wiki.html` §"Sawtooth Channel". The saw
+step counter previously used a `& 0x0D` bit mask that produced a
+malformed 1/2/3/8/9/12/13 sequence; the new modulo-14 cycle now
+matches the §example A=$08 walk byte-for-byte (accumulator climbs
+0,0,8,8,16,16,24,24,32,32,40,40,48,48 then resets to 0 on the 14th
+clock). The §"after A has been added 6 times, on the 7th clock, …
+the internal accumulator is reset to zero" rule and the §footnote
+"If A is more than 42 (floor(255 / 6)), the accumulator will wrap,
+resulting in distorted sound" are now bit-correct against the spec.
+The §"Sawtooth Channel" E-clear rule fires on the falling edge of
+`$B002` bit 7: `Vrc6Saw::accum` + `Vrc6Saw::step` are zeroed while
+the frequency divider is preserved per the §note "Clearing E does
+not reset the frequency divider, however, so the first step of the
+reset saw may appear shortened." 12 new unit tests cover the
+§example walk, the §footnote distortion threshold, the §note
+divider-preservation, the §"Output" 5-bit DAC mapping
+(accum >> 3) across one full cycle, A=0 silence, the `$B000` rate
+field's `..AA AAAA` 6-bit masking, the re-enable phase reset, the
+§"Frequency Control ($9003)" halt-overrides-everything rule, and
+the disabled-tick holds-zero invariant.
+
 Round 17 lands the §4 KSL (Key Scale of LEVEL) formula scaffold per
 `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §4. Each operator's
 KSL field (`$02`/`$03` D7..D6, range 0..=3) is captured from
