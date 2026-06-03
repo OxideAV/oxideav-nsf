@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.2...v0.0.3) - 2026-06-03
+
+### Other
+
+- §4 KSL byte base table from YM2413 Application Manual Table III-5 (round 228)
+- sawtooth 14-step cycle + E-clear accumulator zero (round 223)
+- $5010 PCM Mode/IRQ + $8000..=$BFFF read-mode write-by-read (round 18)
+- §4 KSL formula scaffold + provenance prose scrub (round 17)
+- OPLL KSR (Key Scale of RATE) per app-manual §III-1-2 Table III-2 (round 16)
+- $0F test register + $2X.S sustain override + $00.S release disable + $E000 audio reset (round 15)
+
 ### Added
 
 - **OPLL §4 KSL byte base table — Yamaha YM2413 Application Manual
