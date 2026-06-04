@@ -192,6 +192,30 @@ field's `..AA AAAA` 6-bit masking, the re-enable phase reset, the
 §"Frequency Control ($9003)" halt-overrides-everything rule, and
 the disabled-tick holds-zero invariant.
 
+Round 232 lands the OPLL envelope per-RATE decay step from
+**Yamaha YM2413 Application Manual Table III-7 ("Attack and
+decay times in relation to RATE")** page 14
+(`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf`;
+HTML mirror `ym2413-application-manual-smspower.html`). The 64
+post-key-scale RATE entries from the manual's "EG decay time,
+0 dB → 40 dB" column are staged as
+`TABLE_III_7_DECAY_HUNDREDTHS_MS` (units of 0.01 ms), and the
+new helper `decay_step_q16_per_sample(rate)` converts each
+table entry into the per-OPLL-sample Q16 envelope-level
+increment that traverses the 40 dB span in the tabulated time
+at the OPLL operator clock (≈49.7163 kHz). `Envelope::step`
+now consults the table for the Decay, percussive-Sustain, and
+Release phases — the page-13 footnote "Attenuation times of
+the release rate are the same as that of the decay rate" is
+enforced by reusing the same lookup. The Attack phase still
+uses the prior monotonic `2^(rate-1)` ladder; the manual's
+attack-time column tabulates the 10 %–90 % exponential curve
+and lands separately. The manual's own "Likely transcription
+errors here, especially lower in the table" footnote applies
+to two cells in the unused 10 %–90 % column (`RM=9 RL=2`,
+`RM=3 RL=0`); the consumed 0–40 dB column is reproduced as
+printed and verified by 4 new tests against the manual.
+
 Round 228 fills the §4 KSL byte base table from
 **Yamaha YM2413 Application Manual Table III-5 "Attenuation at
 each F-Number at 3 dB/OCT"**
@@ -513,21 +537,25 @@ fail and signal the per-block first-sample validation pass.
   against the application-manual table even though the per-RATE
   step magnitude remains the coarse approximation. Round 228 filled
   the §4 KSL attenuation byte base table from the application
-  manual's Table III-5. Remaining numeric DOCS-GAPs (flagged
-  provenance-pending in the staging's §"Provenance & non-emulator
-  sourcing" appendix): the §7 per-RATE envelope-increment numeric
-  arrays (the underlying per-RATE step magnitude is still a
-  `2^(rate-1)` Q16-units-per-sample monotonic ladder honouring
-  R=0 halt + RATE=63 saturating-fast semantics; KSR widens the
-  rate correctly into this table even though the table itself is
-  the approximation), and the §7 LFO numeric step arrays for AM
-  (tremolo) + VIB (vibrato) — the test register `$0F` bits 1 + 3
-  are wired and recorded but have no audible effect until the LFO
-  lands. Rhythm-mode operator allocation (`$0E` bit 5, drum
-  channels at `$36`/`$37`/`$38`) is also out of scope — VRC7 has
-  no rhythm DAC so the drum patches in the ROM are inaudible
-  there, but a future YM2413 consumer (an MSX-format crate, say)
-  would need rhythm-mode decoded.
+  manual's Table III-5. Round 232 wired the Decay / percussive-
+  Sustain / Release per-RATE step magnitude to **Yamaha YM2413
+  Application Manual Table III-7** ("Attack and decay times in
+  relation to RATE") — the manual's "EG decay time 0 dB → 40 dB"
+  column is now the source of truth for the per-RATE envelope-
+  level step on those three phases. Remaining numeric DOCS-GAPs
+  (flagged provenance-pending in the staging's §"Provenance &
+  non-emulator sourcing" appendix): the Attack-phase per-RATE
+  step magnitude (the manual's Table III-7 also tabulates the
+  attack-time column, but it is the 10 %–90 % exponential-rise
+  envelope — qualitatively different from the linear decay
+  column and a follow-up landing), and the §7 LFO numeric step
+  arrays for AM (tremolo) + VIB (vibrato) — the test register
+  `$0F` bits 1 + 3 are wired and recorded but have no audible
+  effect until the LFO lands. Rhythm-mode operator allocation
+  (`$0E` bit 5, drum channels at `$36`/`$37`/`$38`) is also out
+  of scope — VRC7 has no rhythm DAC so the drum patches in the
+  ROM are inaudible there, but a future YM2413 consumer (an
+  MSX-format crate, say) would need rhythm-mode decoded.
 * N163: round 11 added the per-channel timer accumulators. Remaining
   gap is matching the documented `f = (n * p) / (15 * 65536 * l * c)`
   output frequency in a calibration test against a known fixture (the

@@ -23,17 +23,20 @@
 //!
 //! Numeric tables flagged as provenance-pending in the §"Provenance"
 //! appendix of `opll-ym2413-tables.md` — the §7 AM/VIB LFO step
-//! arrays and the §7 per-rate envelope increment array — are not
-//! transcribed in this file. The envelope generator therefore runs
-//! a coarse linear-rate approximation against the manual's
-//! documented semantics (rate 0 = halt, rate 1 = slowest, rate 15
-//! = fastest); a precise per-RATE increment table remains a
-//! DOCS-GAP followup tracked in the crate README. The §4 KSL pipeline
+//! arrays — are not transcribed in this file. The §4 KSL pipeline
 //! is wired through the operator path using the documented
 //! `(block_fnum_KSL_base) >> (3 - KSL)` formula, and the base byte
 //! table is now sourced from Yamaha YM2413 Application Manual
 //! **Table III-5 "Attenuation at each F-Number at 3 dB/OCT"**
 //! (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` p. 11).
+//!
+//! The envelope generator's Decay / percussive-Sustain / Release
+//! per-RATE step magnitude is now sourced from
+//! **Yamaha YM2413 Application Manual Table III-7
+//! ("Attack and decay times in relation to RATE")** page 14 — see
+//! [`TABLE_III_7_DECAY_HUNDREDTHS_MS`] / [`decay_step_q16_per_sample`].
+//! The Attack phase still uses the prior monotonic coarse ladder
+//! pending a separate landing for the 10 %–90 % attack-curve column.
 //!
 //! KSR (Key Scale of RATE) IS fully specified by the YM2413
 //! Application Manual §III-1-2 + Table III-2 (mirrored in
@@ -227,6 +230,130 @@ pub fn ksl_attenuation_env_levels(block: u8, fnum_hi: u8, ksl: u8) -> u32 {
     let base = ksl_base_attenuation(block, fnum_hi);
     // §4: shift right by (3 - KSL). KSL ∈ {1,2,3} → shift ∈ {2,1,0}.
     base >> (3 - k as u32)
+}
+
+// -------------------------------------------------------------- §III-7 EG times
+//
+// Envelope decay times in relation to RATE — per
+// **Yamaha YM2413 Application Manual Table III-7
+// ("Attack and decay times in relation to RATE")**, transcribed at
+// `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`
+// (HTML mirror of the original page 14 scan
+// `docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf`).
+//
+// The table is indexed by the post-key-scale `RATE = RM × 4 + RL`
+// (six-bit, 0..=63) — that is the same `RATE` produced by
+// [`Envelope::effective_rate`] from `4·R + Rks`. The manual lists
+// four columns; the only one consumed here is **EG decay time, 0 dB
+// → 40 dB** (the second column), measured in milliseconds. The
+// transcription below stores the column verbatim in units of
+// 0.01 ms (= 10 µs) to keep the entries integer.
+//
+// The manual itself flags "Likely transcription errors here,
+// especially lower in the table" immediately under the table. Two
+// such cells are visibly anomalous against the otherwise-smooth
+// geometric progression — `RM=9 RL=2` and `RM=3 RL=0` in the
+// (unused) "10 % - 90 %" column. Both are outside the columns
+// consumed below; the table is reproduced exactly as printed and
+// the caveat is surfaced here for completeness.
+//
+// RATE entries 0..=3 are not tabulated by the manual. Per §III-1-2
+// Note: "When R=0, RATE=0" → halt; with `Rks ≥ 0` and `R ≥ 1` the
+// formula `4·R + Rks` reaches at least 4, so RATE 1..3 are not
+// produced by [`Envelope::effective_rate`]. We default those entries
+// to zero (halt) defensively.
+
+/// **Yamaha YM2413 Application Manual Table III-7** — EG decay time
+/// (`0 dB → 40 dB` column) in units of 0.01 ms, indexed by the
+/// post-key-scale `RATE = RM·4 + RL` (0..=63).
+///
+/// Source: page 14 of the application manual
+/// (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf`;
+/// HTML mirror `ym2413-application-manual-smspower.html`).
+///
+/// Entries 0..=3 are not tabulated by the manual and are set to
+/// zero here (treated as halt by [`decay_step_q16_per_sample`]);
+/// `[`Envelope::effective_rate`]`'s `4·R + Rks` formula never
+/// produces a RATE below 4 when `R ≥ 1`.
+pub const TABLE_III_7_DECAY_HUNDREDTHS_MS: [u32; 64] = [
+    // RATE 0..3 — not tabulated; treated as halt.
+    0, 0, 0, 0,
+    // RATE 4..7 (RM=1, RL=0..3): 20926.60, 16807.20, 14606.80, 12078.66 ms.
+    2_092_660, 1_680_720, 1_460_680, 1_207_866,
+    // RATE 8..11 (RM=2, RL=0..3): 10463.30, 8403.58, 7002.98, 6014.32 ms.
+    1_046_330, 840_358, 700_298, 601_432,
+    // RATE 12..15 (RM=3, RL=0..3): 5231.64, 4201.79, 3501.49, 3007.16 ms.
+    523_164, 420_179, 350_149, 300_716,
+    // RATE 16..19 (RM=4, RL=0..3): 2615.82, 2180.89, 1750.75, 1503.58 ms.
+    261_582, 218_089, 175_075, 150_358,
+    // RATE 20..23 (RM=5, RL=0..3): 1307.91, 1050.45, 875.37, 751.79 ms.
+    130_791, 105_045, 87_537, 75_179,
+    // RATE 24..27 (RM=6, RL=0..3): 653.95, 525.22, 437.69, 375.98 ms.
+    65_395, 52_522, 43_769, 37_598,
+    // RATE 28..31 (RM=7, RL=0..3): 326.98, 262.61, 218.84, 187.95 ms.
+    32_698, 26_261, 21_884, 18_795,
+    // RATE 32..35 (RM=8, RL=0..3): 163.49, 131.31, 109.42, 93.97 ms.
+    16_349, 13_131, 10_942, 9_397,
+    // RATE 36..39 (RM=9, RL=0..3): 81.74, 65.65, 54.71, 46.99 ms.
+    8_174, 6_565, 5_471, 4_699,
+    // RATE 40..43 (RM=10, RL=0..3): 40.07, 32.03, 27.36, 23.49 ms.
+    4_007, 3_203, 2_736, 2_349,
+    // RATE 44..47 (RM=11, RL=0..3): 20.44, 16.41, 13.60, 11.75 ms.
+    2_044, 1_641, 1_360, 1_175,
+    // RATE 48..51 (RM=12, RL=0..3): 10.22, 8.21, 6.84, 5.87 ms.
+    1_022, 821, 684, 587, // RATE 52..55 (RM=13, RL=0..3): 5.11, 4.10, 3.42, 2.94 ms.
+    511, 410, 342, 294, // RATE 56..59 (RM=14, RL=0..3): 2.55, 2.05, 1.71, 1.47 ms.
+    255, 205, 171, 147, // RATE 60..63 (RM=15, RL=0..3): 1.27, 1.27, 1.27, 1.27 ms.
+    127, 127, 127, 127,
+];
+
+/// Envelope-level span from 0 dB → 40 dB in our internal 0.375 dB
+/// per-level units. Per `opll-ym2413-tables.md` §6 / andete
+/// §"envelope levels", `8 levels = 3 dB`, so `40 dB ≈ 106.67`
+/// envelope-levels. The Q16 fixed-point value used below rounds to
+/// the nearest integer (`40 * 8 / 3 << 16 ≈ 106.667 << 16`).
+pub const ENV_LEVELS_40_DB_Q16: u64 = (40u64 * 8 * (1 << 16)) / 3;
+
+/// Per-sample Q16 envelope-level step for the documented `RATE` per
+/// **Yamaha YM2413 Application Manual Table III-7** column "EG decay
+/// time 0 dB → 40 dB".
+///
+/// Returns the increment (in Q16 fixed-point envelope-levels) that
+/// would carry the envelope through the 40-dB span in exactly the
+/// tabulated time at the OPLL per-operator rate
+/// ([`OPLL_SAMPLE_RATE_HZ`] ≈ 49.7163 kHz). Used by [`Envelope::step`]
+/// for the Decay, percussive-Sustain and Release phases — the manual
+/// is explicit that "Attenuation times of the release rate are the
+/// same as that of the decay rate" (page 13 footnote).
+///
+/// RATE 0..=3 return zero (halt) — the manual does not tabulate them
+/// and `R=0` is the documented halt case.
+#[inline]
+pub fn decay_step_q16_per_sample(rate: u8) -> u32 {
+    let r = (rate & 0x3F) as usize;
+    let hundredths_ms = TABLE_III_7_DECAY_HUNDREDTHS_MS[r];
+    if hundredths_ms == 0 {
+        // Halt (RATE 0..=3 not tabulated; the manual's R=0 carve-out
+        // is honoured upstream by [`Envelope::effective_rate`]).
+        return 0;
+    }
+    // total_samples = (hundredths_ms / 100_000) seconds × sample_rate
+    //               = hundredths_ms × sample_rate / 100_000
+    // (sample_rate is integer 49_716 cycles per second; the
+    //  0.0003-Hz aliasing vs 49716.3 fits inside Q16 rounding).
+    const SAMPLE_RATE_HZ_INT: u64 = 49_716;
+    let total_samples = (hundredths_ms as u64).saturating_mul(SAMPLE_RATE_HZ_INT) / 100_000;
+    if total_samples == 0 {
+        // RATE 60..=63: 1.27 ms × 49 716 Hz / 100 000 ≈ 63 samples
+        // → never zero. Defensive fallthrough only.
+        return u32::MAX;
+    }
+    let step = ENV_LEVELS_40_DB_Q16 / total_samples;
+    if step > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        step as u32
+    }
 }
 
 // -------------------------------------------------------------- §6 logsin / exp
@@ -516,37 +643,45 @@ impl Envelope {
     ///
     /// Each stage's 4-bit R is widened to a 6-bit RATE via the
     /// manual's `RATE = 4·R + Rks` formula (see [`effective_rate`]).
-    /// The per-RATE step magnitude is the coarse approximation
-    /// flagged in the module docstring: rate 0 halts, rate `n>0`
-    /// advances by `2^(n-1)` Q16 units per sample. This widening
-    /// preserves the monotonic rate ladder faithful to the manual's
-    /// `R=0..=15` × `KSR={0,1}` × `(block, fnum_msb)` semantics but
-    /// is NOT bit-exact against the OPLx-decapsulated per-RATE
-    /// increment arrays — that exact transcription remains a
-    /// documented DOCS-GAP followup.
+    ///
+    /// The per-RATE step magnitude for the **Decay**, percussive
+    /// **Sustain**, and **Release** phases is sourced from
+    /// **Yamaha YM2413 Application Manual Table III-7
+    /// ("Attack and decay times in relation to RATE")** — see
+    /// [`decay_step_q16_per_sample`] for the lookup. The manual's
+    /// page-13 footnote states "Attenuation times of the release
+    /// rate are the same as that of the decay rate", so the Release
+    /// (and percussive Sustain) path reuses the decay column.
+    ///
+    /// The **Attack** phase still uses the prior monotonic coarse
+    /// ladder (`2^(rate-1)` Q16-units per sample) — the manual's
+    /// attack-time column tabulates the 10 %–90 % exponential rise
+    /// envelope, which is qualitatively a different curve than the
+    /// linear decay column and is a follow-up landing.
     ///
     /// [`effective_rate`]: Envelope::effective_rate
     pub fn step(&mut self, samples: u32) {
-        let advance = |rate: u8, s: u32| -> u32 {
+        // Attack uses the prior monotonic ladder pending a separate
+        // Table III-7 attack-curve landing.
+        let attack_advance = |rate: u8, s: u32| -> u32 {
             if rate == 0 {
                 0
             } else {
-                // (1 << (rate-1)) Q16-units per sample. Clamp the
-                // shift at 31 to avoid overflow on rate=63 — the
-                // envelope saturates against ENV_MAX_LEVEL within
-                // the same sample once the shift exceeds the level
-                // span anyway.
                 let shift = (rate as u32 - 1).min(31);
                 (1u32 << shift).saturating_mul(s)
             }
         };
+        // Decay / Sustain (percussive) / Release pull the Q16 step
+        // from Table III-7 directly.
+        let decay_advance =
+            |rate: u8, s: u32| -> u32 { decay_step_q16_per_sample(rate).saturating_mul(s) };
 
         match self.phase {
             EnvPhase::Idle => {
                 self.level_q16 = ENV_MAX_LEVEL << 16;
             }
             EnvPhase::Attack => {
-                let step = advance(self.effective_rate(self.attack_rate), samples);
+                let step = attack_advance(self.effective_rate(self.attack_rate), samples);
                 // Attack ramps DOWN to 0 (= loudest).
                 self.level_q16 = self.level_q16.saturating_sub(step);
                 if self.level_q16 == 0 {
@@ -554,7 +689,7 @@ impl Envelope {
                 }
             }
             EnvPhase::Decay => {
-                let step = advance(self.effective_rate(self.decay_rate), samples);
+                let step = decay_advance(self.effective_rate(self.decay_rate), samples);
                 self.level_q16 = self.level_q16.saturating_add(step);
                 // Sustain level: 8 envelope-levels per SL-step (3 dB
                 // per SL-step ÷ 0.375 dB per env-level = 8). SL=15
@@ -568,8 +703,8 @@ impl Envelope {
             EnvPhase::Sustain => {
                 if !self.egt_sustain {
                     // Percussive: continue toward silence at the
-                    // release rate.
-                    let step = advance(self.effective_rate(self.release_rate), samples);
+                    // release rate (Table III-7 column).
+                    let step = decay_advance(self.effective_rate(self.release_rate), samples);
                     self.level_q16 = self.level_q16.saturating_add(step).min(ENV_MAX_LEVEL << 16);
                     if self.level_q16 >= ENV_MAX_LEVEL << 16 {
                         self.phase = EnvPhase::Idle;
@@ -578,7 +713,7 @@ impl Envelope {
                 // Sustained tone: hold here until key-off.
             }
             EnvPhase::Release => {
-                let step = advance(self.effective_rate(self.release_rate), samples);
+                let step = decay_advance(self.effective_rate(self.release_rate), samples);
                 self.level_q16 = self.level_q16.saturating_add(step).min(ENV_MAX_LEVEL << 16);
                 if self.level_q16 >= ENV_MAX_LEVEL << 16 {
                     self.phase = EnvPhase::Idle;
@@ -2042,6 +2177,144 @@ mod tests {
         assert_eq!(ch.modulator.env.rks, 2);
         assert_eq!(ch.carrier.env.rks, 11);
     }
+
+    // ----------------------------------------------- §III-7 decay-time table
+
+    /// **Yamaha YM2413 Application Manual Table III-7** spot-checks
+    /// against the table's documented `EG decay time, 0 dB → 40 dB`
+    /// column. The values are stored in our table as hundredths of
+    /// milliseconds (= 10 µs units).
+    ///
+    /// Row spot-checks reproduce both extremes plus a mid-RATE row.
+    #[test]
+    fn table_iii_7_decay_time_spot_checks_against_manual() {
+        // RATE = 4·RM + RL.
+        // RM=15, RL=3 → RATE=63 → 1.27 ms → 127 hundredths.
+        assert_eq!(TABLE_III_7_DECAY_HUNDREDTHS_MS[63], 127);
+        // RM=1, RL=0 → RATE=4 → 20926.60 ms → 2_092_660 hundredths.
+        assert_eq!(TABLE_III_7_DECAY_HUNDREDTHS_MS[4], 2_092_660);
+        // RM=8, RL=0 → RATE=32 → 163.49 ms → 16_349 hundredths.
+        assert_eq!(TABLE_III_7_DECAY_HUNDREDTHS_MS[32], 16_349);
+        // RM=12, RL=0 → RATE=48 → 10.22 ms → 1_022 hundredths.
+        assert_eq!(TABLE_III_7_DECAY_HUNDREDTHS_MS[48], 1_022);
+        // RM=6, RL=3 → RATE=27 → 375.98 ms → 37_598 hundredths.
+        assert_eq!(TABLE_III_7_DECAY_HUNDREDTHS_MS[27], 37_598);
+    }
+
+    /// RATE 0..=3 are not tabulated in Table III-7 (the manual's
+    /// rows start at RM=1, RL=0 → RATE=4). The implementation
+    /// defaults those entries to zero (halt); `R=0` is the
+    /// documented `RATE=0` halt case from §III-1-2.
+    #[test]
+    fn table_iii_7_below_rate_four_is_halt() {
+        for rate in 0u8..=3 {
+            assert_eq!(
+                TABLE_III_7_DECAY_HUNDREDTHS_MS[rate as usize], 0,
+                "RATE={rate} is not tabulated by Table III-7"
+            );
+            assert_eq!(
+                decay_step_q16_per_sample(rate),
+                0,
+                "decay_step_q16_per_sample({rate}) must halt for RATE<4"
+            );
+        }
+    }
+
+    /// Faster RATE → larger Q16 envelope-level step per sample. The
+    /// manual's decay-time column is strictly monotone non-decreasing
+    /// from RATE=63 (1.27 ms, fastest) down to RATE=4 (20926.60 ms,
+    /// slowest), so the per-sample step is strictly monotone
+    /// non-increasing in the same direction.
+    #[test]
+    fn table_iii_7_step_is_monotone_in_rate() {
+        let mut prev = 0u32; // RATE=3 → halt
+        for rate in 4u8..=63 {
+            let s = decay_step_q16_per_sample(rate);
+            assert!(
+                s >= prev,
+                "decay_step must not decrease with RATE: rate={rate} prev={prev} cur={s}"
+            );
+            prev = s;
+        }
+    }
+
+    /// At a fixed RATE, the envelope's accumulated decay (Q16
+    /// envelope-levels per sample × samples) should traverse the
+    /// 40 dB span in approximately the tabulated time. We use
+    /// RATE=32 (163.49 ms) at the OPLL operator sample rate
+    /// (≈49 716 Hz) — 8128 samples — and assert the step × sample
+    /// count matches the manual within ±2 % (rounding from the
+    /// 0.01 ms × 49 716 / 100 000 path plus the 40-dB Q16 round).
+    #[test]
+    fn table_iii_7_step_traverses_40_db_in_tabulated_time() {
+        let rate = 32u8;
+        let step = decay_step_q16_per_sample(rate) as u64;
+        // Hundredths of ms × 49 716 / 100 000 = samples in tabulated
+        // time. RATE=32 → 16_349 × 49_716 / 100_000 = 8_127.7 → 8_127
+        // samples.
+        let hundredths_ms = TABLE_III_7_DECAY_HUNDREDTHS_MS[rate as usize] as u64;
+        let total_samples = hundredths_ms * 49_716 / 100_000;
+        // Accumulated 40-dB target in Q16 envelope-levels.
+        let traversal = step * total_samples;
+        let expected = ENV_LEVELS_40_DB_Q16;
+        // Allow ±2 % tolerance for the integer rounding.
+        let lower = expected * 98 / 100;
+        let upper = expected * 102 / 100;
+        assert!(
+            (lower..=upper).contains(&traversal),
+            "RATE={rate}: step={step} × samples={total_samples} = \
+             {traversal}, expected ≈ {expected} (±2 %)"
+        );
+    }
+
+    /// The footnote on page 13 of the application manual reads
+    /// "Attenuation times of the release rate are the same as that
+    /// of the decay rate". The envelope step path enforces this by
+    /// reusing [`decay_step_q16_per_sample`] in the Release phase —
+    /// verify by running two identical envelopes at the same RATE
+    /// in Decay vs Release and observing the same per-sample level
+    /// change.
+    #[test]
+    fn release_phase_uses_same_per_sample_step_as_decay() {
+        let mut e_decay = Envelope::default();
+        // AR=15 (instant attack), DR=8 (mid-range, exercises
+        // Table III-7 RATE=32 with Rks=0), SL=15 (sustain at max
+        // attenuation = release boundary), RR=8.
+        e_decay.load_from_patch(15, 8, 15, 8, true);
+        e_decay.key_on();
+        // Force into Decay phase explicitly.
+        e_decay.phase = EnvPhase::Decay;
+        e_decay.level_q16 = 0;
+
+        let mut e_release = e_decay;
+        e_release.phase = EnvPhase::Release;
+
+        // Step both by the same count and compare level deltas while
+        // each stays in its own phase.
+        for _ in 0..256 {
+            let before_d = e_decay.level_q16;
+            let before_r = e_release.level_q16;
+            e_decay.step(1);
+            e_release.step(1);
+            // Skip the boundary samples where Decay flips to Sustain
+            // and Release flips to Idle.
+            if !matches!(e_decay.phase, EnvPhase::Decay)
+                || !matches!(e_release.phase, EnvPhase::Release)
+            {
+                break;
+            }
+            let delta_d = e_decay.level_q16.saturating_sub(before_d);
+            let delta_r = e_release.level_q16.saturating_sub(before_r);
+            assert_eq!(
+                delta_d, delta_r,
+                "Decay vs Release per-sample step must match per the \
+                 page-13 footnote: delta_decay={delta_d} \
+                 delta_release={delta_r}"
+            );
+        }
+    }
+
+    // ----------------------------------------------- KSR (continued)
 
     /// `OpllChannel::load_patch` pulls the per-operator KSR bit from
     /// the patch byte and immediately re-derives Rks against the

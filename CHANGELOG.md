@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OPLL §III-7 envelope decay-time per RATE — Yamaha YM2413
+  Application Manual Table III-7** (round 232): the manual's
+  "Attack and decay times in relation to RATE" table on page 14
+  of the staged application manual
+  (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf`;
+  HTML mirror `ym2413-application-manual-smspower.html`) is now
+  the source of truth for the OPLL envelope generator's per-RATE
+  step magnitude on the Decay, percussive-Sustain, and Release
+  phases. The "EG decay time 0 dB → 40 dB" column is transcribed
+  as `opll::TABLE_III_7_DECAY_HUNDREDTHS_MS` (units of 0.01 ms),
+  indexed by the post-key-scale `RATE = 4·R + Rks` (0..=63 — the
+  same `RATE` produced by `Envelope::effective_rate`). The new
+  helper `opll::decay_step_q16_per_sample(rate)` converts a table
+  entry into a per-OPLL-sample Q16 envelope-level increment that
+  traverses the 40-dB span in the tabulated time at the OPLL
+  operator clock (49.7163 kHz). The page-13 footnote
+  "Attenuation times of the release rate are the same as that of
+  the decay rate" is honoured by reusing the same lookup on the
+  Release phase. Round 16's `2^(rate-1)` Q16-units-per-sample
+  monotonic ladder is gone from those three phases (it remains on
+  Attack pending a separate landing for the 10 %–90 % attack-curve
+  column). RATE 0..=3 are not tabulated by the manual and default
+  to halt; the `R=0 → RATE=0` carve-out from §III-1-2 is
+  upstream-honoured by `effective_rate`. 4 new unit tests cover
+  the table: spot-checks against five (RM, RL) cells of the
+  manual (`RM=15 RL=3 → 1.27 ms`, `RM=1 RL=0 → 20926.60 ms`,
+  `RM=8 RL=0 → 163.49 ms`, `RM=12 RL=0 → 10.22 ms`,
+  `RM=6 RL=3 → 375.98 ms`), the RATE-below-4 halt invariant
+  with both table-zero and step-zero assertions, monotonicity of
+  `decay_step_q16_per_sample` across RATE 4..=63, end-to-end
+  traversal that `step × samples ≈ 40 dB` at RATE=32 (within
+  ±2 %), and a Decay-vs-Release parity check that the per-sample
+  level delta matches between the two phases per the page-13
+  footnote.
+
+  Note: the manual's own caveat "Likely transcription errors
+  here, especially lower in the table" applies to two visible
+  anomalies (`RM=9 RL=2` and `RM=3 RL=0`) in the unused 10 %–90 %
+  column; the consumed 0–40 dB column is reproduced as printed.
+
 - **OPLL §4 KSL byte base table — Yamaha YM2413 Application Manual
   Table III-5** (round 228): the §4 KSL attenuation byte base table,
   previously a zero scaffold for blocks 1..=7, is now sourced from
