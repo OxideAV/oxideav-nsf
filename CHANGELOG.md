@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OPLL §III-7 envelope attack-time per RATE — Yamaha YM2413
+  Application Manual Table III-7** (round 262): the manual's
+  "Attack and decay times in relation to RATE" table on page 14
+  of the staged application manual
+  (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf`;
+  HTML mirror `ym2413-application-manual-smspower.html`) is now
+  also the source of truth for the OPLL envelope generator's
+  per-RATE step magnitude on the Attack phase. The "EG attack
+  time 0 dB → 40 dB" column is transcribed as
+  `opll::TABLE_III_7_ATTACK_HUNDREDTHS_MS` (units of 0.01 ms),
+  indexed by the post-key-scale `RATE = 4·R + Rks` (0..=63 — the
+  same `RATE` produced by `Envelope::effective_rate`). The new
+  helper `opll::attack_step_q16_per_sample(rate)` converts each
+  table entry into the per-OPLL-sample Q16 envelope-level
+  decrement that traverses the 40-dB attack span in the
+  tabulated time at the OPLL operator clock (49.7163 kHz).
+  `Envelope::step` now consults this helper in the Attack phase
+  — the round-14 `2^(rate-1)` Q16-units-per-sample monotonic
+  ladder is gone from the Attack phase too, so all four envelope
+  phases (Attack / Decay / percussive-Sustain / Release) are
+  now table-sourced. RATE 0..=3 are not tabulated by the manual
+  (treated as halt); RATE 60..=63 (RM=15, any RL) are tabulated
+  as `0.00 ms` and interpreted as instantaneous attack
+  (`u32::MAX` step, saturating `level_q16` to zero in one
+  sample). 6 new unit tests cover the table: five (RM, RL) spot
+  checks against the manual (`RM=15 RL=0..3 → 0.00 ms`,
+  `RM=1 RL=0 → 1730.15 ms`, `RM=8 RL=0 → 13.52 ms`,
+  `RM=12 RL=0 → 0.84 ms`, `RM=6 RL=3 → 30.90 ms`,
+  `RM=10 RL=2 → 2.25 ms`), the RATE-below-4 halt invariant with
+  both table-zero and step-zero assertions, the RATE 60..=63
+  instantaneous-attack saturation (envelope reaches
+  `level_q16 == 0` in a single `step(1)` call), monotonicity of
+  `attack_step_q16_per_sample` across RATE 4..=63, end-to-end
+  traversal that `step × samples ≈ 40 dB` at RATE=32 (within
+  ±2 %), the cross-column property that at every shared RATE
+  the per-sample attack step is strictly larger than the
+  decay step (the manual's attack column is uniformly shorter
+  than the decay column at each RATE — attack is ≈10–12× faster
+  than decay at the same RATE), and an end-to-end Envelope check
+  that a slow attack (RATE=32) takes strictly more `step(1)`
+  calls to clear the Attack phase than a fast attack (RATE=48).
+
+  Note: the same "Likely transcription errors here, especially
+  lower in the table" footnote that applied to the decay column
+  applies here. The two visibly anomalous cells (`RM=9 RL=2` and
+  `RM=3 RL=0`) surface only in the unused `10 % - 90 %` column;
+  the consumed `0 dB - 40 dB` attack column is reproduced as
+  printed.
+
 - **OPLL §III-7 envelope decay-time per RATE — Yamaha YM2413
   Application Manual Table III-7** (round 232): the manual's
   "Attack and decay times in relation to RATE" table on page 14

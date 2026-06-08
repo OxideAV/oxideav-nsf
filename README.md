@@ -192,6 +192,36 @@ field's `..AA AAAA` 6-bit masking, the re-enable phase reset, the
 §"Frequency Control ($9003)" halt-overrides-everything rule, and
 the disabled-tick holds-zero invariant.
 
+Round 262 lands the OPLL envelope per-RATE Attack step from the
+same **Yamaha YM2413 Application Manual Table III-7** the decay
+column already came from
+(`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf` p. 14;
+HTML mirror `ym2413-application-manual-smspower.html`). The
+manual's "EG attack time, 0 dB → 40 dB" column is transcribed as
+`opll::TABLE_III_7_ATTACK_HUNDREDTHS_MS` (units of 0.01 ms),
+indexed by the post-key-scale `RATE = 4·R + Rks` (0..=63 — same
+`RATE` produced by `Envelope::effective_rate`). The new helper
+`opll::attack_step_q16_per_sample(rate)` converts each entry into
+the per-OPLL-sample Q16 envelope-level step that traverses the
+40-dB attack span in the tabulated time at the OPLL operator
+clock (≈49.7163 kHz). `Envelope::step` now consults this helper in
+the Attack phase — the round-14 `2^(rate-1)` Q16-units-per-sample
+ladder is gone. RATE 0..=3 are not tabulated (treated as halt);
+RATE 60..=63 are tabulated as `0.00 ms` (instantaneous attack,
+saturated to one-sample collapse). 6 new unit tests cover the
+table: five (RM, RL) spot-checks against the manual (`RM=15 → 0
+ms` at all RL, `RM=1 RL=0 → 1730.15 ms`, `RM=8 RL=0 → 13.52 ms`,
+`RM=12 RL=0 → 0.84 ms`, `RM=6 RL=3 → 30.90 ms`, `RM=10 RL=2 → 2.25
+ms`), the RATE-below-4 halt invariant, the RATE 60..=63
+instantaneous saturation (envelope reaches `level_q16==0` in one
+step), monotonicity of `attack_step_q16_per_sample` across RATE
+4..=63, end-to-end traversal that `step × samples ≈ 40 dB` at
+RATE=32 (within ±2 %), attack-step > decay-step at every shared
+RATE (per the manual's separately-tabulated attack vs decay
+columns), and a count-of-attack-steps comparison between RATE=32
+and RATE=48 confirming the slow rate takes strictly more steps to
+clear the attack phase than the fast one.
+
 Round 232 lands the OPLL envelope per-RATE decay step from
 **Yamaha YM2413 Application Manual Table III-7 ("Attack and
 decay times in relation to RATE")** page 14
@@ -542,13 +572,13 @@ fail and signal the per-block first-sample validation pass.
   Application Manual Table III-7** ("Attack and decay times in
   relation to RATE") — the manual's "EG decay time 0 dB → 40 dB"
   column is now the source of truth for the per-RATE envelope-
-  level step on those three phases. Remaining numeric DOCS-GAPs
+  level step on those three phases. Round 262 extended the
+  same Table III-7 lookup to the Attack phase using the
+  manual's "EG attack time 0 dB → 40 dB" column — the
+  round-14 `2^(rate-1)` Q16-units-per-sample ladder is now
+  gone from every envelope phase. Remaining numeric DOCS-GAP
   (flagged provenance-pending in the staging's §"Provenance &
-  non-emulator sourcing" appendix): the Attack-phase per-RATE
-  step magnitude (the manual's Table III-7 also tabulates the
-  attack-time column, but it is the 10 %–90 % exponential-rise
-  envelope — qualitatively different from the linear decay
-  column and a follow-up landing), and the §7 LFO numeric step
+  non-emulator sourcing" appendix): the §7 LFO numeric step
   arrays for AM (tremolo) + VIB (vibrato) — the test register
   `$0F` bits 1 + 3 are wired and recorded but have no audible
   effect until the LFO lands. Rhythm-mode operator allocation

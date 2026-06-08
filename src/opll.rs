@@ -35,8 +35,16 @@
 //! **Yamaha YM2413 Application Manual Table III-7
 //! ("Attack and decay times in relation to RATE")** page 14 — see
 //! [`TABLE_III_7_DECAY_HUNDREDTHS_MS`] / [`decay_step_q16_per_sample`].
-//! The Attack phase still uses the prior monotonic coarse ladder
-//! pending a separate landing for the 10 %–90 % attack-curve column.
+//! The Attack phase consults the same Table III-7's `EG attack time,
+//! 0 dB → 40 dB` column via
+//! [`TABLE_III_7_ATTACK_HUNDREDTHS_MS`] / [`attack_step_q16_per_sample`]
+//! — the per-sample step is computed as the linear-equivalent ramp that
+//! traverses the 40 dB span in the tabulated time, mirroring the decay
+//! treatment. The manual's exponential 10 %–90 % rise envelope is
+//! qualitatively different (the §III-3 attack curve "rises
+//! exponentially during attack time") but the 0 dB → 40 dB total time
+//! is exactly what we need for the linear-step approximation already
+//! in use for decay.
 //!
 //! KSR (Key Scale of RATE) IS fully specified by the YM2413
 //! Application Manual §III-1-2 + Table III-2 (mirrored in
@@ -356,6 +364,111 @@ pub fn decay_step_q16_per_sample(rate: u8) -> u32 {
     }
 }
 
+/// **Yamaha YM2413 Application Manual Table III-7** — EG attack time
+/// (`0 dB → 40 dB` column) in units of 0.01 ms, indexed by the
+/// post-key-scale `RATE = RM·4 + RL` (0..=63).
+///
+/// Source: page 14 of the application manual
+/// (`docs/audio/nsf/opll-ym2413/ym2413-application-manual.pdf`;
+/// HTML mirror `ym2413-application-manual-smspower.html`). The table
+/// is the parallel column to `TABLE_III_7_DECAY_HUNDREDTHS_MS` — the
+/// attack envelope's §III-3 description "rises exponentially during
+/// attack time" so the manual's `10 % - 90 %` column captures a
+/// different waveform feature; the `0 dB - 40 dB` column tabulates
+/// the total attack-span traversal time, which is the quantity the
+/// envelope generator needs to derive the per-sample step.
+///
+/// Entries 0..=3 are not tabulated by the manual and are set to
+/// zero here (treated as halt by [`attack_step_q16_per_sample`]);
+/// [`Envelope::effective_rate`]'s `4·R + Rks` formula never
+/// produces a RATE below 4 when `R ≥ 1`.
+///
+/// Entries 60..=63 (RM=15, any RL) are tabulated as `0.00 ms` in the
+/// manual — interpreted by [`attack_step_q16_per_sample`] as
+/// "instantaneous attack" (returns `u32::MAX`, which saturates
+/// `level_q16` to zero within one sample).
+///
+/// The same manual footnote that flags the decay column applies here:
+/// "Likely transcription errors here, especially lower in the table".
+/// The same two visibly anomalous cells (`RM=9 RL=2` and `RM=3 RL=0`)
+/// surface in the unused `10 % - 90 %` column; the consumed
+/// `0 dB - 40 dB` column is reproduced as printed.
+pub const TABLE_III_7_ATTACK_HUNDREDTHS_MS: [u32; 64] = [
+    // RATE 0..3 — not tabulated; treated as halt.
+    0, 0, 0, 0, // RATE 4..7 (RM=1, RL=0..3): 1730.15, 1400.60, 1153.43, 988.66 ms.
+    173_015, 140_060, 115_343, 98_866,
+    // RATE 8..11 (RM=2, RL=0..3): 865.88, 780.30, 576.72, 494.33 ms.
+    86_588, 78_030, 57_672, 49_433,
+    // RATE 12..15 (RM=3, RL=0..3): 432.54, 358.15, 280.36, 247.16 ms.
+    43_254, 35_815, 28_036, 24_716,
+    // RATE 16..19 (RM=4, RL=0..3): 216.27, 175.07, 144.48, 123.50 ms.
+    21_627, 17_507, 14_448, 12_350,
+    // RATE 20..23 (RM=5, RL=0..3): 108.13, 87.54, 72.89, 61.79 ms.
+    10_813, 8_754, 7_289, 6_179,
+    // RATE 24..27 (RM=6, RL=0..3): 54.87, 43.77, 36.04, 30.90 ms.
+    5_487, 4_377, 3_604, 3_090,
+    // RATE 28..31 (RM=7, RL=0..3): 27.03, 21.00, 18.02, 15.45 ms.
+    2_703, 2_100, 1_802, 1_545,
+    // RATE 32..35 (RM=8, RL=0..3): 13.52, 10.94, 9.01, 7.72 ms.
+    1_352, 1_094, 901, 772, // RATE 36..39 (RM=9, RL=0..3): 6.76, 5.47, 4.51, 3.86 ms.
+    676, 547, 451, 386, // RATE 40..43 (RM=10, RL=0..3): 3.30, 2.74, 2.25, 1.93 ms.
+    330, 274, 225, 193, // RATE 44..47 (RM=11, RL=0..3): 1.69, 1.37, 1.13, 0.97 ms.
+    169, 137, 113, 97, // RATE 48..51 (RM=12, RL=0..3): 0.84, 0.70, 0.60, 0.54 ms.
+    84, 70, 60, 54, // RATE 52..55 (RM=13, RL=0..3): 0.50, 0.42, 0.34, 0.30 ms.
+    50, 42, 34, 30, // RATE 56..59 (RM=14, RL=0..3): 0.28, 0.22, 0.18, 0.14 ms.
+    28, 22, 18, 14,
+    // RATE 60..63 (RM=15, RL=0..3): 0.00, 0.00, 0.00, 0.00 ms
+    // (treated as instantaneous attack by attack_step_q16_per_sample).
+    0, 0, 0, 0,
+];
+
+/// Per-sample Q16 envelope-level step for the documented `RATE` per
+/// **Yamaha YM2413 Application Manual Table III-7** column "EG attack
+/// time 0 dB → 40 dB".
+///
+/// Returns the increment (in Q16 fixed-point envelope-levels) that
+/// would carry the envelope through the 40-dB attack span in exactly
+/// the tabulated time at the OPLL per-operator rate
+/// ([`OPLL_SAMPLE_RATE_HZ`] ≈ 49.7163 kHz). Used by [`Envelope::step`]
+/// for the Attack phase.
+///
+/// Special cases:
+/// * RATE 0..=3 return zero (halt) — the manual does not tabulate
+///   them and `R=0` is the documented halt case from §III-1-2.
+/// * RATE 60..=63 are tabulated as `0.00 ms` (instantaneous attack):
+///   the helper returns `u32::MAX` so the envelope saturates to zero
+///   (= loudest) in a single `Envelope::step` call.
+#[inline]
+pub fn attack_step_q16_per_sample(rate: u8) -> u32 {
+    let r = (rate & 0x3F) as usize;
+    let hundredths_ms = TABLE_III_7_ATTACK_HUNDREDTHS_MS[r];
+    if hundredths_ms == 0 {
+        // RATE 0..=3 → halt (R=0 carve-out, honoured upstream by
+        // Envelope::effective_rate);
+        // RATE 60..=63 → tabulated 0.00 ms = instantaneous attack.
+        if r >= 4 {
+            return u32::MAX;
+        }
+        return 0;
+    }
+    // total_samples = (hundredths_ms / 100_000) seconds × sample_rate
+    //               = hundredths_ms × sample_rate / 100_000
+    // (matches decay_step_q16_per_sample's integer-49 716 path).
+    const SAMPLE_RATE_HZ_INT: u64 = 49_716;
+    let total_samples = (hundredths_ms as u64).saturating_mul(SAMPLE_RATE_HZ_INT) / 100_000;
+    if total_samples == 0 {
+        // RATE 56..=59: 0.14..0.28 ms × 49 716 / 100 000 ≈ 70..139
+        // samples — never zero. Defensive fallthrough only.
+        return u32::MAX;
+    }
+    let step = ENV_LEVELS_40_DB_Q16 / total_samples;
+    if step > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        step as u32
+    }
+}
+
 // -------------------------------------------------------------- §6 logsin / exp
 
 /// Number of entries in the log-sin and exp ROMs.
@@ -653,24 +766,20 @@ impl Envelope {
     /// rate are the same as that of the decay rate", so the Release
     /// (and percussive Sustain) path reuses the decay column.
     ///
-    /// The **Attack** phase still uses the prior monotonic coarse
-    /// ladder (`2^(rate-1)` Q16-units per sample) — the manual's
-    /// attack-time column tabulates the 10 %–90 % exponential rise
-    /// envelope, which is qualitatively a different curve than the
-    /// linear decay column and is a follow-up landing.
+    /// The **Attack** phase consults the same Table III-7's
+    /// `EG attack time, 0 dB → 40 dB` column via
+    /// [`attack_step_q16_per_sample`], computing the linear-equivalent
+    /// per-sample ramp that traverses the 40-dB span in the tabulated
+    /// time. RATE 60..=63 (RM=15) are tabulated as `0.00 ms` —
+    /// instantaneous attack, saturating `level_q16` to zero in one
+    /// sample.
     ///
     /// [`effective_rate`]: Envelope::effective_rate
     pub fn step(&mut self, samples: u32) {
-        // Attack uses the prior monotonic ladder pending a separate
-        // Table III-7 attack-curve landing.
-        let attack_advance = |rate: u8, s: u32| -> u32 {
-            if rate == 0 {
-                0
-            } else {
-                let shift = (rate as u32 - 1).min(31);
-                (1u32 << shift).saturating_mul(s)
-            }
-        };
+        // Attack pulls the Q16 step from Table III-7's "EG attack
+        // time 0 dB → 40 dB" column.
+        let attack_advance =
+            |rate: u8, s: u32| -> u32 { attack_step_q16_per_sample(rate).saturating_mul(s) };
         // Decay / Sustain (percussive) / Release pull the Q16 step
         // from Table III-7 directly.
         let decay_advance =
@@ -2312,6 +2421,202 @@ mod tests {
                  delta_release={delta_r}"
             );
         }
+    }
+
+    // ----------------------------------------------- §III-7 attack-time table
+
+    /// **Yamaha YM2413 Application Manual Table III-7** spot-checks
+    /// against the table's documented `EG attack time, 0 dB → 40 dB`
+    /// column. The values are stored in our table as hundredths of
+    /// milliseconds (= 10 µs units).
+    ///
+    /// Row spot-checks reproduce both extremes plus three mid-RATE
+    /// rows.
+    #[test]
+    fn table_iii_7_attack_time_spot_checks_against_manual() {
+        // RATE = 4·RM + RL.
+        // RM=15, RL=0..3 → RATE=60..63 → 0.00 ms (instant attack).
+        for rate in 60u8..=63 {
+            assert_eq!(
+                TABLE_III_7_ATTACK_HUNDREDTHS_MS[rate as usize], 0,
+                "RATE={rate} must be 0.00 ms per the manual's RM=15 row"
+            );
+        }
+        // RM=1, RL=0 → RATE=4 → 1730.15 ms → 173_015 hundredths
+        // (the slowest tabulated attack).
+        assert_eq!(TABLE_III_7_ATTACK_HUNDREDTHS_MS[4], 173_015);
+        // RM=8, RL=0 → RATE=32 → 13.52 ms → 1_352 hundredths.
+        assert_eq!(TABLE_III_7_ATTACK_HUNDREDTHS_MS[32], 1_352);
+        // RM=12, RL=0 → RATE=48 → 0.84 ms → 84 hundredths.
+        assert_eq!(TABLE_III_7_ATTACK_HUNDREDTHS_MS[48], 84);
+        // RM=6, RL=3 → RATE=27 → 30.90 ms → 3_090 hundredths.
+        assert_eq!(TABLE_III_7_ATTACK_HUNDREDTHS_MS[27], 3_090);
+        // RM=10, RL=2 → RATE=42 → 2.25 ms → 225 hundredths.
+        assert_eq!(TABLE_III_7_ATTACK_HUNDREDTHS_MS[42], 225);
+    }
+
+    /// RATE 0..=3 are not tabulated in Table III-7 (the manual's
+    /// rows start at RM=1, RL=0 → RATE=4). The implementation
+    /// defaults those entries to zero (halt); `R=0` is the
+    /// documented `RATE=0` halt case from §III-1-2.
+    #[test]
+    fn table_iii_7_attack_below_rate_four_is_halt() {
+        for rate in 0u8..=3 {
+            assert_eq!(
+                TABLE_III_7_ATTACK_HUNDREDTHS_MS[rate as usize], 0,
+                "RATE={rate} is not tabulated by Table III-7 attack column"
+            );
+            assert_eq!(
+                attack_step_q16_per_sample(rate),
+                0,
+                "attack_step_q16_per_sample({rate}) must halt for RATE<4"
+            );
+        }
+    }
+
+    /// RATE 60..=63 (RM=15, any RL) are tabulated as 0.00 ms in the
+    /// manual — interpreted as instantaneous attack. The helper
+    /// returns `u32::MAX` so a single `Envelope::step` saturates
+    /// `level_q16` to zero (= loudest).
+    #[test]
+    fn table_iii_7_attack_rate_sixty_to_sixty_three_is_instantaneous() {
+        for rate in 60u8..=63 {
+            assert_eq!(
+                attack_step_q16_per_sample(rate),
+                u32::MAX,
+                "RATE={rate} attack must be instantaneous (u32::MAX step)"
+            );
+        }
+        // End-to-end: an envelope at the maximum attenuation level
+        // (silent) with AR producing RATE=63 collapses to zero in
+        // exactly one step call.
+        let mut e = Envelope {
+            rks: 3, // 4·15 + 3 = 63
+            ..Default::default()
+        };
+        e.load_from_patch(15, 0, 0, 0, true);
+        e.key_on();
+        e.level_q16 = ENV_MAX_LEVEL << 16;
+        e.step(1);
+        assert_eq!(e.level_q16, 0);
+        assert_eq!(e.phase, EnvPhase::Decay);
+    }
+
+    /// Faster RATE → larger Q16 envelope-level step per sample. The
+    /// manual's attack-time column is monotone non-decreasing from
+    /// RATE=63 (0.00 ms, instant) down to RATE=4 (1730.15 ms,
+    /// slowest), so the per-sample step is monotone non-decreasing
+    /// from slow to fast RATE (and ties are allowed when adjacent
+    /// table cells round to the same per-sample integer).
+    #[test]
+    fn table_iii_7_attack_step_is_monotone_in_rate() {
+        let mut prev = 0u32; // RATE=3 → halt
+        for rate in 4u8..=63 {
+            let s = attack_step_q16_per_sample(rate);
+            assert!(
+                s >= prev,
+                "attack_step must not decrease with RATE: rate={rate} prev={prev} cur={s}"
+            );
+            prev = s;
+        }
+    }
+
+    /// At a fixed RATE the envelope's accumulated attack ramp (Q16
+    /// envelope-levels per sample × samples) should traverse the
+    /// 40 dB span in approximately the tabulated time. We use
+    /// RATE=32 (13.52 ms) at the OPLL operator sample rate
+    /// (≈49 716 Hz) — ~672 samples — and assert the step × sample
+    /// count matches the manual within ±2 % (rounding from the
+    /// 0.01 ms × 49 716 / 100 000 path plus the 40-dB Q16 round).
+    #[test]
+    fn table_iii_7_attack_step_traverses_40_db_in_tabulated_time() {
+        let rate = 32u8;
+        let step = attack_step_q16_per_sample(rate) as u64;
+        let hundredths_ms = TABLE_III_7_ATTACK_HUNDREDTHS_MS[rate as usize] as u64;
+        let total_samples = hundredths_ms * 49_716 / 100_000;
+        let traversal = step * total_samples;
+        let expected = ENV_LEVELS_40_DB_Q16;
+        // Allow ±2 % tolerance for integer rounding.
+        let lower = expected * 98 / 100;
+        let upper = expected * 102 / 100;
+        assert!(
+            (lower..=upper).contains(&traversal),
+            "RATE={rate}: step={step} × samples={total_samples} = \
+             {traversal}, expected ≈ {expected} (±2 %)"
+        );
+    }
+
+    /// At a fixed RATE the attack and decay traversal *step* shapes
+    /// should follow the manual's separately-tabulated columns —
+    /// attack is roughly 10x faster than decay at the same RATE per
+    /// the table's documented spread (e.g. RATE=32: attack 13.52 ms
+    /// vs decay 163.49 ms — ratio ≈ 12.1).
+    ///
+    /// This anchors the relationship between the two columns: the
+    /// per-sample attack step should be strictly larger than the
+    /// per-sample decay step at the same RATE for every tabulated
+    /// row (since each column traverses the same 40-dB span in less
+    /// time, attack always steps further per sample).
+    #[test]
+    fn table_iii_7_attack_step_is_larger_than_decay_step_per_rate() {
+        for rate in 4u8..=59 {
+            let attack = attack_step_q16_per_sample(rate);
+            let decay = decay_step_q16_per_sample(rate);
+            assert!(
+                attack > decay,
+                "attack > decay at same RATE per Table III-7: \
+                 rate={rate} attack={attack} decay={decay}"
+            );
+        }
+        // RATE 60..=63: attack saturates to u32::MAX (instantaneous);
+        // decay is the tabulated 1.27 ms step. Maintain the strict
+        // ordering.
+        for rate in 60u8..=63 {
+            let attack = attack_step_q16_per_sample(rate);
+            let decay = decay_step_q16_per_sample(rate);
+            assert_eq!(attack, u32::MAX);
+            assert!(decay < u32::MAX);
+        }
+    }
+
+    /// End-to-end Envelope check: with a slow attack RATE the
+    /// envelope should take strictly more `step(1)` calls to reach
+    /// `level_q16 == 0` than with a fast attack RATE, per the
+    /// manual's RATE→time monotonicity. We compare RATE=32 (13.52 ms,
+    /// ~672 samples) to RATE=48 (0.84 ms, ~42 samples).
+    #[test]
+    fn envelope_attack_phase_consults_table_iii_7_attack_column() {
+        let count_attack_steps = |rate: u8| -> u32 {
+            // Choose R and Rks so 4·R + Rks = rate exactly.
+            // RATE=32 → R=8, Rks=0; RATE=48 → R=12, Rks=0.
+            let r = rate / 4;
+            let mut e = Envelope::default();
+            e.load_from_patch(r, 0, 0, 0, true);
+            e.key_on();
+            // Start at max attenuation (silent) so the attack span
+            // is the full ENV_MAX_LEVEL.
+            e.level_q16 = ENV_MAX_LEVEL << 16;
+            for i in 0..1_000_000u32 {
+                e.step(1);
+                if e.phase != EnvPhase::Attack {
+                    return i + 1;
+                }
+            }
+            u32::MAX
+        };
+        let slow = count_attack_steps(32);
+        let fast = count_attack_steps(48);
+        assert!(
+            slow > fast,
+            "slow attack (RATE=32) must take more steps than fast \
+             attack (RATE=48): slow={slow} fast={fast}"
+        );
+        // Sanity bounds: the slow attack should be roughly the
+        // ~672-sample 13.52 ms ballpark (40-dB span; tracking
+        // a 127-level envelope is ~3.17x further so a few thousand
+        // samples; bound generously).
+        assert!(slow < 10_000, "RATE=32 attack should be <10k samples");
+        assert!(fast < 1_000, "RATE=48 attack should be <1k samples");
     }
 
     // ----------------------------------------------- KSR (continued)
