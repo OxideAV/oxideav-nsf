@@ -222,6 +222,34 @@ columns), and a count-of-attack-steps comparison between RATE=32
 and RATE=48 confirming the slow rate takes strictly more steps to
 clear the attack phase than the fast one.
 
+Round 270 lands the OPLL AM (tremolo) + VIB (vibrato) LFO phase
+counters per `docs/audio/nsf/vrc7-audio-wiki.html`
+§"Test Register $0F" + §"Audio Reset ($E000)". A new `opll::Lfo`
+advances a tremolo phase once every `TREMOLO_LFO_DIVIDER` = 64
+per-operator samples and a vibrato phase once every
+`VIBRATO_LFO_DIVIDER` = 1024 samples in normal mode (the manual's
+"Tremolo is 64x faster, and vibrato is 1024x faster" describes the
+`$0F` bit-3 fast mode where both dividers are bypassed and advance
+once per sample); `$0F` bit 1 halts + resets both phases to zero.
+`Vrc7::tick` ticks the LFO once per emitted operator sample, so the
+phases track the 49.7163 kHz operator clock. The §"Audio Reset
+($E000)" asymmetry — "clear … (including tremolo LFO state, but not
+including vibrato LFO state)" — is honoured by `Lfo::audio_reset`:
+the tremolo phase clears while the vibrato phase is preserved
+through a `$E000` bit-6 reset. The `$0F` bits 1 + 3, recorded but
+inert since round 15, now drive observable phase machinery. The
+numeric AM/VIB *depth* step arrays (phase → audible attenuation /
+pitch offset) remain the documented DOCS-GAP flagged
+provenance-pending in the §7 appendix of
+`docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md`, so the LFO is
+not yet audible; the phase→depth read is the single remaining edit.
+7 new tests cover the 64 / 1024 cadence, fast-mode every-sample
+advance, the bit-1 hold-resets-and-pins invariant, the
+audio-reset tremolo-clear / vibrato-preserve asymmetry,
+hold-overrides-fast priority, and two `Vrc7`-level integration
+checks for the tick-driven phase advance and the chip-path
+`$E000` asymmetry.
+
 Round 232 lands the OPLL envelope per-RATE decay step from
 **Yamaha YM2413 Application Manual Table III-7 ("Attack and
 decay times in relation to RATE")** page 14
@@ -576,12 +604,17 @@ fail and signal the per-block first-sample validation pass.
   same Table III-7 lookup to the Attack phase using the
   manual's "EG attack time 0 dB → 40 dB" column — the
   round-14 `2^(rate-1)` Q16-units-per-sample ladder is now
-  gone from every envelope phase. Remaining numeric DOCS-GAP
-  (flagged provenance-pending in the staging's §"Provenance &
-  non-emulator sourcing" appendix): the §7 LFO numeric step
-  arrays for AM (tremolo) + VIB (vibrato) — the test register
-  `$0F` bits 1 + 3 are wired and recorded but have no audible
-  effect until the LFO lands. Rhythm-mode operator allocation
+  gone from every envelope phase. Round 270 wired the AM/VIB LFO
+  phase counters (`opll::Lfo`): tremolo advances once per 64
+  per-operator samples, vibrato once per 1024, both bypassed under
+  `$0F` bit 3, held+reset under `$0F` bit 1, and the `$E000` audio
+  reset clears tremolo phase but preserves vibrato phase. Remaining
+  numeric DOCS-GAP (flagged provenance-pending in the staging's
+  §"Provenance & non-emulator sourcing" appendix): the §7 LFO
+  numeric *depth* step arrays for AM (tremolo) + VIB (vibrato) —
+  the phase cadence is now live, but the phase→depth translation
+  that makes the LFO audible awaits those arrays. Rhythm-mode
+  operator allocation
   (`$0E` bit 5, drum channels at `$36`/`$37`/`$38`) is also out
   of scope — VRC7 has no rhythm DAC so the drum patches in the
   ROM are inaudible there, but a future YM2413 consumer (an

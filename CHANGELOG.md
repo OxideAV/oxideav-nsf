@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OPLL AM/VIB LFO phase counters + `$E000` audio-reset asymmetry**
+  (round 270): the VRC7/OPLL built-in tremolo (AM) + vibrato (VIB)
+  low-frequency oscillators now carry phase counters at the spec'd
+  cadence, per `docs/audio/nsf/vrc7-audio-wiki.html`
+  §"Test Register $0F" + §"Audio Reset ($E000)". A new
+  `opll::Lfo` struct advances a tremolo phase once every
+  `opll::TREMOLO_LFO_DIVIDER` = 64 per-operator samples and a vibrato
+  phase once every `opll::VIBRATO_LFO_DIVIDER` = 1024 samples in
+  normal mode — the manual's bit-3 note "Tremolo is 64x faster, and
+  vibrato is 1024x faster" describes the fast (`$0F` bit 3) mode where
+  both dividers are bypassed and both advance once per sample. `$0F`
+  bit 1 (hold) halts + resets both phases to zero per "Hold LFO phase
+  at zero. This halts, disables, and resets both the tremolo and
+  vibrato LFO." `Vrc7::tick` calls `Lfo::tick(hold_lfo, fast_lfo)`
+  once per emitted operator sample so the phases track the chip's
+  49.7163 kHz operator clock. The §"Audio Reset ($E000)" asymmetry
+  "clear its registers (including tremolo LFO state, but not including
+  vibrato LFO state)" is honoured by `Lfo::audio_reset` (called from
+  the `$E000` bit-6 reset path): the tremolo phase is cleared while
+  the vibrato phase is preserved. The two `$0F` bits 1 + 3 — recorded
+  but inert since round 15 — now drive observable phase machinery.
+  The numeric AM/VIB *depth* step arrays that translate phase into an
+  audible attenuation (tremolo) / pitch offset (vibrato) remain a
+  documented DOCS-GAP — flagged provenance-pending in the §7
+  "Provenance & non-emulator sourcing" appendix of
+  `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` — so the LFO has
+  no audible effect yet; the phase→depth read is the single remaining
+  edit once those arrays are staged. 7 new unit tests: the normal-mode
+  64 / 1024 divider cadence, fast-mode every-sample advance, the
+  bit-1 hold-resets-and-pins invariant, the audio-reset
+  tremolo-cleared / vibrato-preserved asymmetry, hold-overrides-fast
+  priority (5 in `opll`), plus 2 `Vrc7`-level integration tests that
+  `Vrc7::tick` advances both phases at the right ratio and that
+  `$E000` clears tremolo but preserves vibrato through the chip path.
+
 - **OPLL §III-7 envelope attack-time per RATE — Yamaha YM2413
   Application Manual Table III-7** (round 262): the manual's
   "Attack and decay times in relation to RATE" table on page 14

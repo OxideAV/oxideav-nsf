@@ -1283,6 +1283,17 @@ pub struct Vrc7 {
     /// while this bit is set." Default false (BIOS starts the chip
     /// in the unreset state).
     pub audio_reset_held: bool,
+    /// Built-in AM (tremolo) + VIB (vibrato) low-frequency
+    /// oscillators. Per `docs/audio/nsf/vrc7-audio-wiki.html`
+    /// §"Test Register $0F" the LFO phases advance once every 64
+    /// (tremolo) / 1024 (vibrato) per-operator samples in normal
+    /// mode, every sample under `$0F` bit 3, and are held+reset under
+    /// `$0F` bit 1. The §"Audio Reset ($E000)" clears the tremolo
+    /// phase but preserves the vibrato phase. Advanced once per
+    /// emitted operator sample in [`Vrc7::tick`]. The phase→depth
+    /// translation awaits the §7 AM/VIB depth step arrays (a
+    /// documented DOCS-GAP), so the LFO has no audible effect yet.
+    pub lfo: crate::opll::Lfo,
 }
 
 impl Default for Vrc7 {
@@ -1297,6 +1308,7 @@ impl Default for Vrc7 {
             latched_output: 0,
             test_register: crate::opll::TestRegister::default(),
             audio_reset_held: false,
+            lfo: crate::opll::Lfo::default(),
         }
     }
 }
@@ -1336,15 +1348,17 @@ impl Vrc7 {
                     // Entering reset: "silence the expansion audio
                     // and clear its registers (including tremolo LFO
                     // state, but not including vibrato LFO state)."
-                    // We don't model the LFOs yet (§7 DOCS-GAP), so
-                    // the LFO-state qualifier is a no-op today; the
-                    // register clear + silence are observable.
+                    // The tremolo phase is cleared and the vibrato
+                    // phase preserved by `Lfo::audio_reset` per the
+                    // §"Audio Reset ($E000)" asymmetry; the register
+                    // clear + silence are observable.
                     self.regs = [0u8; 0x40];
                     self.channels = [Vrc7Chan::default(); 6];
                     self.opll_channels = [crate::opll::OpllChannel::default(); 6];
                     self.latched_output = 0;
                     self.op_cycles_q8 = 0;
                     self.test_register = crate::opll::TestRegister::default();
+                    self.lfo.audio_reset();
                     // §"Test Register $0F" bit 1 reset semantics
                     // (LFO held + reset) overlap with the audio
                     // reset's LFO clear; both leave the LFO at
@@ -1484,6 +1498,12 @@ impl Vrc7 {
             // channel so bits 0/2 (envelope-bypass / phase-hold)
             // override the synthesis path uniformly.
             let test = self.test_register;
+            // Advance the built-in AM/VIB LFOs once per operator
+            // sample. `$0F` bit 1 holds+resets both phases; bit 3
+            // makes both advance every sample instead of once per
+            // 64 / 1024 samples. The phase is not yet read into the
+            // synthesis path (§7 depth-array DOCS-GAP).
+            self.lfo.tick(test.hold_lfo, test.fast_lfo);
             let mut sum: i32 = 0;
             for ch in &mut self.opll_channels {
                 if ch.is_active() || test.envs_zero {
@@ -4208,6 +4228,53 @@ mod tests {
             chip.tick(50);
             assert_eq!(chip.latched_output, 0);
         }
+    }
+
+    /// `Vrc7::tick` advances the built-in AM/VIB LFO phases once per
+    /// emitted operator sample, at the spec'd 64 / 1024 cadence. With
+    /// enough CPU cycles to emit ≥1024 operator samples, the tremolo
+    /// phase has stepped many times and the vibrato phase at least
+    /// once. Per `docs/audio/nsf/vrc7-audio-wiki.html`
+    /// §"Test Register $0F".
+    #[test]
+    fn vrc7_tick_advances_lfo_phases() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        // ~36 CPU cycles per operator sample; 1100 * 36 ≈ 39_600
+        // cycles emits ~1100 operator samples > 1024.
+        chip.tick(40_000);
+        assert!(
+            chip.lfo.tremolo_phase > 1,
+            "tremolo phase advanced: {}",
+            chip.lfo.tremolo_phase
+        );
+        assert!(
+            chip.lfo.vibrato_phase >= 1,
+            "vibrato phase advanced at least once: {}",
+            chip.lfo.vibrato_phase
+        );
+        // Tremolo is 16× faster than vibrato in normal mode.
+        assert!(chip.lfo.tremolo_phase > chip.lfo.vibrato_phase);
+    }
+
+    /// `$E000` audio reset clears the tremolo LFO phase but preserves
+    /// the vibrato LFO phase per `docs/audio/nsf/vrc7-audio-wiki.html`
+    /// §"Audio Reset ($E000)": "clear its registers (including
+    /// tremolo LFO state, but not including vibrato LFO state)."
+    #[test]
+    fn vrc7_audio_reset_clears_tremolo_lfo_preserves_vibrato_lfo() {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        chip.tick(80_000); // emit enough samples to step both phases
+        assert!(chip.lfo.tremolo_phase > 0);
+        let vib_before = chip.lfo.vibrato_phase;
+        assert!(vib_before > 0);
+        chip.write(0xE000, 0x40);
+        assert_eq!(chip.lfo.tremolo_phase, 0, "tremolo cleared on audio reset");
+        assert_eq!(
+            chip.lfo.vibrato_phase, vib_before,
+            "vibrato preserved across audio reset"
+        );
     }
 
     /// §"Audio Reset ($E000)": only bit 6 matters for audio. Other

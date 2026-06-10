@@ -22,8 +22,15 @@
 //! anything beyond that appendix is out-of-scope for this module.
 //!
 //! Numeric tables flagged as provenance-pending in the §"Provenance"
-//! appendix of `opll-ym2413-tables.md` — the §7 AM/VIB LFO step
-//! arrays — are not transcribed in this file. The §4 KSL pipeline
+//! appendix of `opll-ym2413-tables.md` — the §7 AM/VIB LFO depth step
+//! arrays — are not transcribed in this file. The LFO phase *cadence*
+//! (tremolo advances once per 64 operator samples, vibrato once per
+//! 1024, both bypassed under `$0F` bit 3 and held+reset under `$0F`
+//! bit 1, with the `$E000` audio reset clearing tremolo phase but
+//! preserving vibrato phase) IS fully specified by
+//! `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F" +
+//! §"Audio Reset ($E000)" and is implemented in [`Lfo`]; only the
+//! phase→depth translation awaits the §7 step arrays. The §4 KSL pipeline
 //! is wired through the operator path using the documented
 //! `(block_fnum_KSL_base) >> (3 - KSL)` formula, and the base byte
 //! table is now sourced from Yamaha YM2413 Application Manual
@@ -947,6 +954,139 @@ impl Operator {
     }
 }
 
+// -------------------------------------------------------------- LFO
+
+/// Tremolo (AM) LFO normal-mode divider: in normal operation the
+/// tremolo LFO advances once every 64 operator samples. Per
+/// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F" bit 3:
+/// "Update tremolo and vibrato LFOs every sample instead of once
+/// every several samples. (Tremolo is 64x faster, …)" — i.e. in the
+/// normal (bit-3-clear) state the tremolo phase advances once per 64
+/// per-operator samples, and 64× faster (once per sample) when bit 3
+/// is set.
+pub const TREMOLO_LFO_DIVIDER: u32 = 64;
+
+/// Vibrato (VIB) LFO normal-mode divider: in normal operation the
+/// vibrato LFO advances once every 1024 operator samples. Per the
+/// same §"Test Register $0F" bit 3 note "… and vibrato is 1024x
+/// faster" — i.e. normal-mode vibrato advances once per 1024
+/// per-operator samples, and once per sample when bit 3 is set.
+pub const VIBRATO_LFO_DIVIDER: u32 = 1024;
+
+/// The built-in AM (tremolo) + VIB (vibrato) low-frequency
+/// oscillators that drive the per-operator amplitude / pitch
+/// modulation when an operator's `$00`/`$01` AM / VIB bit is set.
+///
+/// This struct models the **LFO phase cadence and hold/reset
+/// semantics only** — the timing of how often each LFO advances, per
+/// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F" (bit 1
+/// hold-and-reset, bit 3 fast-update) and §"Audio Reset ($E000)"
+/// (tremolo phase cleared, vibrato phase preserved). It deliberately
+/// does **not** translate the phase into an attenuation (tremolo) or
+/// a pitch offset (vibrato): the numeric AM/VIB depth step arrays are
+/// flagged provenance-pending in the §7 "Provenance & non-emulator
+/// sourcing" appendix of
+/// `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` and are a
+/// documented DOCS-GAP. Wiring the phase counters now means the
+/// depth-array landing is a single edit on the (currently inert)
+/// phase→depth read, with no new timing machinery required.
+///
+/// The two phases are independent free-running step counters
+/// (`u32`); the eventual depth arrays will index them modulo their
+/// per-LFO period. The OPL family's AM phase is a triangle that
+/// repeats far below the sample rate, so a `u32` step counter never
+/// wraps in any realistic render length.
+///
+/// The two dividers count down from `N - 1` and step their phase when
+/// they reach 0 (then reload), so the first phase step lands on the
+/// `N`-th per-operator sample after a clear — matching "once every N
+/// samples".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lfo {
+    /// Per-operator-sample countdown to the next tremolo phase step.
+    /// Reaches 0 once every [`TREMOLO_LFO_DIVIDER`] samples in normal
+    /// mode (or every sample when `fast_lfo` is set), at which point
+    /// [`Lfo::tremolo_phase`] increments and the divider reloads.
+    pub tremolo_divider: u32,
+    /// Free-running tremolo phase step counter. Reset to 0 when the
+    /// `$0F` bit-1 hold is engaged and when the `$E000` audio reset
+    /// fires.
+    pub tremolo_phase: u32,
+    /// Per-operator-sample countdown to the next vibrato phase step.
+    /// Reaches 0 once every [`VIBRATO_LFO_DIVIDER`] samples in normal
+    /// mode (or every sample when `fast_lfo` is set).
+    pub vibrato_divider: u32,
+    /// Free-running vibrato phase step counter. Reset to 0 by the
+    /// `$0F` bit-1 hold, but — unlike tremolo — **preserved** across a
+    /// `$E000` audio reset per §"Audio Reset ($E000)".
+    pub vibrato_phase: u32,
+}
+
+impl Default for Lfo {
+    fn default() -> Self {
+        Self {
+            tremolo_divider: TREMOLO_LFO_DIVIDER - 1,
+            tremolo_phase: 0,
+            vibrato_divider: VIBRATO_LFO_DIVIDER - 1,
+            vibrato_phase: 0,
+        }
+    }
+}
+
+impl Lfo {
+    /// Advance the LFO phases by one per-operator sample.
+    ///
+    /// * `hold` is the `$0F` bit-1 state. Per §"Test Register $0F"
+    ///   bit 1: "Hold LFO phase at zero. This halts, disables, and
+    ///   resets both the tremolo and vibrato LFO." While held both
+    ///   phases (and both dividers) are pinned to zero and do not
+    ///   advance.
+    /// * `fast` is the `$0F` bit-3 state. When set both LFOs advance
+    ///   once per sample (the dividers are bypassed); when clear they
+    ///   advance once per [`TREMOLO_LFO_DIVIDER`] /
+    ///   [`VIBRATO_LFO_DIVIDER`] samples respectively.
+    pub fn tick(&mut self, hold: bool, fast: bool) {
+        if hold {
+            // §"Test Register $0F" bit 1: halt + reset both LFOs.
+            self.tremolo_phase = 0;
+            self.vibrato_phase = 0;
+            self.tremolo_divider = TREMOLO_LFO_DIVIDER - 1;
+            self.vibrato_divider = VIBRATO_LFO_DIVIDER - 1;
+            return;
+        }
+        // Tremolo.
+        if fast {
+            self.tremolo_phase = self.tremolo_phase.wrapping_add(1);
+        } else if self.tremolo_divider == 0 {
+            self.tremolo_phase = self.tremolo_phase.wrapping_add(1);
+            self.tremolo_divider = TREMOLO_LFO_DIVIDER - 1;
+        } else {
+            self.tremolo_divider -= 1;
+        }
+        // Vibrato.
+        if fast {
+            self.vibrato_phase = self.vibrato_phase.wrapping_add(1);
+        } else if self.vibrato_divider == 0 {
+            self.vibrato_phase = self.vibrato_phase.wrapping_add(1);
+            self.vibrato_divider = VIBRATO_LFO_DIVIDER - 1;
+        } else {
+            self.vibrato_divider -= 1;
+        }
+    }
+
+    /// `$E000` bit 6 audio reset. Per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Audio Reset ($E000)":
+    /// "Setting this bit will silence the expansion audio and clear
+    /// its registers (including tremolo LFO state, but not including
+    /// vibrato LFO state)." So the tremolo phase + divider are
+    /// cleared while the vibrato phase + divider are **preserved**.
+    pub fn audio_reset(&mut self) {
+        self.tremolo_phase = 0;
+        self.tremolo_divider = TREMOLO_LFO_DIVIDER - 1;
+        // Vibrato deliberately untouched.
+    }
+}
+
 // -------------------------------------------------------------- test register
 
 /// Decoded VRC7 / OPLL `$0F` test register state per
@@ -961,17 +1101,21 @@ pub struct TestRegister {
     /// is overridden."
     pub envs_zero: bool,
     /// `$0F` bit 1 — "Hold LFO phase at zero. This halts, disables,
-    /// and resets both the tremolo and vibrato LFO." We do not yet
-    /// run an LFO (the §7 numeric step arrays are a documented
-    /// DOCS-GAP), so this bit is recorded but has no operator
-    /// effect today.
+    /// and resets both the tremolo and vibrato LFO." Consumed by
+    /// [`Lfo::tick`] to pin both LFO phases at zero. The LFO phase
+    /// *cadence* is wired; the numeric AM/VIB depth step arrays that
+    /// translate phase into audible modulation remain a documented
+    /// DOCS-GAP (§7 provenance-pending), so the held phase has no
+    /// audible effect yet.
     pub hold_lfo: bool,
     /// `$0F` bit 2 — "Holds and resets waveform phase to zero. The
     /// envelopes are not halted, though the output will be silent."
     pub hold_phase: bool,
     /// `$0F` bit 3 — "Update tremolo and vibrato LFOs every sample
-    /// instead of once every several samples." Same no-op-today
-    /// story as `hold_lfo`.
+    /// instead of once every several samples." Consumed by
+    /// [`Lfo::tick`] to bypass the [`TREMOLO_LFO_DIVIDER`] /
+    /// [`VIBRATO_LFO_DIVIDER`] dividers so both LFOs advance once per
+    /// per-operator sample.
     pub fast_lfo: bool,
 }
 
@@ -2643,5 +2787,102 @@ mod tests {
         assert_eq!(ch.modulator.env.rks, 9);
         // Carrier KSR=0 → Rks = block>>1 = 2.
         assert_eq!(ch.carrier.env.rks, 2);
+    }
+
+    // ----------------------------------------------- LFO (AM/VIB)
+
+    /// Normal-mode cadence: the tremolo phase advances exactly once
+    /// every [`TREMOLO_LFO_DIVIDER`] = 64 samples and the vibrato
+    /// phase once every [`VIBRATO_LFO_DIVIDER`] = 1024 samples, per
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F"
+    /// bit 3's "Tremolo is 64x faster, and vibrato is 1024x faster"
+    /// description of the fast mode (so normal mode is 64× / 1024×
+    /// slower).
+    #[test]
+    fn lfo_normal_mode_divider_cadence() {
+        let mut lfo = Lfo::default();
+        // 64 samples → exactly one tremolo step; 64 < 1024 so vibrato
+        // has not stepped yet.
+        for _ in 0..64 {
+            lfo.tick(false, false);
+        }
+        assert_eq!(lfo.tremolo_phase, 1, "tremolo steps once per 64 samples");
+        assert_eq!(lfo.vibrato_phase, 0, "vibrato has not stepped at 64");
+        // After a total of 1024 samples: 1024/64 = 16 tremolo steps,
+        // 1024/1024 = 1 vibrato step.
+        for _ in 64..1024 {
+            lfo.tick(false, false);
+        }
+        assert_eq!(lfo.tremolo_phase, 16, "16 tremolo steps in 1024 samples");
+        assert_eq!(lfo.vibrato_phase, 1, "1 vibrato step in 1024 samples");
+    }
+
+    /// `$0F` bit 3 (fast LFO) bypasses both dividers: each operator
+    /// sample advances both phases once.
+    #[test]
+    fn lfo_fast_mode_advances_every_sample() {
+        let mut lfo = Lfo::default();
+        for _ in 0..100 {
+            lfo.tick(false, true);
+        }
+        assert_eq!(lfo.tremolo_phase, 100, "fast tremolo: one step per sample");
+        assert_eq!(lfo.vibrato_phase, 100, "fast vibrato: one step per sample");
+    }
+
+    /// `$0F` bit 1 (hold) halts + resets both LFOs to phase 0, and
+    /// holds them there while engaged — no advance regardless of how
+    /// many ticks elapse.
+    #[test]
+    fn lfo_hold_resets_and_pins_both_phases() {
+        let mut lfo = Lfo::default();
+        // Advance a bit first so there is non-zero state to reset.
+        for _ in 0..200 {
+            lfo.tick(false, true);
+        }
+        assert!(lfo.tremolo_phase > 0 && lfo.vibrato_phase > 0);
+        // Engage hold: both phases collapse to 0 and stay there.
+        for _ in 0..500 {
+            lfo.tick(true, false);
+        }
+        assert_eq!(lfo.tremolo_phase, 0);
+        assert_eq!(lfo.vibrato_phase, 0);
+        // Dividers reloaded to a full period (held, not advancing).
+        assert_eq!(lfo.tremolo_divider, TREMOLO_LFO_DIVIDER - 1);
+        assert_eq!(lfo.vibrato_divider, VIBRATO_LFO_DIVIDER - 1);
+    }
+
+    /// `$E000` audio reset clears the tremolo phase but PRESERVES the
+    /// vibrato phase, per `docs/audio/nsf/vrc7-audio-wiki.html`
+    /// §"Audio Reset ($E000)": "clear its registers (including
+    /// tremolo LFO state, but not including vibrato LFO state)."
+    #[test]
+    fn lfo_audio_reset_clears_tremolo_preserves_vibrato() {
+        let mut lfo = Lfo::default();
+        // Advance both phases to non-zero values.
+        for _ in 0..2048 {
+            lfo.tick(false, false);
+        }
+        let vib_before = lfo.vibrato_phase;
+        assert!(lfo.tremolo_phase > 0);
+        assert!(vib_before > 0);
+        lfo.audio_reset();
+        assert_eq!(lfo.tremolo_phase, 0, "tremolo phase cleared by audio reset");
+        assert_eq!(lfo.tremolo_divider, TREMOLO_LFO_DIVIDER - 1);
+        assert_eq!(
+            lfo.vibrato_phase, vib_before,
+            "vibrato phase preserved across audio reset"
+        );
+    }
+
+    /// Hold takes priority over fast: while bit 1 is set the phases
+    /// stay pinned at zero even with bit 3 also set.
+    #[test]
+    fn lfo_hold_overrides_fast() {
+        let mut lfo = Lfo::default();
+        for _ in 0..50 {
+            lfo.tick(true, true);
+        }
+        assert_eq!(lfo.tremolo_phase, 0);
+        assert_eq!(lfo.vibrato_phase, 0);
     }
 }
