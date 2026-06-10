@@ -1060,6 +1060,55 @@ impl N163 {
     pub fn output(&self) -> f32 {
         self.last_output
     }
+
+    /// Channel-update rate in Hz for the current `channels_active`,
+    /// given the host CPU clock `cpu_hz`. Per
+    /// `docs/audio/nsf/namco-163-audio-wiki.html` §"Channel Update":
+    /// "It takes exactly 15 CPU cycles to update and output one
+    /// channel. When multiple channels are used it will cycle between
+    /// them." So one full pass over the `c` active channels takes
+    /// `15 * c` CPU cycles, and any individual channel is refreshed at
+    /// `cpu_hz / (15 * c)`.
+    ///
+    /// The §"Channel Update" table tabulates this for the NTSC clock
+    /// (≈1789773 Hz): 1 channel → 119.318 kHz, 2 → 59.659 kHz, …,
+    /// 8 → 14.915 kHz — and the PAL column (≈1662607 Hz): 110.840 kHz
+    /// down to 13.855 kHz. Returns 0 when no channel is active.
+    pub fn update_rate_hz(&self, cpu_hz: u32) -> f64 {
+        if self.channels_active == 0 {
+            return 0.0;
+        }
+        cpu_hz as f64 / (15.0 * self.channels_active as f64)
+    }
+
+    /// Emitted output frequency in Hz of channel `ch` (1..=8), per the
+    /// closed form in `docs/audio/nsf/namco-163-audio-wiki.html`
+    /// §"Frequency":
+    ///
+    /// ```text
+    /// f = (n * p) / (15 * 65536 * l * c)
+    /// ```
+    ///
+    /// where `n` = CPU clock rate (`cpu_hz`), `p` = the channel's
+    /// 18-bit frequency value, `l` = wave length (in 4-bit samples),
+    /// and `c` = number of enabled channels. The derivation: the high
+    /// 8 bits of the 24-bit phase accumulator drive the wave position,
+    /// each channel is updated once per `15 * c` CPU cycles adding its
+    /// 18-bit `p`, and one full wave of `l` samples spans
+    /// `l << 16` accumulator counts. Returns 0 when the channel is
+    /// inactive, its frequency value is 0, or no channels are enabled.
+    pub fn emitted_frequency_hz(&self, ch: u8, cpu_hz: u32) -> f64 {
+        if self.channels_active == 0 || !(1..=8).contains(&ch) {
+            return 0.0;
+        }
+        let dec = self.decode_channel(ch);
+        if dec.freq == 0 || dec.wave_len == 0 {
+            return 0.0;
+        }
+        // f = (n * p) / (15 * 65536 * l * c)
+        (cpu_hz as f64 * dec.freq as f64)
+            / (15.0 * 65536.0 * dec.wave_len as f64 * self.channels_active as f64)
+    }
 }
 
 /// Decoded view of one N163 channel — pulled out of `&self.ram` once
@@ -3898,6 +3947,170 @@ mod tests {
         // The high phase byte stays 0 (freq = 0x100 < 0x10000), but
         // the low byte ticks to 0x00 and mid byte to 0x01.
         assert_eq!(chip.ram[0x7B], 0x01);
+    }
+
+    // ----- N163 emitted-frequency / update-rate calibration (round 274) -----
+
+    const N163_NTSC_HZ: u32 = 1_789_773;
+    const N163_PAL_HZ: u32 = 1_662_607;
+
+    #[test]
+    fn n163_update_rate_matches_wiki_ntsc_table() {
+        // Wiki §"Channel Update" tabulates the per-channel update rate
+        // at the NTSC clock (≈1.789773 MHz): rate = n / (15 * c).
+        // The documented kHz values (1..=8 channels):
+        let expected_khz = [
+            119.318_f64,
+            59.659,
+            39.773,
+            29.830,
+            23.864,
+            19.886,
+            17.045,
+            14.915,
+        ];
+        let mut chip = N163::new();
+        for (i, &khz) in expected_khz.iter().enumerate() {
+            chip.channels_active = (i + 1) as u8;
+            let got_khz = chip.update_rate_hz(N163_NTSC_HZ) / 1000.0;
+            assert!(
+                (got_khz - khz).abs() < 0.001,
+                "ntsc {} channels: got {got_khz} kHz, table says {khz} kHz",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn n163_update_rate_matches_wiki_pal_table() {
+        // Wiki §"Channel Update" PAL column (≈1.662607 MHz clock).
+        let expected_khz = [
+            110.840_f64,
+            55.420,
+            36.947,
+            27.710,
+            22.168,
+            18.473,
+            15.834,
+            13.855,
+        ];
+        let mut chip = N163::new();
+        for (i, &khz) in expected_khz.iter().enumerate() {
+            chip.channels_active = (i + 1) as u8;
+            let got_khz = chip.update_rate_hz(N163_PAL_HZ) / 1000.0;
+            assert!(
+                (got_khz - khz).abs() < 0.001,
+                "pal {} channels: got {got_khz} kHz, table says {khz} kHz",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn n163_update_rate_zero_when_no_channels_active() {
+        let mut chip = N163::new();
+        chip.channels_active = 0;
+        assert_eq!(chip.update_rate_hz(N163_NTSC_HZ), 0.0);
+    }
+
+    #[test]
+    fn n163_update_rate_halves_when_channels_double() {
+        // rate = n / (15 * c): doubling c halves the per-channel rate.
+        let mut chip = N163::new();
+        chip.channels_active = 2;
+        let r2 = chip.update_rate_hz(N163_NTSC_HZ);
+        chip.channels_active = 4;
+        let r4 = chip.update_rate_hz(N163_NTSC_HZ);
+        assert!((r2 - 2.0 * r4).abs() < 1e-6, "r2={r2} r4={r4}");
+    }
+
+    #[test]
+    fn n163_emitted_frequency_matches_closed_form() {
+        // Wiki §"Frequency": f = (n * p) / (15 * 65536 * l * c).
+        // Single channel (c=1), wave_len l=4 (L field=63), p=0x100.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        n163_write_channel8(&mut chip, 0x100, 0, 63, 0, 0x0F, 0);
+        assert_eq!(chip.channels_active, 1);
+        let p = 256.0_f64; // 0x100
+        let l = 4.0_f64;
+        let c = 1.0_f64;
+        let expected = (N163_NTSC_HZ as f64 * p) / (15.0 * 65536.0 * l * c);
+        let got = chip.emitted_frequency_hz(8, N163_NTSC_HZ);
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn n163_emitted_frequency_scales_inversely_with_channel_count() {
+        // The §"Frequency" note: "the output frequency is thus divided
+        // by the number of channels enabled." Same p + l, but c=4
+        // should yield exactly a quarter of the c=1 frequency.
+        let mut chip1 = N163::new();
+        chip1.enabled = true;
+        n163_write_channel8(&mut chip1, 0x4000, 0, 63, 0, 0x0F, 0); // C=0 → 1 ch
+        let f1 = chip1.emitted_frequency_hz(8, N163_NTSC_HZ);
+
+        let mut chip4 = N163::new();
+        chip4.enabled = true;
+        n163_write_channel8(&mut chip4, 0x4000, 0, 63, 0, 0x0F, 3); // C=3 → 4 ch
+        assert_eq!(chip4.channels_active, 4);
+        let f4 = chip4.emitted_frequency_hz(8, N163_NTSC_HZ);
+        assert!((f1 - 4.0 * f4).abs() < 1e-6, "f1={f1} f4={f4}");
+    }
+
+    #[test]
+    fn n163_emitted_frequency_scales_inversely_with_wave_length() {
+        // f ∝ 1/l: a wave twice as long emits half the frequency for
+        // the same 18-bit frequency value.
+        // wave_len = 256 - (L<<2). L=63 → len 4; L=62 → len 8.
+        let mut chip_short = N163::new();
+        chip_short.enabled = true;
+        n163_write_channel8(&mut chip_short, 0x400, 0, 63, 0, 0x0F, 0); // len 4
+        let f_short = chip_short.emitted_frequency_hz(8, N163_NTSC_HZ);
+
+        let mut chip_long = N163::new();
+        chip_long.enabled = true;
+        n163_write_channel8(&mut chip_long, 0x400, 0, 62, 0, 0x0F, 0); // len 8
+        let f_long = chip_long.emitted_frequency_hz(8, N163_NTSC_HZ);
+        assert!(
+            (f_short - 2.0 * f_long).abs() < 1e-6,
+            "short={f_short} long={f_long}"
+        );
+    }
+
+    #[test]
+    fn n163_emitted_frequency_zero_for_silent_or_inactive() {
+        let mut chip = N163::new();
+        chip.enabled = true;
+        // freq value 0 → no output frequency.
+        n163_write_channel8(&mut chip, 0, 0, 63, 0, 0x0F, 0);
+        assert_eq!(chip.emitted_frequency_hz(8, N163_NTSC_HZ), 0.0);
+        // Out-of-range channel index → 0.
+        n163_write_channel8(&mut chip, 0x100, 0, 63, 0, 0x0F, 0);
+        assert_eq!(chip.emitted_frequency_hz(0, N163_NTSC_HZ), 0.0);
+        assert_eq!(chip.emitted_frequency_hz(9, N163_NTSC_HZ), 0.0);
+        // No channels active → 0.
+        chip.channels_active = 0;
+        assert_eq!(chip.emitted_frequency_hz(8, N163_NTSC_HZ), 0.0);
+    }
+
+    #[test]
+    fn n163_emitted_frequency_pal_uses_pal_clock() {
+        // Same registers, PAL clock → frequency scaled by the clock
+        // ratio n_pal / n_ntsc.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        n163_write_channel8(&mut chip, 0x800, 0, 63, 0, 0x0F, 0);
+        let f_ntsc = chip.emitted_frequency_hz(8, N163_NTSC_HZ);
+        let f_pal = chip.emitted_frequency_hz(8, N163_PAL_HZ);
+        let ratio = N163_PAL_HZ as f64 / N163_NTSC_HZ as f64;
+        assert!(
+            (f_pal - f_ntsc * ratio).abs() < 1e-6,
+            "f_ntsc={f_ntsc} f_pal={f_pal}"
+        );
     }
 
     // ------------------------------------------------------------- VRC7

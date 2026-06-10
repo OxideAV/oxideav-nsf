@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **N163 emitted-frequency + channel-update-rate calibration API**
+  (round 274): the Namco 163's wavetable channels now expose their
+  documented output frequency and update cadence as a first-class API,
+  per `docs/audio/nsf/namco-163-audio-wiki.html` §"Channel Update" +
+  §"Frequency". `N163::update_rate_hz(cpu_hz)` returns the per-channel
+  refresh rate `cpu_hz / (15 * channels_active)` — the chip spends
+  exactly 15 CPU cycles updating one channel and round-robins across
+  the active set, so one channel is refreshed every `15 * c` cycles.
+  `N163::emitted_frequency_hz(ch, cpu_hz)` implements the §"Frequency"
+  closed form `f = (n * p) / (15 * 65536 * l * c)` (CPU clock × 18-bit
+  frequency value, divided by the 15-cycle update period, the
+  `l << 16` accumulator span of one full wave, and the channel count),
+  returning 0 for inactive/silent channels. This closes the round-11
+  N163 followup that left the emitted frequency verified only at the
+  per-tick phase-advance level. 9 new unit tests validate
+  `update_rate_hz` against the §"Channel Update" tabulated NTSC column
+  (1 ch → 119.318 kHz down to 8 ch → 14.915 kHz) and PAL column
+  (110.840 kHz down to 13.855 kHz), the no-channels-active zero case,
+  the rate-halves-on-channel-doubling property, the
+  `emitted_frequency_hz` closed form against a direct computation, its
+  inverse scaling with channel count (the §"Frequency" note "the
+  output frequency is thus divided by the number of channels enabled")
+  and with wave length, the silent/out-of-range zero cases, and the
+  PAL-clock frequency scaling by the `n_pal / n_ntsc` ratio.
 - **OPLL AM/VIB LFO phase counters + `$E000` audio-reset asymmetry**
   (round 270): the VRC7/OPLL built-in tremolo (AM) + vibrato (VIB)
   low-frequency oscillators now carry phase counters at the spec'd

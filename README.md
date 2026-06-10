@@ -250,6 +250,24 @@ hold-overrides-fast priority, and two `Vrc7`-level integration
 checks for the tick-driven phase advance and the chip-path
 `$E000` asymmetry.
 
+Round 274 lands the N163 emitted-frequency + channel-update-rate
+calibration API per `docs/audio/nsf/namco-163-audio-wiki.html`
+§"Channel Update" + §"Frequency". `N163::update_rate_hz(cpu_hz)`
+returns the per-channel refresh rate `cpu_hz / (15 · channels_active)`
+— the chip spends exactly 15 CPU cycles updating one channel and
+round-robins across the active set — and `N163::emitted_frequency_hz(
+ch, cpu_hz)` implements the §"Frequency" closed form
+`f = (n · p) / (15 · 65536 · l · c)`. This closes the round-11 N163
+followup that had verified the emitted pitch only at the per-tick
+phase-advance level; the output frequency is now validated end-to-end
+against the §"Channel Update" tabulated update-rate columns
+(NTSC 1 ch → 119.318 kHz … 8 ch → 14.915 kHz; PAL 110.840 kHz …
+13.855 kHz) and the §"Frequency" formula. 9 new unit tests cover the
+NTSC + PAL update-rate tables, the no-channels-active zero case, the
+rate-halves-on-doubling property, the closed-form frequency, its
+inverse scaling with channel count and wave length, the
+silent/out-of-range zero cases, and PAL-clock frequency scaling.
+
 Round 232 lands the OPLL envelope per-RATE decay step from
 **Yamaha YM2413 Application Manual Table III-7 ("Attack and
 decay times in relation to RATE")** page 14
@@ -619,12 +637,14 @@ fail and signal the per-block first-sample validation pass.
   of scope — VRC7 has no rhythm DAC so the drum patches in the
   ROM are inaudible there, but a future YM2413 consumer (an
   MSX-format crate, say) would need rhythm-mode decoded.
-* N163: round 11 added the per-channel timer accumulators. Remaining
-  gap is matching the documented `f = (n * p) / (15 * 65536 * l * c)`
-  output frequency in a calibration test against a known fixture (the
-  current synthetic tests verify per-tick phase advances and
-  round-robin ordering, but not the multi-channel-divided emitted
-  frequency end-to-end).
+* N163: round 11 added the per-channel timer accumulators; round 274
+  added the `update_rate_hz` / `emitted_frequency_hz` calibration API
+  and validated the documented `f = (n * p) / (15 * 65536 * l * c)`
+  output frequency end-to-end against the §"Channel Update" NTSC + PAL
+  update-rate tables and the §"Frequency" formula. Remaining gap is a
+  match against a recorded known-fixture pitch (the round-274 tests
+  validate the closed-form derivation and its scaling laws, but not a
+  captured-audio ground truth).
 * FDS: round 8 added the envelope ramp generators and round 9 the
   `$4023.D1` waveform-halt (constant `$4040` output + frozen
   accumulators + envelopes not ticked while halted, per §"Master I/O
