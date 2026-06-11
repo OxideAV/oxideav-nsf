@@ -268,6 +268,29 @@ rate-halves-on-doubling property, the closed-form frequency, its
 inverse scaling with channel count and wave length, the
 silent/out-of-range zero cases, and PAL-clock frequency scaling.
 
+Round 279 lands NSFDRV sound-driver identification per
+`docs/audio/nsf/nsfdrv-nesdev-wiki.html`. The 8-byte tag at the start
+of the program data (file offsets `$0080..=$0087` in a plain NSF:
+6-byte ASCII driver ID + major + minor version bytes per the
+§"File Format" layout table) is decoded into a new `NsfDrvTag`
+struct, and the §"List of NSFDRV sound driver IDs" registry — `OFGS`
+(`$4F $46 $47 $53 $20 $20`), `FTDRV` (`$46 $54 $44 $52 $56 $20`),
+`NSDL` (`$4E $53 $44 $4C $20 $20`), plus the documented blank
+six-space in-development ID — classifies the tag via
+`NsfDrvTag::known_id() -> Option<NsfDrvId>`.
+`NsfHeader::nsfdrv()` is the best-effort header-level surface: the
+wiki defines no presence predicate stronger than the ID registry, so
+the tag is reported only when the first 6 program bytes match a
+registered ID (unregistered patterns are plain program data; callers
+can additionally filter out `NsfDrvId::Blank`). The tag is read from
+the same program blob for all three container shapes, so NSFe
+`DATA`-chunk programs are covered too. 5 new unit tests pin the
+ASCII-vs-binary documented forms of all four registered IDs,
+end-to-end detection + major/minor byte placement through
+`parse_nsf`, ASCII rendering (including the non-printable-ID `None`
+case), the unregistered / too-short-program negative paths, and
+detection through the NSFe `DATA` chunk.
+
 Round 232 lands the OPLL envelope per-RATE decay step from
 **Yamaha YM2413 Application Manual Table III-7 ("Attack and
 decay times in relation to RATE")** page 14

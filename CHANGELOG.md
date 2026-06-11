@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NSFDRV sound-driver identification** (round 279): the 8-byte
+  NSFDRV tag at the start of the program data is now decoded, per
+  `docs/audio/nsf/nsfdrv-nesdev-wiki.html` §"File Format" (6-byte
+  ASCII sound-driver ID at file offsets `$0080-$0085` in a plain NSF
+  + major version byte at `$0086` + minor at `$0087`, immediately
+  after the 128-byte header). A new `NsfDrvTag` struct carries the
+  raw `id: [u8; 6]` / `major` / `minor`; `NsfDrvTag::read(program)`
+  reads it off any 8-byte-plus program blob;
+  `NsfDrvTag::known_id() -> Option<NsfDrvId>` classifies the ID
+  against the wiki's §"List of NSFDRV sound driver IDs" registry —
+  `NsfDrvId::Ofgs` (`"OFGS  "` = `$4F $46 $47 $53 $20 $20`),
+  `NsfDrvId::Ftdrv` (`"FTDRV "` = `$46 $54 $44 $52 $56 $20`),
+  `NsfDrvId::Nsdl` (`"NSDL  "` = `$4E $53 $44 $4C $20 $20`), and
+  `NsfDrvId::Blank` (six spaces — "a blank NSFDRV ID may be used for
+  sound drivers under development"). `NsfHeader::nsfdrv()` is the
+  best-effort header-level surface: the wiki defines no presence
+  predicate stronger than the ID registry itself, so the tag is
+  reported only when the first 6 program bytes match a registered ID
+  (anything else is treated as plain program code; callers can
+  additionally filter out the ambiguous `Blank`). The tag is read
+  from the parsed program blob for all three container shapes (plain
+  NSF tail, NSFe `DATA` chunk, NSF2 pre-metadata program block).
+  `NsfDrvTag::id_ascii()` renders printable-ASCII IDs for display.
+  5 new unit tests pin the documented ASCII-vs-binary forms of all
+  four registered IDs, end-to-end detection + major/minor byte
+  placement through `parse_nsf`, ASCII rendering incl. the
+  non-printable `None` case, the unregistered-ID / too-short-program
+  negative paths, and detection through the NSFe `DATA` chunk.
+
 - **N163 emitted-frequency + channel-update-rate calibration API**
   (round 274): the Namco 163's wavetable channels now expose their
   documented output frequency and update cadence as a first-class API,

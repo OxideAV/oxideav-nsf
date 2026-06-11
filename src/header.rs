@@ -25,6 +25,8 @@
 //!   24-bit data length + embedded metadata rules).
 //! * `docs/audio/nsf/nsfe-nesdev-wiki.html` (chunk format reused by
 //!   NSF2 metadata).
+//! * `docs/audio/nsf/nsfdrv-nesdev-wiki.html` (NSFDRV sound-driver
+//!   identification tag at the start of the program data).
 
 use core::fmt;
 
@@ -135,6 +137,93 @@ impl Nsf2Features {
     }
 }
 
+/// NSFDRV sound-driver identification tag, per
+/// `docs/audio/nsf/nsfdrv-nesdev-wiki.html`.
+///
+/// The tag occupies the first 8 bytes of the program data — in a plain
+/// NSF file that is offsets `$0080..=$0087`, immediately after the
+/// 128-byte header per the wiki's §"File Format" layout table:
+///
+/// ```text
+/// $0080 - $0085   6   Sound driver ID
+/// $0086           1   Major version number
+/// $0087           1   Minor version number
+/// ```
+///
+/// Per §"Usage and applications", players can use the ID to recognise
+/// sound drivers developed against inaccurate playback environments
+/// (and patch accordingly), authors can assert an NSF is original
+/// rather than ripped from a ROM, and bug reports can pin the driver
+/// version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NsfDrvTag {
+    /// 6-byte ASCII sound-driver ID (program bytes 0..=5, file
+    /// `$0080-$0085`).
+    pub id: [u8; 6],
+    /// Major version number (program byte 6, file `$0086`).
+    pub major: u8,
+    /// Minor version number (program byte 7, file `$0087`).
+    pub minor: u8,
+}
+
+/// Driver IDs registered in `docs/audio/nsf/nsfdrv-nesdev-wiki.html`
+/// §"List of NSFDRV sound driver IDs". Variants are named after the
+/// 6-byte ASCII tag itself, not after any product.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NsfDrvId {
+    /// `"OFGS  "` — binary `$4F $46 $47 $53 $20 $20`.
+    Ofgs,
+    /// `"FTDRV "` — binary `$46 $54 $44 $52 $56 $20`.
+    Ftdrv,
+    /// `"NSDL  "` — binary `$4E $53 $44 $4C $20 $20`.
+    Nsdl,
+    /// `"      "` (six spaces) — binary `$20` × 6. Per the wiki, "a
+    /// blank NSFDRV ID may be used for sound drivers under
+    /// development".
+    Blank,
+}
+
+impl NsfDrvTag {
+    /// Reads the raw 8-byte tag from the start of a program blob.
+    /// Returns `None` when the program is shorter than 8 bytes. No
+    /// validation is performed — every 8-byte-plus program yields a
+    /// tag; use [`NsfDrvTag::known_id`] (or [`NsfHeader::nsfdrv`]) to
+    /// test the ID against the wiki's registered list.
+    pub fn read(program: &[u8]) -> Option<NsfDrvTag> {
+        let bytes = program.get(..8)?;
+        let mut id = [0u8; 6];
+        id.copy_from_slice(&bytes[..6]);
+        Some(NsfDrvTag {
+            id,
+            major: bytes[6],
+            minor: bytes[7],
+        })
+    }
+
+    /// Matches the 6-byte ID against the registered IDs from the
+    /// wiki's §"List of NSFDRV sound driver IDs" (including the
+    /// documented blank in-development ID). `None` for anything else.
+    pub fn known_id(&self) -> Option<NsfDrvId> {
+        match &self.id {
+            b"OFGS  " => Some(NsfDrvId::Ofgs),
+            b"FTDRV " => Some(NsfDrvId::Ftdrv),
+            b"NSDL  " => Some(NsfDrvId::Nsdl),
+            b"      " => Some(NsfDrvId::Blank),
+            _ => None,
+        }
+    }
+
+    /// The ID bytes as ASCII, if they are printable ASCII (space
+    /// through tilde). Registered IDs always are.
+    pub fn id_ascii(&self) -> Option<&str> {
+        if self.id.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+            core::str::from_utf8(&self.id).ok()
+        } else {
+            None
+        }
+    }
+}
+
 /// Parsed NSF header + the raw program data tail.
 #[derive(Clone, Debug)]
 pub struct NsfHeader {
@@ -216,6 +305,26 @@ impl NsfHeader {
 
     pub fn has_expansion(&self) -> bool {
         self.expansion.0 != 0
+    }
+
+    /// Best-effort NSFDRV sound-driver identification, per
+    /// `docs/audio/nsf/nsfdrv-nesdev-wiki.html`. Returns the 8-byte
+    /// tag at the start of the program data only when its 6-byte ID
+    /// matches one of the wiki's registered IDs (the wiki defines no
+    /// stronger presence predicate than the ID list itself, so an
+    /// unregistered first-6-bytes pattern is treated as plain program
+    /// data). Note the documented blank in-development ID (six
+    /// spaces) is also matched — callers wanting to treat it as
+    /// absent can filter on [`NsfDrvTag::known_id`] `!=`
+    /// [`NsfDrvId::Blank`].
+    ///
+    /// For plain NSF the program data starts at file offset `$0080`,
+    /// matching the wiki's layout table exactly; for NSFe/NSF2 inputs
+    /// the tag is read from the same program blob (the `DATA` chunk /
+    /// pre-metadata program block).
+    pub fn nsfdrv(&self) -> Option<NsfDrvTag> {
+        let tag = NsfDrvTag::read(&self.program)?;
+        tag.known_id().map(|_| tag)
     }
 }
 
@@ -815,5 +924,100 @@ mod tests {
         assert!(!Nsf2Features(0x0F).suppressed_play());
         assert!(!Nsf2Features(0x0F).mandatory_metadata());
         assert!(!Nsf2Features(0x0F).needs_vector_overlay());
+    }
+
+    /// Builds a v1 NSF whose program data starts with the given
+    /// 8-byte NSFDRV tag (6-byte ID + major + minor), followed by a
+    /// couple of code bytes.
+    fn fake_v1_with_nsfdrv(id: &[u8; 6], major: u8, minor: u8) -> Vec<u8> {
+        let mut buf = fake_v1();
+        buf.truncate(NSF_HEADER_LEN);
+        buf.extend_from_slice(id);
+        buf.push(major);
+        buf.push(minor);
+        buf.extend_from_slice(&[0xea, 0x60]);
+        buf
+    }
+
+    #[test]
+    fn nsfdrv_registered_ids_match_documented_binary_forms() {
+        // §"List of NSFDRV sound driver IDs": ASCII tags and their
+        // documented binary byte sequences must agree.
+        assert_eq!(b"OFGS  ", &[0x4f, 0x46, 0x47, 0x53, 0x20, 0x20]);
+        assert_eq!(b"FTDRV ", &[0x46, 0x54, 0x44, 0x52, 0x56, 0x20]);
+        assert_eq!(b"NSDL  ", &[0x4e, 0x53, 0x44, 0x4c, 0x20, 0x20]);
+        assert_eq!(b"      ", &[0x20, 0x20, 0x20, 0x20, 0x20, 0x20]);
+    }
+
+    #[test]
+    fn nsfdrv_detects_each_registered_id_through_parse_nsf() {
+        for (id, expected) in [
+            (b"OFGS  ", NsfDrvId::Ofgs),
+            (b"FTDRV ", NsfDrvId::Ftdrv),
+            (b"NSDL  ", NsfDrvId::Nsdl),
+            (b"      ", NsfDrvId::Blank),
+        ] {
+            let h = parse_nsf(&fake_v1_with_nsfdrv(id, 2, 11)).unwrap();
+            let tag = h.nsfdrv().expect("registered ID must be detected");
+            assert_eq!(&tag.id, id);
+            assert_eq!(tag.known_id(), Some(expected));
+            // File layout: ID at $0080-$0085, major at $0086, minor
+            // at $0087 — i.e. program bytes 6 + 7.
+            assert_eq!(tag.major, 2);
+            assert_eq!(tag.minor, 11);
+        }
+    }
+
+    #[test]
+    fn nsfdrv_id_ascii_roundtrips_registered_ids() {
+        let tag = NsfDrvTag::read(b"FTDRV \x01\x02").unwrap();
+        assert_eq!(tag.id_ascii(), Some("FTDRV "));
+        assert_eq!(tag.major, 1);
+        assert_eq!(tag.minor, 2);
+        // Non-printable ID bytes -> no ASCII rendering.
+        let raw = NsfDrvTag::read(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]).unwrap();
+        assert_eq!(raw.id_ascii(), None);
+    }
+
+    #[test]
+    fn nsfdrv_unregistered_program_start_is_plain_code() {
+        // fake_v1's program is 4 bytes (shorter than the 8-byte tag).
+        let h = parse_nsf(&fake_v1()).unwrap();
+        assert_eq!(h.nsfdrv(), None);
+        assert_eq!(NsfDrvTag::read(&h.program), None);
+
+        // 8+ bytes that don't match any registered ID: the raw read
+        // succeeds but classification + header-level detection fail.
+        let h = parse_nsf(&fake_v1_with_nsfdrv(b"XYZZY ", 1, 0)).unwrap();
+        assert_eq!(h.nsfdrv(), None);
+        let raw = NsfDrvTag::read(&h.program).unwrap();
+        assert_eq!(raw.known_id(), None);
+        assert_eq!(raw.id_ascii(), Some("XYZZY "));
+    }
+
+    #[test]
+    fn nsfdrv_read_from_nsfe_data_chunk_program() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        let info_payload: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 1, 0];
+        out.extend_from_slice(&(info_payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"INFO");
+        out.extend_from_slice(&info_payload);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"NSDL  ");
+        data.extend_from_slice(&[3, 7, 0xea, 0x60]);
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"DATA");
+        out.extend_from_slice(&data);
+
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(b"NEND");
+
+        let h = parse_nsf(&out).unwrap();
+        let tag = h.nsfdrv().unwrap();
+        assert_eq!(tag.known_id(), Some(NsfDrvId::Nsdl));
+        assert_eq!(tag.major, 3);
+        assert_eq!(tag.minor, 7);
     }
 }
