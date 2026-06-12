@@ -291,6 +291,32 @@ end-to-end detection + major/minor byte placement through
 case), the unregistered / too-short-program negative paths, and
 detection through the NSFe `DATA` chunk.
 
+Round 283 lands the OPLL rhythm-mode register semantics + the VRC7
+no-rhythm-DAC carve-out per Yamaha YM2413 Application Manual
+§III-1-7 / §III-1-8 (mirrored in
+`docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`)
+and `docs/audio/nsf/vrc7-audio-wiki.html` §"Rhythm Register $0E" +
+§"Internal patch set". `opll::RhythmRegister` decodes `$0E`
+(`D5..D0` = `RHYTHM BD SD TOM TOP-CY HH`; D5 = 1 routes percussion
+through channels 7~9 and limits the melody section to six sounds);
+`opll::RhythmInstrument` carries the **Table III-9** slot allocation
+(BD = 13 + 16, HH = 14, TOM = 15, SD = 17, TOP-CYM = 18) and the
+derived channel allocation (BD owns channel 7 as the only two-slot
+FM pair per §V-4; HH+SD share 8; TOM+TOP-CYM share 9);
+`opll::RhythmVolumes` decodes the rhythm-mode `$36`~`$38`
+dual-volume nibbles; `opll::RHYTHM_FNUM_PRESET` pins the manual's
+recommended percussion F-Number/Block writes with the Key-ON bits
+clear. `expansion::VRC7_RHYTHM_ROM` pins the 3 drum patches in the
+VRC7 instrument ROM dump — inaudible on VRC7, which has no rhythm
+DAC — including the documented snare byte-`$07` divergence (`$68`
+vs the YM2413's `$48`), and `Vrc7::rhythm_control()` surfaces the
+carve-out: the rhythm-mode bit is treated as always enabled and
+`$0E` writes never reach the synthesis path (proven by a lockstep
+two-chip bit-identical-output test). Rhythm *synthesis* beyond the
+BD FM pair (the §V-4 noise-oscillator phases for HH/SD/TOM/TOP-CYM)
+is not numerically pinned by the staged material and stays out of
+scope. 7 new unit tests.
+
 Round 232 lands the OPLL envelope per-RATE decay step from
 **Yamaha YM2413 Application Manual Table III-7 ("Attack and
 decay times in relation to RATE")** page 14
@@ -654,12 +680,17 @@ fail and signal the per-block first-sample validation pass.
   §"Provenance & non-emulator sourcing" appendix): the §7 LFO
   numeric *depth* step arrays for AM (tremolo) + VIB (vibrato) —
   the phase cadence is now live, but the phase→depth translation
-  that makes the LFO audible awaits those arrays. Rhythm-mode
-  operator allocation
-  (`$0E` bit 5, drum channels at `$36`/`$37`/`$38`) is also out
-  of scope — VRC7 has no rhythm DAC so the drum patches in the
-  ROM are inaudible there, but a future YM2413 consumer (an
-  MSX-format crate, say) would need rhythm-mode decoded.
+  that makes the LFO audible awaits those arrays. Round 283
+  decoded the rhythm-mode register semantics (`$0E` bit table,
+  Table III-9 slot/channel allocation, `$36`~`$38` dual-volume
+  nibbles, the manual's percussion F-Number preset, the VRC7 drum
+  ROM bytes + always-enabled/no-rhythm-DAC carve-out); what a
+  future YM2413 consumer (an MSX-format crate, say) would still
+  need is the rhythm *synthesis* path for HH/SD/TOM/TOP-CYM — the
+  §V-4 noise oscillator is described qualitatively ("specified by
+  the frequency information (BLOCK, F-Number, Multiple) of the 8
+  and 9 channels" composed with white noise) but its phase-bit
+  formulas are not numerically pinned by the staged material.
 * N163: round 11 added the per-channel timer accumulators; round 274
   added the `update_rate_hz` / `emitted_frequency_hz` calibration API
   and validated the documented `f = (n * p) / (15 * 65536 * l * c)`

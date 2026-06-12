@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OPLL §III-1-7 rhythm-mode register semantics + VRC7 no-rhythm-DAC
+  carve-out** (round 283): the rhythm-control register map is now
+  decoded, per the Yamaha YM2413 Application Manual §III-1-7 /
+  §III-1-8 (mirrored in
+  `docs/audio/nsf/opll-ym2413/ym2413-application-manual-smspower.html`)
+  and `docs/audio/nsf/vrc7-audio-wiki.html`. New in `opll`:
+  `RhythmRegister` decodes `$0E` (`D5..D0` = `RHYTHM BD SD TOM TOP-CY
+  HH`; D5 = 1 puts the OPLL in Rhythm mode with percussion through
+  channels 7~9 and the melody section limited to six sounds);
+  `RhythmInstrument` carries the **Table III-9** slot allocation
+  (BD = slots 13 + 16, HH = 14, TOM = 15, SD = 17, TOP-CYM = 18) and
+  the channel allocation derived from it + §V-4's "three channels and
+  six slots" (BD owns channel 7 as the only two-slot FM pair; HH+SD
+  share channel 8; TOM+TOP-CYM share channel 9); `RhythmVolumes`
+  decodes the rhythm-mode `$36`~`$38` dual-volume nibbles (BD in
+  `$36` low; HH high / SD low in `$37`; TOM high / T-CYM low in
+  `$38`); `RHYTHM_FNUM_PRESET` pins the manual's recommended
+  percussion F-Number/Block writes (`$16←$20 $17←$50 $18←$C0 $26←$05
+  $27←$05 $28←$01`, Key-ON bits clear per "Key-ON bits $26, $27, $28
+  must always be cleared to 0"). New in `expansion`:
+  `VRC7_RHYTHM_ROM` pins the 3 drum patches in the VRC7 instrument
+  ROM dump — inaudible there per §"Rhythm Register $0E" (no rhythm
+  DAC) — including the documented snare-drum byte `$07` divergence
+  (`$68` on VRC7 vs `$48` on YM2413); `Vrc7::rhythm_control()`
+  surfaces the VRC7 carve-out (the rhythm-mode bit "is treated as
+  though it were always enabled", `$0E` writes are ignored by the
+  synthesis path, six audible FM channels always). Rhythm *synthesis*
+  beyond the BD two-slot FM pair (the §V-4 noise-oscillator phases
+  for HH/SD/TOM/TOP-CYM) is not numerically pinned by the staged
+  material and stays out of scope — moot for VRC7. 7 new unit tests:
+  the `$0E` per-bit decode (incl. D7/D6 exclusion), the Table III-9
+  slot allocation + six-slot exact-cover property, the channel
+  allocation + slot↔channel consistency, the `$36`~`$38` nibble
+  decode, the F-Number preset + Key-ON-clear invariant, the rhythm
+  ROM bytes + `$68` divergence, and a lockstep two-chip proof that a
+  `$0E` write leaves the VRC7's melody output bit-identical.
+
 - **NSFDRV sound-driver identification** (round 279): the 8-byte
   NSFDRV tag at the start of the program data is now decoded, per
   `docs/audio/nsf/nsfdrv-nesdev-wiki.html` §"File Format" (6-byte

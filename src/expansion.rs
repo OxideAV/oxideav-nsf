@@ -1155,6 +1155,27 @@ pub const VRC7_INSTRUMENT_ROM: [[u8; 8]; 16] = [
     [0x21, 0x72, 0x0D, 0x00, 0xC1, 0xD5, 0x56, 0x06], // F Sweep
 ];
 
+/// The three rhythm (drum) patches present in the VRC7's instrument
+/// ROM, per the §"Internal patch set" footnote in
+/// `docs/audio/nsf/vrc7-audio-wiki.html`: "The VRC7 instrument ROM
+/// dump also shows 3 drum patches. It is believed that these
+/// additional patches are an artifact from the YM2413 and are not
+/// playable on the VRC7." They are inaudible on the VRC7 — the chip
+/// has no rhythm DAC (§"Rhythm Register $0E") — but the bytes are
+/// documented ROM contents, including the one divergence from the
+/// YM2413's drum ROM the same footnote calls out: "byte $07 of the
+/// snare drum ($68) differs from YM2413 ($48)".
+///
+/// Order: Bass Drum; Snare Drum / Hi-Hat; Tom / Top Cymbal — the
+/// shared-patch pairing matches the Table III-9 slot allocation
+/// (see [`crate::opll::RhythmInstrument::slots`]), where HH+SD and
+/// TOM+T-CY each share one channel's modulator/carrier slot pair.
+pub const VRC7_RHYTHM_ROM: [[u8; 8]; 3] = [
+    [0x01, 0x01, 0x18, 0x0F, 0xDF, 0xF8, 0x6A, 0x6D], // Bass Drum
+    [0x01, 0x01, 0x00, 0x00, 0xC8, 0xD8, 0xA7, 0x68], // Snare Drum / Hi-Hat
+    [0x05, 0x01, 0x00, 0x00, 0xF8, 0xAA, 0x59, 0x55], // Tom / Top Cymbal
+];
+
 /// Decoded 2-operator patch parameters per the §"Custom Patch"
 /// table in `docs/audio/nsf/vrc7-audio-wiki.html`. The patch defines
 /// one modulator + one carrier; bytes `$00`/`$04`/`$06` describe the
@@ -1523,6 +1544,29 @@ impl Vrc7 {
     /// Return the currently selected patch for channel `ch` (0..=5).
     pub fn active_patch(&self, ch: usize) -> Vrc7Patch {
         self.patch(self.channels[ch].patch_index)
+    }
+
+    /// Effective rhythm-control state — constant on the VRC7.
+    ///
+    /// Per `docs/audio/nsf/vrc7-audio-wiki.html` §"Rhythm Register
+    /// $0E": "In normal operation, the 'rhythm mode' bit in register
+    /// $0E is treated as though it were always enabled, resulting
+    /// [in] only six audible FM channels. The VRC7 has no rhythm DAC,
+    /// so the 5 rhythm channels are always inaudible." And per
+    /// §"Internal Audio Registers", register values outside the
+    /// documented set ($00-$07, $10-$15, $20-$25, $30-$35, $0F) "are
+    /// ignored" — so a `$0E` write is recorded in [`Vrc7::regs`] as
+    /// raw bookkeeping but never reaches the synthesis path. The
+    /// returned state therefore always reads `rhythm_mode = true`
+    /// with all five drum keys off, regardless of what was written.
+    /// (Disabling the bit for 9-channel OPLL audio requires the
+    /// hardware debug mode on pin 15, which an NSF rip cannot
+    /// exercise.)
+    pub fn rhythm_control(&self) -> crate::opll::RhythmRegister {
+        crate::opll::RhythmRegister {
+            rhythm_mode: true,
+            ..crate::opll::RhythmRegister::default()
+        }
     }
 
     pub fn tick(&mut self, cycles: u32) {
@@ -4610,5 +4654,77 @@ mod tests {
         vrc7_write_reg(&mut chip, 0x30, 0xA0); // patch=A, vol=0
         assert_eq!(chip.opll_channels[0].modulator.env.rks, 7);
         assert_eq!(chip.opll_channels[0].carrier.env.rks, 1);
+    }
+
+    /// The 3 drum patches in the VRC7 instrument ROM dump, per the
+    /// §"Internal patch set" footnote of
+    /// `docs/audio/nsf/vrc7-audio-wiki.html` — including the one
+    /// documented divergence from the YM2413 drum ROM ("byte $07 of
+    /// the snare drum ($68) differs from YM2413 ($48)").
+    #[test]
+    fn vrc7_rhythm_rom_matches_documented_dump() {
+        assert_eq!(
+            VRC7_RHYTHM_ROM[0],
+            [0x01, 0x01, 0x18, 0x0F, 0xDF, 0xF8, 0x6A, 0x6D],
+            "Bass Drum"
+        );
+        assert_eq!(
+            VRC7_RHYTHM_ROM[1],
+            [0x01, 0x01, 0x00, 0x00, 0xC8, 0xD8, 0xA7, 0x68],
+            "Snare Drum / Hi-Hat"
+        );
+        assert_eq!(
+            VRC7_RHYTHM_ROM[2],
+            [0x05, 0x01, 0x00, 0x00, 0xF8, 0xAA, 0x59, 0x55],
+            "Tom / Top Cymbal"
+        );
+        assert_eq!(
+            VRC7_RHYTHM_ROM[1][7], 0x68,
+            "snare byte $07 is the documented VRC7-vs-YM2413 divergence"
+        );
+        // Every drum row decodes through the standard §"Custom Patch"
+        // 8-byte layout (same format as the melody slots).
+        for row in &VRC7_RHYTHM_ROM {
+            let p = Vrc7Patch::from_bytes(row);
+            assert!(p.mod_mult <= 0x0F && p.car_mult <= 0x0F);
+        }
+    }
+
+    /// §"Rhythm Register $0E": the VRC7 treats the rhythm-mode bit as
+    /// always enabled, has no rhythm DAC, and ignores `$0E` writes —
+    /// `rhythm_control()` is constant and the 6 melody channels'
+    /// output is bit-identical with or without a `$0E` write.
+    #[test]
+    fn vrc7_rhythm_register_is_inert() {
+        let base = Vrc7::new().rhythm_control();
+        assert!(base.rhythm_mode, "rhythm mode reads as always enabled");
+        assert!(
+            !(base.bd || base.sd || base.tom || base.t_cy || base.hh),
+            "no drum key is ever effective (no rhythm DAC)"
+        );
+
+        // Two chips in lockstep; one also receives a $0E write with
+        // every drum key + the rhythm bit set.
+        let mut plain = Vrc7::new();
+        let mut poked = Vrc7::new();
+        for chip in [&mut plain, &mut poked] {
+            chip.enabled = true;
+            vrc7_write_reg(chip, 0x30, 0x10); // patch 1, vol 0
+            vrc7_write_reg(chip, 0x10, 0x80); // fnum low
+            vrc7_write_reg(chip, 0x20, 0x17); // key-on, block 3, fnum msb 1
+        }
+        vrc7_write_reg(&mut poked, 0x0E, 0x3F);
+        // The raw byte is recorded as bookkeeping but never reaches
+        // the synthesis path.
+        assert_eq!(poked.regs[0x0E], 0x3F);
+        assert_eq!(poked.rhythm_control(), base, "decode unaffected by write");
+        for _ in 0..256 {
+            plain.tick(36);
+            poked.tick(36);
+            assert_eq!(
+                plain.latched_output, poked.latched_output,
+                "melody output unaffected by $0E"
+            );
+        }
     }
 }
