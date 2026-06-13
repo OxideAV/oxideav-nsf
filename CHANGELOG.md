@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VRC6 pulse duty generator 15→0 down-count + E-bit phase reset**
+  (round 290): the VRC6 pulse channels now model the duty generator
+  exactly as `docs/audio/nsf/vrc6-audio-wiki.html` §"Pulse Channels"
+  describes — "The duty cycle generator takes 16 steps, counting down
+  from 15 to 0. When the current step is less than or equal to the
+  given duty cycle D, the channel volume V is output." The generator
+  step now decrements 15→0 (wrapping back to 15) instead of the prior
+  up-count, and a fresh chip seeds both pulses at the top of the
+  countdown. The previously-missing §"Pulse Channels" disable
+  semantic — "When the channel is disabled by clearing the E bit,
+  output is forced to 0, and the duty cycle is immediately reset and
+  halted; it will resume from the beginning when E is once again set"
+  — now fires on the `$9002`/`$A002` E-bit falling edge: the duty
+  generator is pinned to its beginning (step 15) and the timer
+  reloaded, so the documented "reset phase by clearing and immediately
+  setting E" technique lands the pulse at a deterministic phase. The
+  duty *ratio* (D+1 of 16 steps high) and the M-mode 100 % override
+  were already correct and are unchanged. 7 new unit tests cover the
+  15→0 down-count + wrap, the D=3 → 4/16 duty ratio, the M-mode
+  full-volume override across all 16 phases, the E-clear reset to
+  step 15 + zero output + resume-from-beginning, and the
+  clear-then-set phase-reset technique.
+
 - **OPLL §III-1-7 rhythm-mode register semantics + VRC7 no-rhythm-DAC
   carve-out** (round 283): the rhythm-control register map is now
   decoded, per the Yamaha YM2413 Application Manual §III-1-7 /

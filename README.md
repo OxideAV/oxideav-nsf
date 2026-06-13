@@ -317,6 +317,28 @@ BD FM pair (the §V-4 noise-oscillator phases for HH/SD/TOM/TOP-CYM)
 is not numerically pinned by the staged material and stays out of
 scope. 7 new unit tests.
 
+Round 290 lands the VRC6 pulse duty generator's documented 15→0
+down-count and the E-bit phase-reset semantic per
+`docs/audio/nsf/vrc6-audio-wiki.html` §"Pulse Channels". The
+generator now decrements 15→0 (wrapping back to 15) — "The duty
+cycle generator takes 16 steps, counting down from 15 to 0. When the
+current step is less than or equal to the given duty cycle D, the
+channel volume V is output" — instead of the prior up-count, with a
+fresh chip seeded at the top of the countdown. The previously-missing
+disable behaviour — "When the channel is disabled by clearing the E
+bit, output is forced to 0, and the duty cycle is immediately reset
+and halted; it will resume from the beginning when E is once again
+set" — now fires on the `$9002`/`$A002` E-bit falling edge: the
+generator is pinned to step 15 and the timer reloaded, so the
+spec's "reset phase by clearing and immediately setting E" technique
+(the VRC6 analogue of the 2A03 pulse phase-reset) lands at a
+deterministic phase. The duty ratio (D+1 of 16 high) and the M-mode
+100 % override were already correct and are unchanged. 7 new unit
+tests cover the down-count + wrap, the D=3 → 4/16 ratio, the M-mode
+full-volume override across all 16 phases, the E-clear reset +
+zero-output + resume-from-beginning, and the clear-then-set
+phase-reset technique.
+
 Round 232 lands the OPLL envelope per-RATE decay step from
 **Yamaha YM2413 Application Manual Table III-7 ("Attack and
 decay times in relation to RATE")** page 14

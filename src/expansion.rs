@@ -45,7 +45,33 @@ pub struct Vrc6Pulse {
     pub volume: u8,
     pub timer_period: u16,
     pub timer: u16,
+    /// 16-step duty generator, counting **down** from 15 to 0 per
+    /// `docs/audio/nsf/vrc6-audio-wiki.html` §"Pulse Channels": "The
+    /// duty cycle generator takes 16 steps, counting down from 15 to
+    /// 0. When the current step is less than or equal to the given
+    /// duty cycle D, the channel volume V is output, otherwise 0 is
+    /// output." A freshly reset / re-enabled generator starts at the
+    /// top of the countdown (15).
     pub step: u8,
+}
+
+impl Vrc6Pulse {
+    /// Apply a `$x002` E-bit (enable) write, honouring the §"Pulse
+    /// Channels" reset semantics: "When the channel is disabled by
+    /// clearing the E bit, output is forced to 0, and the duty cycle
+    /// is immediately reset and halted; it will resume from the
+    /// beginning when E is once again set." The duty generator's
+    /// "beginning" is the top of the 15→0 countdown, so a falling
+    /// edge on E pins `step` at 15 and the timer is reloaded so the
+    /// generator resumes a full step from a clean phase when E is set
+    /// again.
+    fn set_enabled(&mut self, now_enabled: bool) {
+        if !now_enabled && self.enabled {
+            self.step = 15;
+            self.timer = self.timer_period;
+        }
+        self.enabled = now_enabled;
+    }
 }
 
 #[derive(Default)]
@@ -60,7 +86,13 @@ pub struct Vrc6Saw {
 
 impl Vrc6 {
     pub fn new() -> Self {
-        Self::default()
+        let mut chip = Self::default();
+        // The duty generator counts down from 15 to 0
+        // (§"Pulse Channels"); seed both pulses at the top of the
+        // countdown so the very first enabled cycle has a clean phase.
+        chip.pulse[0].step = 15;
+        chip.pulse[1].step = 15;
+        chip
     }
 
     pub fn write(&mut self, addr: u16, value: u8) {
@@ -76,7 +108,7 @@ impl Vrc6 {
             0x9002 => {
                 self.pulse[0].timer_period =
                     (self.pulse[0].timer_period & 0x00FF) | (((value & 0x0F) as u16) << 8);
-                self.pulse[0].enabled = value & 0x80 != 0;
+                self.pulse[0].set_enabled(value & 0x80 != 0);
             }
             0x9003 => {
                 self.halt = value & 0x01 != 0;
@@ -93,7 +125,7 @@ impl Vrc6 {
             0xA002 => {
                 self.pulse[1].timer_period =
                     (self.pulse[1].timer_period & 0x00FF) | (((value & 0x0F) as u16) << 8);
-                self.pulse[1].enabled = value & 0x80 != 0;
+                self.pulse[1].set_enabled(value & 0x80 != 0);
             }
             0xB000 => {
                 self.saw.rate = value & 0x3F;
@@ -142,7 +174,9 @@ impl Vrc6 {
                 let take = left.min(scale);
                 if p.timer == 0 {
                     p.timer = p.timer_period;
-                    p.step = (p.step + 1) & 0x0F;
+                    // §"Pulse Channels": the duty generator counts
+                    // down from 15 to 0, wrapping back to 15.
+                    p.step = if p.step == 0 { 15 } else { p.step - 1 };
                 } else {
                     p.timer = p.timer.saturating_sub(take.min(p.timer as u32) as u16);
                 }
@@ -201,6 +235,12 @@ impl Vrc6 {
             if !p.enabled || p.timer_period < 1 {
                 continue;
             }
+            // §"Pulse Channels": "When the current step is less than
+            // or equal to the given duty cycle D, the channel volume V
+            // is output, otherwise 0 is output. When the mode bit M is
+            // true, the channel ignores the duty cycle generator and
+            // outputs the current volume regardless of the current
+            // duty."
             let high = if p.mode_digital {
                 true
             } else {
@@ -2639,6 +2679,139 @@ mod tests {
         chip.tick(10_000);
         assert_eq!(chip.saw.step, 0);
         assert_eq!(chip.saw.accum, 0);
+    }
+
+    // ---------------- Round 290: VRC6 pulse duty generator -----------------
+    //
+    // Spec source: `docs/audio/nsf/vrc6-audio-wiki.html`
+    //   §"Pulse Channels" — "The duty cycle generator takes 16 steps,
+    //                        counting down from 15 to 0. When the
+    //                        current step is less than or equal to the
+    //                        given duty cycle D, the channel volume V
+    //                        is output, otherwise 0 is output. When the
+    //                        mode bit M is true, the channel ignores
+    //                        the duty cycle generator and outputs the
+    //                        current volume regardless of the current
+    //                        duty."
+    //   §"Pulse Channels" — "When the channel is disabled by clearing
+    //                        the E bit, output is forced to 0, and the
+    //                        duty cycle is immediately reset and
+    //                        halted; it will resume from the beginning
+    //                        when E is once again set."
+
+    /// Advance the pulse duty generator by exactly one step and return
+    /// the new step value. The chip ticks `timer_period + 1` cycles per
+    /// step (the +1 absorbs the "0 → reload + advance" tick), with
+    /// `freq_shift = 0` so one CPU cycle == one divider tick.
+    fn vrc6_pulse_step_once(chip: &mut Vrc6, idx: usize) -> u8 {
+        let period = chip.pulse[idx].timer_period;
+        chip.tick(period as u32 + 1);
+        chip.pulse[idx].step
+    }
+
+    #[test]
+    fn vrc6_pulse_duty_generator_counts_down_from_fifteen() {
+        // §"Pulse Channels": the 16-step generator counts down 15→0
+        // and wraps. A fresh chip seeds step at 15; each timer expiry
+        // decrements it, wrapping 0 → 15.
+        let mut chip = Vrc6::new();
+        chip.write(0x9000, 0x0F); // vol=15, duty=0, M=0
+        chip.write(0x9001, 0x02); // period low = 2 (short, deterministic)
+        chip.write(0x9002, 0x80); // E=1, period high = 0
+        assert_eq!(chip.pulse[0].step, 15, "fresh generator starts at 15");
+        let walk: Vec<u8> = (0..17)
+            .map(|_| vrc6_pulse_step_once(&mut chip, 0))
+            .collect();
+        assert_eq!(
+            walk,
+            vec![14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14],
+            "step counts down 15→0 then wraps back to 15"
+        );
+    }
+
+    #[test]
+    fn vrc6_pulse_duty_ratio_is_d_plus_one_steps_high() {
+        // §"Pulse Channels": "When the current step is less than or
+        // equal to the given duty cycle D, the channel volume V is
+        // output." With D=3 (25 % per the §duty table 4/16), exactly
+        // steps 0,1,2,3 of the 16-step cycle output volume — 4 of 16.
+        let mut chip = Vrc6::new();
+        chip.write(0x9000, 0x3F); // M=0, duty=3, vol=15
+        chip.write(0x9001, 0x02);
+        chip.write(0x9002, 0x80);
+        let mut high = 0usize;
+        // Sample all 16 phases of the duty cycle.
+        for _ in 0..16 {
+            if chip.output() > 0.0 {
+                high += 1;
+            }
+            let _ = vrc6_pulse_step_once(&mut chip, 0);
+        }
+        assert_eq!(high, 4, "duty D=3 → 4/16 steps high (25 %)");
+    }
+
+    #[test]
+    fn vrc6_pulse_mode_bit_outputs_full_volume_ignoring_duty() {
+        // §"Pulse Channels": "When the mode bit M is true, the channel
+        // ignores the duty cycle generator and outputs the current
+        // volume regardless of the current duty." (§duty table M row
+        // = 16/16 = 100 %.) Even with duty=0 (the narrowest setting),
+        // M=1 outputs volume at every one of the 16 phases.
+        let mut chip = Vrc6::new();
+        chip.write(0x9000, 0x8F); // M=1, duty=0, vol=15
+        chip.write(0x9001, 0x02);
+        chip.write(0x9002, 0x80);
+        for _ in 0..16 {
+            assert!(chip.output() > 0.0, "M-mode outputs volume at every phase");
+            let _ = vrc6_pulse_step_once(&mut chip, 0);
+        }
+    }
+
+    #[test]
+    fn vrc6_pulse_e_clear_resets_duty_generator_to_beginning() {
+        // §"Pulse Channels": "When the channel is disabled by clearing
+        // the E bit, output is forced to 0, and the duty cycle is
+        // immediately reset and halted; it will resume from the
+        // beginning when E is once again set." The duty generator's
+        // "beginning" is the top of the 15→0 countdown (step 15).
+        let mut chip = Vrc6::new();
+        chip.write(0x9000, 0x7F); // M=0, duty=7 (50 %), vol=15
+        chip.write(0x9001, 0x04);
+        chip.write(0x9002, 0x80); // E=1
+                                  // Walk a few steps so the generator is mid-countdown.
+        for _ in 0..5 {
+            let _ = vrc6_pulse_step_once(&mut chip, 0);
+        }
+        assert_ne!(chip.pulse[0].step, 15, "generator has walked off 15");
+        // Falling edge on E forces output to 0 and resets the duty
+        // generator to the beginning (step 15).
+        chip.write(0x9002, 0x00); // E=0
+        assert!(!chip.pulse[0].enabled);
+        assert_eq!(chip.pulse[0].step, 15, "duty generator reset to beginning");
+        assert_eq!(chip.output(), 0.0, "disabled pulse outputs 0");
+        // Re-enabling resumes from the beginning (step 15) per the
+        // "resume from the beginning when E is once again set" rule.
+        chip.write(0x9002, 0x80); // E=1
+        assert_eq!(chip.pulse[0].step, 15);
+    }
+
+    #[test]
+    fn vrc6_pulse_e_clear_phase_reset_matches_2a03_style_technique() {
+        // §"Pulse Channels": "Thus it is possible to reset phase by
+        // clearing and immediately setting E." A clear-then-set pair
+        // must land the generator at a deterministic phase (15)
+        // independent of where it was when E was cleared.
+        let mut chip = Vrc6::new();
+        chip.write(0x9000, 0x5F); // duty=5, vol=15
+        chip.write(0x9001, 0x08);
+        chip.write(0x9002, 0x80); // E=1
+        for _ in 0..9 {
+            let _ = vrc6_pulse_step_once(&mut chip, 0);
+        }
+        // Clear + immediately set E → phase pinned at 15.
+        chip.write(0x9002, 0x00);
+        chip.write(0x9002, 0x80);
+        assert_eq!(chip.pulse[0].step, 15);
     }
 
     #[test]
