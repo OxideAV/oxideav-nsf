@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MMC5 pulse 240 Hz envelope + length counter (no frame sequencer)**
+  (round 294): the MMC5 pulse channels previously decoded `$5000`/
+  `$5004` (duty / halt / constant / volume) and the `$5003`/`$5007`
+  length register only at the byte level — the length counter was
+  never clocked, the envelope decay was never generated, and
+  `output()` always emitted the raw volume nibble. They now model the
+  envelope + length unit per `docs/audio/nsf/mmc5-audio-wiki.html`
+  §"Pulse 1 ($5000-$5003)" + §"Status ($5015)". The chip has "no
+  equivalent frame sequencer (APU $4017); envelope and length counter
+  are fixed to a 240hz update rate", so a new free-running
+  `MMC5_FRAME_CPU`-cycle accumulator (the same 7457-cycle ≈240 Hz
+  cadence the 2A03 frame counter uses) clocks both units each tick.
+  The length counter now loads from the 2A03 `LENGTH_TABLE` on a
+  `$5003`/`$5007` write (only while the channel is enabled in
+  `$5015`), counts down at the 240 Hz clock — "twice as fast as the
+  APU length counter" — silences the channel at 0, and is zeroed when
+  the channel's `$5015` enable bit is cleared ("analogous to the APU
+  Status register"). The envelope is the APU-identical decay generator
+  (`$5003`/`$5007` write arms `env_start`; the shared `$5000` bit-5
+  halt bit also acts as the envelope loop bit; bit 4 selects constant
+  volume vs decay level), so `output()` now emits the decay level in
+  envelope mode. The §"Pulse 1" "Frequency values less than 8 do not
+  silence the MMC5 pulse channels" difference from the 2A03 is also
+  honoured — the prior `timer_period >= 8` mute is removed, so sub-8
+  periods emit ultrasonic tones. `$5001` remains unimplemented (the
+  MMC5 pulse has no sweep). 13 new unit tests cover the
+  LENGTH_TABLE-vs-raw-index load, the enabled-gating of the load, the
+  240 Hz count-down to silence, the halt freeze, the disable-clears-
+  length rule, envelope decay at 240 Hz, the envelope-period divider,
+  the loop-on-halt wrap, the constant-vs-envelope volume select, the
+  sub-8-period non-silence, the length-write envelope restart, and the
+  full-period requirement of the 240 Hz clock.
+
 - **VRC6 pulse duty generator 15→0 down-count + E-bit phase reset**
   (round 290): the VRC6 pulse channels now model the duty generator
   exactly as `docs/audio/nsf/vrc6-audio-wiki.html` §"Pulse Channels"

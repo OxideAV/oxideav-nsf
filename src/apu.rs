@@ -44,7 +44,7 @@
 const NTSC_CPU_HZ: u32 = 1_789_773;
 
 /// Length counter lookup table (nesdev.org/wiki/APU_Length_Counter).
-const LENGTH_TABLE: [u8; 32] = [
+pub(crate) const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
     192, 24, 72, 26, 16, 28, 32, 30,
 ];

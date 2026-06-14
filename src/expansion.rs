@@ -261,6 +261,17 @@ impl Vrc6 {
 
 // ---------------------------------------------------------------- MMC5
 
+/// CPU-cycle period of the MMC5's fixed 240 Hz envelope / length clock.
+///
+/// Per `docs/audio/nsf/mmc5-audio-wiki.html` §"Pulse 1 ($5000-$5003)":
+/// "MMC5 does not have an equivalent frame sequencer (APU $4017);
+/// envelope and length counter are fixed to a 240hz update rate." The
+/// chip free-runs this clock — there is no 4-step / 5-step mode and no
+/// `$4017` analogue. We reuse the same `7457`-cycle quarter-frame
+/// period the 2A03 frame counter uses for its own ≈240 Hz quarter-frame
+/// events, so the two share one cadence.
+const MMC5_FRAME_CPU: u32 = 7457;
+
 /// MMC5 audio has 2 pulses (almost identical to 2A03 pulses but no
 /// sweep) at `$5000..=$5007` plus a raw 8-bit PCM channel at `$5011`
 /// and a status register at `$5015`.
@@ -301,6 +312,12 @@ pub struct Mmc5 {
     /// `$8000..=$BFFF` read in read mode) sees a `$00` byte; cleared
     /// on any non-zero DAC update or a `$5010` read.
     pub irq_trip: bool,
+    /// CPU-cycle accumulator for the fixed 240 Hz envelope / length
+    /// clock (§"Pulse 1": "envelope and length counter are fixed to a
+    /// 240hz update rate"). No frame sequencer exists, so this just
+    /// free-runs and fires both the envelope and length steps each
+    /// time it crosses `MMC5_FRAME_CPU`.
+    pub frame_acc: u32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -308,12 +325,31 @@ pub struct Mmc5Pulse {
     pub enabled: bool,
     pub duty: u8,
     pub volume: u8,
+    /// `$5000`/`$5004` bit 4 — constant-volume vs envelope select. When
+    /// set, `output()` uses `volume` directly; when clear, the envelope
+    /// decay level is used (§"Pulse 1": "the envelope … [is] the same
+    /// as their APU counterparts").
     pub constant: bool,
     pub timer_period: u16,
     pub timer: u16,
     pub step: u8,
+    /// Length counter, loaded from the 2A03 `LENGTH_TABLE` on a
+    /// `$5003`/`$5007` write and counted down at the fixed 240 Hz clock
+    /// — "twice as fast as the APU length counter" per §"Pulse 1".
     pub length: u8,
+    /// `$5000`/`$5004` bit 5 — length-counter halt + envelope loop. The
+    /// 2A03 shares one bit for both functions; the MMC5 pulse does too
+    /// ("the same as their APU counterparts").
     pub halt: bool,
+    // ---- Envelope (APU-identical) ----
+    /// Envelope start flag, set on every `$5003`/`$5007` write; the
+    /// next envelope clock reloads the decay level to 15 and the
+    /// divider to `volume`.
+    pub env_start: bool,
+    /// Current 4-bit envelope decay level (0..=15).
+    pub env_decay: u8,
+    /// Envelope divider; counts down from `volume`, reloads on 0.
+    pub env_divider: u8,
 }
 
 const MMC5_DUTY: [[u8; 8]; 4] = [
@@ -322,6 +358,64 @@ const MMC5_DUTY: [[u8; 8]; 4] = [
     [0, 1, 1, 1, 1, 0, 0, 0],
     [1, 0, 0, 1, 1, 1, 1, 1],
 ];
+
+impl Mmc5Pulse {
+    /// Clock the envelope unit once (240 Hz). Identical to the 2A03
+    /// envelope (§"Pulse 1": "the envelope … the same as their APU
+    /// counterparts"): `env_start` reloads decay=15 + divider=volume;
+    /// otherwise the divider counts down and, on reaching 0, reloads to
+    /// `volume` and decrements the decay (looping back to 15 when the
+    /// halt/loop bit is set).
+    fn clock_envelope(&mut self) {
+        if self.env_start {
+            self.env_start = false;
+            self.env_decay = 15;
+            self.env_divider = self.volume;
+        } else if self.env_divider == 0 {
+            self.env_divider = self.volume;
+            if self.env_decay > 0 {
+                self.env_decay -= 1;
+            } else if self.halt {
+                self.env_decay = 15;
+            }
+        } else {
+            self.env_divider -= 1;
+        }
+    }
+
+    /// Clock the length counter once (240 Hz, "twice as fast as the APU
+    /// length counter"). The halt bit freezes it; the count never wraps
+    /// below 0.
+    fn clock_length(&mut self) {
+        if !self.halt && self.length > 0 {
+            self.length -= 1;
+        }
+    }
+
+    /// 4-bit volume the channel currently emits: the constant level
+    /// (`$500x` bit 4 set) or the envelope decay level (clear).
+    fn current_volume(&self) -> u8 {
+        if self.constant {
+            self.volume
+        } else {
+            self.env_decay
+        }
+    }
+
+    /// One channel's contribution before mixing. Silenced by a disabled
+    /// channel, an expired length counter, or a low duty step. Note
+    /// there is NO `timer_period >= 8` mute (§"Pulse 1": sub-8 periods
+    /// emit ultrasonic tones rather than silence).
+    fn pulse_output(&self) -> u32 {
+        if !self.enabled
+            || self.length == 0
+            || MMC5_DUTY[self.duty as usize][self.step as usize] == 0
+        {
+            return 0;
+        }
+        self.current_volume() as u32
+    }
+}
 
 impl Mmc5 {
     pub fn new() -> Self {
@@ -342,8 +436,16 @@ impl Mmc5 {
             0x5003 => {
                 self.pulse[0].timer_period =
                     (self.pulse[0].timer_period & 0x00FF) | (((value & 0x07) as u16) << 8);
-                self.pulse[0].length = (value >> 3) & 0x1F;
+                // Length counter loads from the 2A03 LENGTH_TABLE
+                // (§"Pulse 1": length counter "the same as their APU
+                // counterparts"); only when the channel is enabled in
+                // `$5015`. Phase reset + envelope restart on the
+                // length register write match the 2A03 ($4003) write.
+                if self.pulse[0].enabled {
+                    self.pulse[0].length = crate::apu::LENGTH_TABLE[((value >> 3) & 0x1F) as usize];
+                }
                 self.pulse[0].step = 0;
+                self.pulse[0].env_start = true;
             }
             0x5004 => {
                 self.pulse[1].duty = (value >> 6) & 0x03;
@@ -357,8 +459,11 @@ impl Mmc5 {
             0x5007 => {
                 self.pulse[1].timer_period =
                     (self.pulse[1].timer_period & 0x00FF) | (((value & 0x07) as u16) << 8);
-                self.pulse[1].length = (value >> 3) & 0x1F;
+                if self.pulse[1].enabled {
+                    self.pulse[1].length = crate::apu::LENGTH_TABLE[((value >> 3) & 0x1F) as usize];
+                }
                 self.pulse[1].step = 0;
+                self.pulse[1].env_start = true;
             }
             0x5010 => {
                 // §"PCM Mode/IRQ ($5010)" — write:
@@ -376,6 +481,14 @@ impl Mmc5 {
                 self.status = value;
                 self.pulse[0].enabled = value & 0x01 != 0;
                 self.pulse[1].enabled = value & 0x02 != 0;
+                // §"Status ($5015)" is "analogous to the APU Status
+                // register": clearing a channel's enable bit forces its
+                // length counter to zero (the 2A03 `$4015` behaviour).
+                for p in &mut self.pulse {
+                    if !p.enabled {
+                        p.length = 0;
+                    }
+                }
             }
             _ => {}
         }
@@ -471,25 +584,32 @@ impl Mmc5 {
                 left = left.saturating_sub(take);
             }
         }
+
+        // §"Pulse 1": "envelope and length counter are fixed to a 240hz
+        // update rate" with no frame sequencer. The MMC5 free-runs a
+        // single 240 Hz clock; each tick steps both the envelope and
+        // the length counter (the latter being "twice as fast as the
+        // APU length counter", i.e. the APU's 120 Hz half-frame length
+        // clock doubled to 240 Hz).
+        self.frame_acc += cycles;
+        while self.frame_acc >= MMC5_FRAME_CPU {
+            self.frame_acc -= MMC5_FRAME_CPU;
+            for p in &mut self.pulse {
+                p.clock_envelope();
+                p.clock_length();
+            }
+        }
     }
 
     pub fn output(&self) -> f32 {
-        let p0 = if self.pulse[0].enabled
-            && self.pulse[0].timer_period >= 8
-            && MMC5_DUTY[self.pulse[0].duty as usize][self.pulse[0].step as usize] != 0
-        {
-            self.pulse[0].volume as u32
-        } else {
-            0
-        };
-        let p1 = if self.pulse[1].enabled
-            && self.pulse[1].timer_period >= 8
-            && MMC5_DUTY[self.pulse[1].duty as usize][self.pulse[1].step as usize] != 0
-        {
-            self.pulse[1].volume as u32
-        } else {
-            0
-        };
+        // §"Pulse 1": "Frequency values less than 8 do not silence the
+        // MMC5 pulse channels; they can output ultrasonic frequencies."
+        // — so, unlike the 2A03, there is NO `timer_period >= 8` mute.
+        // A channel is silenced only by its length counter reaching 0
+        // (the APU-identical length-counter gate) or by the duty being
+        // low; the volume comes from the envelope (or constant level).
+        let p0 = self.pulse[0].pulse_output();
+        let p1 = self.pulse[1].pulse_output();
         // Pulses share the 2A03 mixer curve approximation.
         let pulse_sum = (p0 + p1) as f32;
         let pulse_out = if pulse_sum <= 0.0 {
@@ -3035,6 +3155,215 @@ mod tests {
         assert_eq!(ex.mmc5.pcm, 0x33);
         ex.observe_prg_read(0xC000, 0x11); // just outside
         assert_eq!(ex.mmc5.pcm, 0x33);
+    }
+
+    // ---------------- Round 294: MMC5 240 Hz envelope + length ----------------
+    //
+    // Spec source: `docs/audio/nsf/mmc5-audio-wiki.html` §"Pulse 1
+    // ($5000-$5003)":
+    //   * "$5001 is not implemented" (no sweep).
+    //   * "Frequency values less than 8 do not silence the MMC5 pulse
+    //     channels; they can output ultrasonic frequencies."
+    //   * "Length counter operates twice as fast as the APU length
+    //     counter (might be clocked at the envelope rate)."
+    //   * "MMC5 does not have an equivalent frame sequencer (APU
+    //     $4017); envelope and length counter are fixed to a 240hz
+    //     update rate."
+    //   * "Other features such as the envelope and phase reset are the
+    //     same as their APU counterparts."
+
+    /// One MMC5 240 Hz envelope/length step is `MMC5_FRAME_CPU` CPU
+    /// cycles; this drives exactly `n` of them.
+    fn mmc5_frame_steps(chip: &mut Mmc5, n: u32) {
+        for _ in 0..n {
+            chip.tick(MMC5_FRAME_CPU);
+        }
+    }
+
+    #[test]
+    fn mmc5_length_loads_from_apu_table_not_raw_index() {
+        // §"Pulse 1": length counter is "the same as their APU
+        // counterparts" — a $5003 write loads LENGTH_TABLE[value>>3],
+        // not the raw 5-bit index. value=$08 → index 1 → 254.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01); // enable pulse 0
+        chip.write(0x5003, 0x08);
+        assert_eq!(chip.pulse[0].length, 254);
+        // index 0 → 10.
+        chip.write(0x5003, 0x00);
+        assert_eq!(chip.pulse[0].length, 10);
+    }
+
+    #[test]
+    fn mmc5_length_load_ignored_when_channel_disabled() {
+        // APU-identical: a length-register write while the channel is
+        // disabled in $5015 does not load the counter.
+        let mut chip = Mmc5::new();
+        chip.write(0x5003, 0x08); // pulse 0 still disabled
+        assert_eq!(chip.pulse[0].length, 0);
+    }
+
+    #[test]
+    fn mmc5_length_counts_down_at_240hz_until_silent() {
+        // The length counter decrements once per MMC5_FRAME_CPU cycles
+        // and silences the channel when it reaches 0. index 3 → 2 is
+        // the shortest non-trivial entry, so 2 ticks exhausts it.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x1F); // constant volume 15, halt CLEAR
+        chip.write(0x5002, 0x40); // period > 0 so duty step can be high
+        chip.write(0x5003, 0x18); // index 3 → length 2
+        assert_eq!(chip.pulse[0].length, 2);
+        mmc5_frame_steps(&mut chip, 1);
+        assert_eq!(chip.pulse[0].length, 1);
+        mmc5_frame_steps(&mut chip, 1);
+        assert_eq!(chip.pulse[0].length, 0);
+        // Expired length → channel silent regardless of duty step.
+        chip.pulse[0].step = 1; // a high duty step
+        assert_eq!(chip.pulse[0].pulse_output(), 0);
+    }
+
+    #[test]
+    fn mmc5_length_halt_freezes_counter() {
+        // §"Pulse 1": halt bit ($5000 bit 5) is "the same as their APU
+        // counterparts" — it freezes the length counter.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x3F); // halt SET (bit 5), constant vol 15
+        chip.write(0x5003, 0x18); // length 2
+        mmc5_frame_steps(&mut chip, 10);
+        assert_eq!(chip.pulse[0].length, 2, "halt must freeze the counter");
+    }
+
+    #[test]
+    fn mmc5_disabling_channel_clears_length() {
+        // §"Status ($5015)" "analogous to the APU Status register":
+        // clearing the enable bit zeroes the length counter.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5003, 0x08); // length 254
+        assert_eq!(chip.pulse[0].length, 254);
+        chip.write(0x5015, 0x00); // disable
+        assert_eq!(chip.pulse[0].length, 0);
+    }
+
+    #[test]
+    fn mmc5_envelope_decays_at_240hz() {
+        // §"Pulse 1": envelope is "the same as their APU counterparts".
+        // With the constant bit clear and a fast period (volume=0 →
+        // divider reloads to 0 → decay drops every tick), the decay
+        // ladder walks 15,14,13,… one step per 240 Hz clock.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x00); // constant CLEAR, halt CLEAR, env period (volume)=0
+        chip.write(0x5003, 0x08); // env_start + long length
+                                  // First clock consumes env_start (decay→15).
+        mmc5_frame_steps(&mut chip, 1);
+        assert_eq!(chip.pulse[0].env_decay, 15);
+        mmc5_frame_steps(&mut chip, 1);
+        assert_eq!(chip.pulse[0].env_decay, 14);
+        mmc5_frame_steps(&mut chip, 5);
+        assert_eq!(chip.pulse[0].env_decay, 9);
+    }
+
+    #[test]
+    fn mmc5_envelope_period_slows_decay() {
+        // A non-zero envelope period (the volume nibble) divides the
+        // 240 Hz clock: volume=3 → divider counts 3,2,1,0 before each
+        // decay step, so the decay drops every 4th tick.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x03); // constant CLEAR, volume/period = 3
+        chip.write(0x5003, 0x08); // env_start
+        mmc5_frame_steps(&mut chip, 1); // env_start → decay 15, divider 3
+        assert_eq!(chip.pulse[0].env_decay, 15);
+        mmc5_frame_steps(&mut chip, 3); // divider 3→2→1→0, decay unchanged
+        assert_eq!(chip.pulse[0].env_decay, 15);
+        mmc5_frame_steps(&mut chip, 1); // divider 0 → reload, decay 14
+        assert_eq!(chip.pulse[0].env_decay, 14);
+    }
+
+    #[test]
+    fn mmc5_envelope_loops_when_halt_set() {
+        // The shared halt/loop bit ($5000 bit 5) makes the envelope
+        // wrap 0 → 15 instead of staying at 0 — APU-identical loop.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x20); // constant CLEAR, halt/loop SET, period 0
+        chip.write(0x5003, 0x08); // env_start
+                                  // Walk decay down to 0 (15 steps after the start-consuming one).
+        mmc5_frame_steps(&mut chip, 1 + 15);
+        assert_eq!(chip.pulse[0].env_decay, 0);
+        mmc5_frame_steps(&mut chip, 1); // loop wraps back to 15
+        assert_eq!(chip.pulse[0].env_decay, 15);
+    }
+
+    #[test]
+    fn mmc5_constant_bit_selects_volume_over_envelope() {
+        // §"Pulse 1" constant-volume path: bit 4 set → fixed `volume`;
+        // clear → envelope decay level.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5002, 0x40); // non-zero period
+                                  // Constant volume 7.
+        chip.write(0x5000, 0x17); // constant SET, volume 7
+        chip.write(0x5003, 0x08); // arm length (resets duty step to 0)
+        chip.pulse[0].step = 1; // a high step for duty 0
+        assert_eq!(chip.pulse[0].pulse_output(), 7);
+        // Envelope mode: output tracks the decay level (15 after start).
+        chip.write(0x5000, 0x07); // constant CLEAR, volume(period) 7
+        chip.write(0x5003, 0x08); // resets duty step to 0, arms env_start
+        mmc5_frame_steps(&mut chip, 1); // env_start → decay 15
+        chip.pulse[0].step = 1; // high step (after the timer-advancing tick)
+        assert_eq!(chip.pulse[0].pulse_output(), 15);
+    }
+
+    #[test]
+    fn mmc5_sub_eight_period_is_not_silenced() {
+        // §"Pulse 1": "Frequency values less than 8 do not silence the
+        // MMC5 pulse channels" — unlike the 2A03, a period below 8 must
+        // still emit on a high duty step.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x1F); // constant volume 15
+        chip.write(0x5002, 0x02); // period low = 2 (< 8)
+        chip.write(0x5003, 0x08); // period hi 0, arm length
+        chip.pulse[0].step = 1; // high step for duty 0
+        assert_eq!(
+            chip.pulse[0].pulse_output(),
+            15,
+            "sub-8 period must NOT silence the MMC5 pulse"
+        );
+    }
+
+    #[test]
+    fn mmc5_length_write_restarts_envelope() {
+        // "phase reset … the same as their APU counterparts": a
+        // $5003 write sets env_start so the next clock reloads decay
+        // to 15, even mid-decay.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x00); // envelope mode, period 0
+        chip.write(0x5003, 0x08);
+        mmc5_frame_steps(&mut chip, 5); // decay walks down below 15
+        assert!(chip.pulse[0].env_decay < 15);
+        chip.write(0x5003, 0x08); // re-arm → env_start
+        mmc5_frame_steps(&mut chip, 1);
+        assert_eq!(chip.pulse[0].env_decay, 15);
+    }
+
+    #[test]
+    fn mmc5_240hz_clock_needs_full_period() {
+        // The envelope/length clock only fires once MMC5_FRAME_CPU CPU
+        // cycles have accumulated; a partial tick must not advance it.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x00);
+        chip.write(0x5003, 0x18); // length 2
+        chip.tick(MMC5_FRAME_CPU - 1); // one cycle short
+        assert_eq!(chip.pulse[0].length, 2, "sub-period tick must not step");
+        chip.tick(1); // crosses the boundary
+        assert_eq!(chip.pulse[0].length, 1);
     }
 
     #[test]

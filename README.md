@@ -339,6 +339,36 @@ full-volume override across all 16 phases, the E-clear reset +
 zero-output + resume-from-beginning, and the clear-then-set
 phase-reset technique.
 
+Round 294 lands the MMC5 pulse 240 Hz envelope + length-counter unit
+per `docs/audio/nsf/mmc5-audio-wiki.html` §"Pulse 1 ($5000-$5003)" +
+§"Status ($5015)". The MMC5 pulse channels previously decoded
+`$5000`/`$5004` (duty / halt / constant / volume) and the
+`$5003`/`$5007` length register at the byte level only — the length
+counter was never clocked and the envelope decay was never generated,
+so `output()` always emitted the raw volume nibble. They now model the
+units the wiki describes as "the same as their APU counterparts". The
+chip has "no equivalent frame sequencer (APU $4017); envelope and
+length counter are fixed to a 240hz update rate", so a free-running
+`MMC5_FRAME_CPU` (7457-cycle ≈240 Hz, the same cadence the 2A03 frame
+counter uses) accumulator clocks both units. The length counter loads
+from the shared 2A03 `LENGTH_TABLE` on a `$5003`/`$5007` write (only
+while the channel is enabled in `$5015`), counts down at the 240 Hz
+clock — "twice as fast as the APU length counter" — silences the
+channel at 0, and is zeroed when the channel's `$5015` enable bit is
+cleared. The envelope is the APU decay generator (write arms the start
+flag, the `$5000` bit-5 halt bit doubles as the envelope loop bit, bit
+4 selects constant volume vs decay), so `output()` now emits the decay
+level in envelope mode. The §"Pulse 1" "Frequency values less than 8
+do not silence the MMC5 pulse channels" difference from the 2A03 is
+honoured — the prior `timer_period >= 8` mute is removed so sub-8
+periods emit ultrasonic tones. `$5001` stays unimplemented (no sweep
+unit). 13 new unit tests cover the table-vs-raw-index load, the
+enabled-gating, the 240 Hz count-down to silence, the halt freeze, the
+disable-clears-length rule, decay at 240 Hz, the envelope-period
+divider, the loop-on-halt wrap, the constant-vs-envelope select, the
+sub-8-period non-silence, the length-write envelope restart, and the
+full-period requirement of the 240 Hz clock.
+
 Round 232 lands the OPLL envelope per-RATE decay step from
 **Yamaha YM2413 Application Manual Table III-7 ("Attack and
 decay times in relation to RATE")** page 14
@@ -501,7 +531,13 @@ fail and signal the per-block first-sample validation pass.
 * **Expansion chips** ([`expansion`]) — aggregate routed by the bus,
   outputs summed into the APU mixer:
   * **VRC6** — 2 pulses + sawtooth (`$9000..=$B002`).
-  * **MMC5** — 2 pulses + 8-bit raw PCM (`$5000..=$5015`).
+  * **MMC5** — 2 pulses + 8-bit raw PCM (`$5000..=$5015`). Round 294
+    wires the pulse envelope + length counter at the chip's fixed
+    240 Hz rate (no `$4017` frame sequencer; length clocked twice as
+    fast as the 2A03), the `LENGTH_TABLE` load on `$5003`/`$5007`, the
+    `$5015` enable-bit length clear, the constant-vs-envelope volume
+    select, and the §"Pulse 1" "sub-8 periods are not silenced"
+    carve-out.
   * **Sunsoft 5B** — 3 squares with AY-style log-volume envelopes
     (`$C000` / `$E000` indirect register file).
   * **Namco 163** — wavetable RAM at `$4800` indexed via `$F800`
@@ -739,7 +775,14 @@ fail and signal the per-block first-sample validation pass.
   existing frame-counter / DMC / NSF2-timer sources. A purely
   software-driven PCM streaming consumer (using $5010 IRQ + the
   $00-terminator pattern from §"PCM description") is now fully
-  spec-compliant.
+  spec-compliant. Round 294 added the pulse-channel envelope + length
+  unit at the chip's fixed 240 Hz rate (no frame sequencer; length
+  clocked twice as fast as the 2A03), the length-table load, the
+  enable-bit length clear, and the §"Pulse 1" sub-8-period
+  non-silence carve-out. The remaining MMC5 gap is the §"Pin 2 DAC
+  Characteristic" analog transfer curve (a hardware-measured voltage
+  equation rather than a digital channel behaviour) and cycle-exact
+  240 Hz phase relative to the CPU.
 * RIFF-NSF container variant.
 * `oxideav-source` magic-detection registration so the framework
   auto-dispatches `*.nsf` and `*.nsfe` URIs.
