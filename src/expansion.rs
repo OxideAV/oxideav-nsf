@@ -1099,13 +1099,23 @@ impl N163 {
         }
     }
 
-    pub fn read(&self, addr: u16) -> u8 {
+    pub fn read(&mut self, addr: u16) -> u8 {
         match addr {
-            // The hardware read-port also auto-increments the pointer
-            // when `addr_inc` is set, but `Expansion::read` takes
-            // `&self`, so the increment lives on the writable
-            // mirror path; reads here are non-mutating.
-            0x4800 => self.ram[self.addr as usize],
+            // Data Port read: return the sound-RAM byte at the current
+            // address, then auto-increment the pointer when the `I` bit
+            // is set. Per `docs/audio/nsf/namco-163-audio-wiki.html`
+            // §"Address Port ($F800-$FFFF)" the increment happens "on
+            // writes and reads to the Data Port ($4800)", and §"Data
+            // Port" confirms "When read, the appropriate byte is
+            // returned." Like the write path the pointer "does not wrap,
+            // instead stopping at $7F".
+            0x4800 => {
+                let value = self.ram[self.addr as usize];
+                if self.addr_inc && self.addr < 0x7F {
+                    self.addr += 1;
+                }
+                value
+            }
             _ => 0xFF,
         }
     }
@@ -4101,6 +4111,70 @@ mod tests {
         chip.write(0x4800, 0xAB);
         assert_eq!(chip.ram[0x10], 0xAB);
         assert_eq!(chip.addr, 0x11);
+    }
+
+    #[test]
+    fn n163_data_port_read_returns_ram_at_current_address() {
+        // §"Data Port ($4800-$4FFF)": "When read, the appropriate byte
+        // is returned." With auto-increment clear, repeated reads stay
+        // at the same address.
+        let mut chip = N163::new();
+        chip.ram[0x20] = 0x5A;
+        chip.write(0xF800, 0x20); // addr=0x20, I clear → no auto-inc
+        assert_eq!(chip.read(0x4800), 0x5A);
+        assert_eq!(
+            chip.addr, 0x20,
+            "read must not move a non-incrementing pointer"
+        );
+        assert_eq!(chip.read(0x4800), 0x5A);
+    }
+
+    #[test]
+    fn n163_data_port_read_auto_increments_when_i_bit_set() {
+        // §"Address Port": "If the 'I' bit is set, the address will
+        // increment on writes and reads to the Data Port ($4800)."
+        let mut chip = N163::new();
+        chip.ram[0x30] = 0x11;
+        chip.ram[0x31] = 0x22;
+        chip.ram[0x32] = 0x33;
+        chip.write(0xF800, 0x80 | 0x30); // addr=0x30, auto-inc set
+        assert_eq!(chip.read(0x4800), 0x11);
+        assert_eq!(chip.addr, 0x31);
+        assert_eq!(chip.read(0x4800), 0x22);
+        assert_eq!(chip.addr, 0x32);
+        assert_eq!(chip.read(0x4800), 0x33);
+        assert_eq!(chip.addr, 0x33);
+    }
+
+    #[test]
+    fn n163_data_port_read_auto_increment_stops_at_7f() {
+        // §"Address Port": "it does not wrap, instead stopping at $7F."
+        // The same non-wrapping rule the write path honours applies to
+        // the read-driven increment.
+        let mut chip = N163::new();
+        chip.ram[0x7F] = 0xCC;
+        chip.write(0xF800, 0x80 | 0x7F); // addr=0x7F, auto-inc set
+        assert_eq!(chip.read(0x4800), 0xCC);
+        assert_eq!(chip.addr, 0x7F, "pointer must clamp at $7F, not wrap");
+        // A second read still observes $7F (pointer pinned).
+        assert_eq!(chip.read(0x4800), 0xCC);
+        assert_eq!(chip.addr, 0x7F);
+    }
+
+    #[test]
+    fn n163_data_port_read_through_expansion_router_increments() {
+        // Drive the auto-increment via the public `Expansion::read`
+        // path (the bus-facing entry the CPU uses), confirming the
+        // mutation reaches the live chip when N163 is enabled.
+        let mut ex = Expansion::new();
+        ex.set_flags(ExpansionChips(0x10)); // N163 enable bit
+        ex.n163.ram[0x40] = 0xDE;
+        ex.n163.ram[0x41] = 0xAD;
+        ex.n163.write(0xF800, 0x80 | 0x40); // addr=0x40, auto-inc
+        assert_eq!(ex.read(0x4800), 0xDE);
+        assert_eq!(ex.n163.addr, 0x41);
+        assert_eq!(ex.read(0x4800), 0xAD);
+        assert_eq!(ex.n163.addr, 0x42);
     }
 
     // ------- FDS read registers $4090..=$4097 (round 10) -------

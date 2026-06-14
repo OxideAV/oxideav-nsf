@@ -753,10 +753,19 @@ fail and signal the per-block first-sample validation pass.
   added the `update_rate_hz` / `emitted_frequency_hz` calibration API
   and validated the documented `f = (n * p) / (15 * 65536 * l * c)`
   output frequency end-to-end against the §"Channel Update" NTSC + PAL
-  update-rate tables and the §"Frequency" formula. Remaining gap is a
-  match against a recorded known-fixture pitch (the round-274 tests
-  validate the closed-form derivation and its scaling laws, but not a
-  captured-audio ground truth).
+  update-rate tables and the §"Frequency" formula. Round 301 wired the
+  Data Port (`$4800`) read-side auto-increment: `N163::read` now takes
+  `&mut self` and, per §"Address Port ($F800-$FFFF)" — "the address
+  will increment on writes **and reads** to the Data Port ($4800)" —
+  advances the internal pointer after returning the sound-RAM byte when
+  the `I` bit is set, clamping at `$7F` ("it does not wrap, instead
+  stopping at $7F") exactly as the write path already did. A
+  sequential-read wavetable readback (the §"Data Port" "When read, the
+  appropriate byte is returned" path) now walks the RAM correctly
+  through `Expansion::read`. Remaining gap is a match against a
+  recorded known-fixture pitch (the round-274 tests validate the
+  closed-form derivation and its scaling laws, but not a captured-audio
+  ground truth).
 * FDS: round 8 added the envelope ramp generators and round 9 the
   `$4023.D1` waveform-halt (constant `$4040` output + frozen
   accumulators + envelopes not ticked while halted, per §"Master I/O

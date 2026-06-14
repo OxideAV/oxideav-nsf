@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **N163 Data Port (`$4800`) read-side auto-increment** (round 301):
+  the Namco 163 read port previously returned the sound-RAM byte at the
+  current address but never advanced the internal pointer, even with the
+  Address Port `I` bit set — an explicit TODO noted the increment lived
+  only on the write path because `N163::read` took `&self`. Per
+  `docs/audio/nsf/namco-163-audio-wiki.html` §"Address Port
+  ($F800-$FFFF)" the address "will increment on writes **and reads** to
+  the Data Port ($4800)" and §"Data Port" confirms "When read, the
+  appropriate byte is returned." `N163::read` now takes `&mut self`
+  (the whole `Expansion::read` → `Apu2A03::read_expansion` →
+  `NesBus::read` chain was already `&mut`), returns the byte at the
+  current address, then increments the pointer when `addr_inc` is set,
+  clamping at `$7F` ("it does not wrap, instead stopping at $7F") to
+  mirror the write path. A program that reads the wavetable back
+  sequentially now walks sound RAM correctly. 5 new unit tests cover the
+  non-incrementing read (pointer held), the incrementing read across
+  three bytes, the `$7F` clamp, and the increment through the public
+  `Expansion::read` router with the chip enabled.
+
 - **MMC5 pulse 240 Hz envelope + length counter (no frame sequencer)**
   (round 294): the MMC5 pulse channels previously decoded `$5000`/
   `$5004` (duty / halt / constant / volume) and the `$5003`/`$5007`
