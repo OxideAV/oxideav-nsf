@@ -443,6 +443,23 @@ the base table is filled, the round-17 trip-wire test
 `channel_blocks_one_through_seven_currently_match_block_zero` will
 fail and signal the per-block first-sample validation pass.
 
+Round 307 lands the Sunsoft 5B select-port data-write lock-out per
+`docs/audio/nsf/sunsoft-5b-audio-wiki.html` §"Audio Register Select
+($C000-$DFFF)". The select byte is `DDDDRRRR` — the low nibble `RRRR`
+chooses the internal register and the high nibble `DDDD`, when nonzero,
+"Disable writes to $E000 if nonzero (like the original AY-3-8910)". The
+`$C000` handler previously masked to the low nibble and dropped the
+high nibble, so a select with a nonzero high nibble incorrectly let the
+following `$E000` data-port write through. `Sunsoft5b` now carries a
+`writes_disabled` flag driven by the high nibble: while it is set,
+`$E000` writes are ignored, and a later select write with a zero high
+nibble re-enables the data port. The selected register index always
+updates regardless. 3 new unit tests cover the disable (data-port write
+ignored, register-derived state unchanged), the re-enable (later
+zero-high-nibble select restores the port and the write propagates to
+the channel-period derivation), and the full every-nonzero-high-nibble
+truth table (only high nibble 0 allows the write).
+
 ## Round 2 scope
 
 * **Header parser** ([`parse_nsf`]):

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sunsoft 5B select-port data-write lock-out** (round 307): per
+  `docs/audio/nsf/sunsoft-5b-audio-wiki.html` §"Audio Register Select
+  ($C000-$DFFF)" the select byte is `DDDDRRRR` — the high nibble
+  `DDDD`, when nonzero, "Disable writes to $E000 if nonzero (like the
+  original AY-3-8910)". The `$C000` write previously masked the byte to
+  its low nibble and dropped the high nibble entirely, so a select with
+  a nonzero high nibble incorrectly let the following `$E000` data-port
+  write through. `Sunsoft5b` now tracks a `writes_disabled` flag set by
+  the high nibble; while it is set, `$E000` writes are ignored, and a
+  later select write with a zero high nibble re-enables the port. The
+  low nibble always updates the selected register index regardless. 3
+  new unit tests cover the disable, the re-enable, and the
+  every-nonzero-high-nibble-blocks / zero-allows truth table.
 - **N163 Data Port (`$4800`) read-side auto-increment** (round 301):
   the Namco 163 read port previously returned the sound-RAM byte at the
   current address but never advanced the internal pointer, even with the

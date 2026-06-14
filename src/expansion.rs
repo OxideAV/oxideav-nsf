@@ -661,10 +661,22 @@ impl Mmc5 {
 ///
 /// Period 0 produces the same period as 1 per the §Sound note (and
 /// the cited Period 0 verification) for tone, noise, and envelope.
+///
+/// §"Audio Register Select ($C000-$DFFF)": the select byte is
+/// `DDDDRRRR`; a nonzero high nibble `DDDD` disables writes to the
+/// `$E000` data port (the AY-3-8910 register-write lock-out). The
+/// low nibble `RRRR` always updates the selected register index.
 #[derive(Default)]
 pub struct Sunsoft5b {
     pub enabled: bool,
     pub addr: u8,
+    /// §"Audio Register Select ($C000-$DFFF)": the select byte is
+    /// `DDDDRRRR` — the low nibble `RRRR` chooses the internal
+    /// register and the high nibble `DDDD`, when nonzero, "Disable
+    /// writes to $E000 if nonzero (like the original AY-3-8910)".
+    /// A later select write with a zero high nibble re-enables the
+    /// data port. The selected register index is retained either way.
+    pub writes_disabled: bool,
     pub regs: [u8; 16],
     pub channels: [S5bChan; 3],
     /// Noise generator — 5-bit period at `$06`, 17-bit LFSR shared
@@ -740,7 +752,17 @@ impl Sunsoft5b {
 
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
-            0xC000 => self.addr = value & 0x0F,
+            0xC000 => {
+                // §"Audio Register Select": low nibble selects the
+                // internal register; a nonzero high nibble disables
+                // subsequent `$E000` data-port writes until a select
+                // write clears it.
+                self.addr = value & 0x0F;
+                self.writes_disabled = (value & 0xF0) != 0;
+            }
+            // §"Audio Register Write": ignored entirely while the
+            // data port is disabled by a nonzero select high nibble.
+            0xE000 if self.writes_disabled => {}
             0xE000 => {
                 let r = (self.addr & 0x0F) as usize;
                 self.regs[r] = value;
@@ -3384,6 +3406,65 @@ mod tests {
         chip.write(0xC000, 0x01);
         chip.write(0xE000, 0x03); // R1 = 0x03 (period hi channel A)
         assert_eq!(chip.channels[0].timer_period, 0x0342);
+    }
+
+    #[test]
+    fn s5b_select_high_nibble_disables_data_port_writes() {
+        // §"Audio Register Select ($C000-$DFFF)": `DDDDRRRR` — a
+        // nonzero high nibble "Disable writes to $E000 if nonzero".
+        // The low nibble still selects the register, but the
+        // following data-port write must be ignored.
+        let mut chip = Sunsoft5b::new();
+        // Establish a known value with writes enabled.
+        chip.write(0xC000, 0x00); // select R0, writes enabled
+        chip.write(0xE000, 0x42);
+        assert_eq!(chip.regs[0], 0x42);
+        assert!(!chip.writes_disabled);
+        // Now select R0 again but with a nonzero high nibble.
+        chip.write(0xC000, 0x10); // select R0, writes DISABLED
+        assert!(chip.writes_disabled);
+        assert_eq!(chip.addr, 0x00, "low nibble still selects R0");
+        chip.write(0xE000, 0xFF); // must be ignored
+        assert_eq!(chip.regs[0], 0x42, "data-port write ignored while disabled");
+        assert_eq!(
+            chip.channels[0].timer_period, 0x0042,
+            "register-derived state unchanged while disabled"
+        );
+    }
+
+    #[test]
+    fn s5b_select_zero_high_nibble_reenables_data_port_writes() {
+        // A later select write with a zero high nibble clears the
+        // disable and the data port works again.
+        let mut chip = Sunsoft5b::new();
+        chip.write(0xC000, 0xF3); // select R3, writes DISABLED
+        assert!(chip.writes_disabled);
+        chip.write(0xE000, 0xAA); // ignored
+        assert_eq!(chip.regs[3], 0x00);
+        chip.write(0xC000, 0x03); // select R3, writes ENABLED
+        assert!(!chip.writes_disabled);
+        chip.write(0xE000, 0x07); // honoured
+        assert_eq!(chip.regs[3], 0x07);
+        // R3 is channel B period high (`---- HHHH`); confirm it
+        // propagated to the channel-B period derivation.
+        assert_eq!(chip.channels[1].timer_period, 0x0700);
+    }
+
+    #[test]
+    fn s5b_every_nonzero_high_nibble_disables_writes() {
+        // The disable is "if nonzero" — exercise each high-nibble
+        // value 1..=15 and confirm the data port stays inert, while
+        // high nibble 0 is the only value that enables it.
+        for high in 0u8..=0x0F {
+            let mut chip = Sunsoft5b::new();
+            chip.write(0xC000, high << 4); // select R0, high nibble = `high`
+            chip.write(0xE000, 0x55);
+            if high == 0 {
+                assert_eq!(chip.regs[0], 0x55, "high=0 must allow the write");
+            } else {
+                assert_eq!(chip.regs[0], 0x00, "high={high} must block the write");
+            }
+        }
     }
 
     /// Helper: write `value` into Sunsoft 5B register `r` using the
