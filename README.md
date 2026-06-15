@@ -460,6 +460,34 @@ zero-high-nibble select restores the port and the write propagates to
 the channel-period derivation), and the full every-nonzero-high-nibble
 truth table (only high nibble 0 allows the write).
 
+Round 311 lands the NSFe `mixe` per-device default mix levels per
+`docs/audio/nsf/nsfe-nesdev-wiki.html` §mixe. The §mixe "Device byte
+values" list assigns each device a default millibel comparison against
+the APU square reference and states "Any omitted device should instead
+use a default mix" — but the `Apu2A03` per-device gain table was seeded
+flat at `1.0` (0 mB) and only diverged when an explicit `mixe` chunk
+overrode a device, so unmentioned VRC7 / FDS / Sunsoft 5B / APU-TND
+rips played at the wrong relative level. The new constant
+`MIXE_DEFAULT_MILLIBELS = [0, -20, 0, 1100, 700, 0, 1100, -130]` pins
+the documented defaults (APU Squares 0 / APU Triangle-Noise-DPCM -20 /
+VRC6 0 / VRC7 1100 / FDS 700 / MMC5 0 / N163 1100 / Sunsoft 5B -130),
+`Apu2A03::default_device_gains()` converts each via the §mixe
+`10^(mB/2000)` linear-gain formula, and `Apu2A03::new` seeds
+`device_gain` from it. A device with no `mixe` entry now plays at its
+documented level (VRC7 ≈ 3.55x, FDS ≈ 2.24x, TND ≈ 0.977x, 5B ≈
+0.861x); an explicit `mixe` entry still replaces that device's default
+unchanged. The §mixe N163 default is the literal documented string
+"1100 or 1900" with no in-doc disambiguation — the first-listed,
+more-conservative `1100` (matching the §mixe "compared in 1-channel
+mode" note and the VRC7 default magnitude) is used, with the `1900`
+alternative flagged DOCS-GAP in the constant's doc-comment. 3 new
+tests cover the seeded per-device defaults (each gain == `10^(mB/2000)`
+plus the boost/attenuate direction of every non-unity device), the
+explicit-override-replaces-default semantic (VRC7 1100 mB default
+pinned back to unity by an explicit 0 mB entry while FDS keeps its
+default), and the rewritten unmentioned-slot invariant (5B keeps its
+-130 mB default rather than 1.0).
+
 ## Round 2 scope
 
 * **Header parser** ([`parse_nsf`]):
@@ -524,7 +552,11 @@ truth table (only high nibble 0 allows the write).
   * **NSFe `mixe` per-device gain overrides** (round 5) — `Apu2A03`
     carries an 8-slot `device_gain` table indexed by NSFe device id
     (`apu::mixe_device::{APU_SQUARES, APU_TND, VRC6, VRC7, FDS,
-    MMC5, N163, S5B}`). `apply_mixe_overrides` decodes signed
+    MMC5, N163, S5B}`). Round 311 seeds the table from the §mixe
+    documented per-device default mix levels
+    (`MIXE_DEFAULT_MILLIBELS`) so an omitted device plays at its
+    default level per the spec's "Any omitted device should instead
+    use a default mix"; `apply_mixe_overrides` decodes signed
     millibels via `10^(mB/2000)` linear gain (per the
     `dB = 20·log10` §mixe convention) and `output_sample` multiplies
     each channel's contribution by the matching slot.

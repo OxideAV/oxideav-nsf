@@ -617,6 +617,39 @@ pub mod mixe_device {
     pub const S5B: u8 = 7;
 }
 
+/// Per-device default mix levels in signed millibels, indexed by the
+/// NSFe device id, per `docs/audio/nsf/nsfe-nesdev-wiki.html` §mixe
+/// "Device byte values" — "Any omitted device should instead use a
+/// default mix." Each entry is the device's loudness relative to the
+/// APU square channel at its default volume (the §mixe comparison
+/// reference), expressed in 1/100 dB:
+///
+/// * `0` APU Squares — Default: `0`
+/// * `1` APU Triangle / Noise / DPCM — Default: `-20`
+/// * `2` VRC6 — Default: `0`
+/// * `3` VRC7 — Default: `1100`
+/// * `4` FDS — Default: `700`
+/// * `5` MMC5 — Default: `0`
+/// * `6` N163 — Default: `1100` (1-channel-mode comparison)
+/// * `7` Sunsoft 5B — Default: `-130`
+///
+/// DOCS-GAP — the §mixe table lists the N163 default as the literal
+/// string "1100 or 1900" without resolving which value a player
+/// should pick. The first-listed, more-conservative `1100` is used
+/// here (it matches the §mixe "compared in 1-channel mode" note and
+/// the VRC7 default magnitude); the staged wiki mirror does not
+/// disambiguate, so the `1900` alternative is left for a clean-room
+/// trace to settle.
+pub const MIXE_DEFAULT_MILLIBELS: [i16; MIXE_DEVICE_COUNT] = [0, -20, 0, 1100, 700, 0, 1100, -130];
+
+/// Convert a signed-millibel `mixe` comparison to a linear gain via
+/// `10^(mB/2000)` (the `dB = 20·log10(linear)` convention from the
+/// §mixe spec: millibels are 1/100 dB, so `mB/100` dB ÷ 20 = `mB/2000`
+/// as the base-10 exponent).
+fn mixe_millibel_to_linear(mb: i16) -> f32 {
+    10.0f32.powf(mb as f32 / 2000.0)
+}
+
 /// 2A03 APU — five channels + frame counter + status / mixer + the
 /// expansion-chip aggregate.
 pub struct Apu2A03 {
@@ -647,13 +680,15 @@ pub struct Apu2A03 {
     /// PAL flag — toggles the DMC rate table.
     pal: bool,
 
-    /// Linear gain per NSFe `mixe` device id. `1.0` = unchanged.
-    /// Index 0 = APU squares, 1 = APU triangle/noise/DPCM, 2..=7 =
-    /// VRC6 / VRC7 / FDS / MMC5 / N163 / 5B. Populated from a
-    /// `Vec<NsfeMixerEntry>` via [`Apu2A03::apply_mixe_overrides`].
-    /// All gains default to `1.0`; an override of `+X` millibels
-    /// produces `10^(X/2000)` (using the
-    /// `dB = 20 * log10(linear)` convention from the §mixe spec).
+    /// Linear gain per NSFe `mixe` device id. Index 0 = APU squares,
+    /// 1 = APU triangle/noise/DPCM, 2..=7 = VRC6 / VRC7 / FDS / MMC5 /
+    /// N163 / 5B. Seeded from the §mixe per-device default mix levels
+    /// ([`MIXE_DEFAULT_MILLIBELS`]) — the spec's "Any omitted device
+    /// should instead use a default mix" — and overridden per device
+    /// from a `Vec<NsfeMixerEntry>` via
+    /// [`Apu2A03::apply_mixe_overrides`]. An override of `X` millibels
+    /// produces `10^(X/2000)` (the `dB = 20 * log10(linear)`
+    /// convention from the §mixe spec).
     device_gain: [f32; MIXE_DEVICE_COUNT],
 
     /// Aggregate of the active expansion chips.
@@ -681,9 +716,23 @@ impl Apu2A03 {
             frame_acc: 0,
             frame_step: 0,
             pal: false,
-            device_gain: [1.0; MIXE_DEVICE_COUNT],
+            device_gain: Self::default_device_gains(),
             expansion: crate::expansion::Expansion::new(),
         }
+    }
+
+    /// The §mixe per-device default gain table — each documented
+    /// default mix level ([`MIXE_DEFAULT_MILLIBELS`]) converted to a
+    /// linear gain. Used to seed [`Apu2A03::device_gain`] so that, per
+    /// the spec's "Any omitted device should instead use a default
+    /// mix", a device with no `mixe` entry plays at its documented
+    /// level rather than a flat `1.0`.
+    pub fn default_device_gains() -> [f32; MIXE_DEVICE_COUNT] {
+        let mut g = [1.0f32; MIXE_DEVICE_COUNT];
+        for (slot, &mb) in g.iter_mut().zip(MIXE_DEFAULT_MILLIBELS.iter()) {
+            *slot = mixe_millibel_to_linear(mb);
+        }
+        g
     }
 
     /// Apply NSFe `mixe` per-device millibel overrides. The spec says
@@ -691,13 +740,12 @@ impl Apu2A03 {
     /// reference square at maximum volume — the player converts it to
     /// a linear gain via `10^(mB/2000)` and multiplies the channel's
     /// post-mixer contribution by that gain. Devices not mentioned by
-    /// the entries keep their existing gain (default `1.0`).
+    /// the entries keep their §mixe default mix level (seeded at
+    /// construction from [`MIXE_DEFAULT_MILLIBELS`]).
     pub fn apply_mixe_overrides(&mut self, entries: &[crate::nsfe::NsfeMixerEntry]) {
         for entry in entries {
             if (entry.device as usize) < MIXE_DEVICE_COUNT {
-                let mb = entry.millibel as f32;
-                let linear = 10.0f32.powf(mb / 2000.0);
-                self.device_gain[entry.device as usize] = linear;
+                self.device_gain[entry.device as usize] = mixe_millibel_to_linear(entry.millibel);
             }
         }
     }

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NSFe `mixe` per-device default mix levels** (round 311): per
+  `docs/audio/nsf/nsfe-nesdev-wiki.html` §mixe "Any omitted device
+  should instead use a default mix", the `Apu2A03` per-device gain
+  table is now seeded from the documented signed-millibel defaults
+  rather than a flat `1.0`. `MIXE_DEFAULT_MILLIBELS` pins the §mixe
+  "Device byte values" list — APU Squares `0`, APU Triangle/Noise/DPCM
+  `-20`, VRC6 `0`, VRC7 `1100`, FDS `700`, MMC5 `0`, N163 `1100`,
+  Sunsoft 5B `-130` — and `Apu2A03::default_device_gains()` converts
+  each via `10^(mB/2000)`. A device with no `mixe` entry now plays at
+  its documented level (VRC7 ≈ 3.55x, FDS ≈ 2.24x, TND ≈ 0.977x, 5B ≈
+  0.861x); an explicit `mixe` entry still replaces that device's
+  default. The §mixe N163 default is documented as the literal "1100
+  or 1900" string; the first-listed `1100` (matching the "compared in
+  1-channel mode" note) is used and the `1900` alternative is flagged
+  DOCS-GAP in the constant's doc-comment. 3 new tests cover the seeded
+  defaults, the explicit-override-replaces-default semantic, and the
+  updated unmentioned-slot-keeps-default invariant.
 - **Sunsoft 5B select-port data-write lock-out** (round 307): per
   `docs/audio/nsf/sunsoft-5b-audio-wiki.html` §"Audio Register Select
   ($C000-$DFFF)" the select byte is `DDDDRRRR` — the high nibble
