@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.2...v0.0.3) - 2026-06-15
+
+### Other
+
+- seed NSFe mixe table with documented per-device default mix levels
+- Sunsoft 5B: select-port data-write lock-out (high nibble disables $E000) (round 307)
+- Data Port ($4800) read-side auto-increment
+- pulse 240 Hz envelope + length counter (no frame sequencer)
+- round 290 — VRC6 pulse duty 15→0 down-count + E-bit phase reset
+- §III-1-7 rhythm-mode register semantics + VRC7 no-rhythm-DAC carve-out (round 283)
+- sound-driver identification tag at the start of the program data (round 279)
+- emitted-frequency + channel-update-rate calibration API (round 274)
+- wire AM/VIB LFO phase counters + $E000 audio-reset asymmetry (round 270)
+- §III-7 envelope attack-time per RATE from YM2413 Application Manual Table III-7 (round 262)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- §III-7 envelope decay-time per RATE from YM2413 Application Manual Table III-7 (round 232)
+- §4 KSL byte base table from YM2413 Application Manual Table III-5 (round 228)
+- sawtooth 14-step cycle + E-clear accumulator zero (round 223)
+- $5010 PCM Mode/IRQ + $8000..=$BFFF read-mode write-by-read (round 18)
+- §4 KSL formula scaffold + provenance prose scrub (round 17)
+- OPLL KSR (Key Scale of RATE) per app-manual §III-1-2 Table III-2 (round 16)
+- $0F test register + $2X.S sustain override + $00.S release disable + $E000 audio reset (round 15)
+
 ### Added
 
 - **NSFe `mixe` per-device default mix levels** (round 311): per
