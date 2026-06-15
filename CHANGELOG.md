@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- OPLL: make the AM/VIB LFO audible — map the free-running tremolo /
+  vibrato phase through a triangle scaled to the §7 *physical* depths
+  (1.0 dB amplitude modulation / ±7-cent pitch modulation), gated by
+  each operator's `$00`/`$01` AM / VIB enable bit (now wired from the
+  patch into the operator pipeline). The exact emulator depth step
+  arrays remain a documented §7 DOCS-GAP; the depth here is derived
+  from the documented physical quantities, not a lifted table
+  (round 319)
 - MMC5: raw-PCM analog Pin 2 DAC transfer curve — replace the empirical
   PCM scale with the §"Pin 2 DAC Characteristic" affine equation
   `Voltage = (DAC/255)·0.4·AVcc + 0.1·AVcc` (AC-coupled about the

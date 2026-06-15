@@ -1587,9 +1587,11 @@ pub struct Vrc7 {
     /// mode, every sample under `$0F` bit 3, and are held+reset under
     /// `$0F` bit 1. The §"Audio Reset ($E000)" clears the tremolo
     /// phase but preserves the vibrato phase. Advanced once per
-    /// emitted operator sample in [`Vrc7::tick`]. The phase→depth
-    /// translation awaits the §7 AM/VIB depth step arrays (a
-    /// documented DOCS-GAP), so the LFO has no audible effect yet.
+    /// emitted operator sample in [`Vrc7::tick`] and read per operator
+    /// in [`crate::opll::OpllChannel::sample_with_test`]: the phase is
+    /// mapped through a triangle scaled to the §7 *physical* depths
+    /// (1.0 dB AM / ±7-cent VIB), so an operator with its `$00`/`$01`
+    /// AM / VIB bit set is audibly modulated.
     pub lfo: crate::opll::Lfo,
 }
 
@@ -1821,9 +1823,11 @@ impl Vrc7 {
             // Advance the built-in AM/VIB LFOs once per operator
             // sample. `$0F` bit 1 holds+resets both phases; bit 3
             // makes both advance every sample instead of once per
-            // 64 / 1024 samples. The phase is not yet read into the
-            // synthesis path (§7 depth-array DOCS-GAP).
+            // 64 / 1024 samples. The triangle-mapped AM / VIB depth
+            // (§7 1.0 dB / ±7 cents) is read per operator in
+            // `sample_with_test` below.
             self.lfo.tick(test.hold_lfo, test.fast_lfo);
+            let lfo = self.lfo;
             let mut sum: i32 = 0;
             for ch in &mut self.opll_channels {
                 if ch.is_active() || test.envs_zero {
@@ -1831,7 +1835,7 @@ impl Vrc7 {
                     // envelope sits at Idle (because the carrier
                     // would normally be silenced and we'd skip
                     // sampling it). Always sample when bit 0 is set.
-                    sum = sum.saturating_add(ch.sample_with_test(&test));
+                    sum = sum.saturating_add(ch.sample_with_test(&test, &lfo));
                 }
             }
             self.latched_output = sum;

@@ -64,7 +64,9 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     per-RATE attack/decay/release step magnitudes (from the YM2413
     Application Manual Table III-7), KSR + KSL attenuation (Tables
     III-2 / III-5), the `$0F` test register, `$E000` audio reset, the
-    AM/VIB LFO phase counters, and rhythm-mode register decoding.
+    audible AM/VIB LFO (the §7 1.0 dB tremolo / ±7-cent vibrato
+    physical depths mapped through a triangle onto each operator's
+    `$00`/`$01` AM / VIB bit), and rhythm-mode register decoding.
   * **FDS** — wavetable + frequency-modulation unit, the volume + mod
     envelope ramp generators (`c = 8·(e+1)·(m+1)` timer), the `$4023`
     master sound-enable / waveform-halt, and the `$4090..=$4097` read
@@ -86,10 +88,13 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   DMC CPU-stall accounting); envelope tick timers are stepped in
   CPU-cycle batches — adequate for music, not cycle-exact.
-* OPLL §7 AM/VIB LFO numeric *depth* step arrays (the phase cadence is
-  live but the phase→depth translation is provenance-pending in the
-  staged docs, so the LFO is not yet audible) and the VRC7 rhythm
-  *synthesis* path for HH/SD/TOM/TOP-CYM.
+* OPLL §7 AM/VIB LFO *exact* numeric depth step arrays — these stay a
+  documented DOCS-GAP (the §7 provenance appendix cites them to
+  silicon-RE primary sources and keeps the emulator arrays out of the
+  repo). The LFO is now audible via the documented *physical* depths
+  (1.0 dB tremolo / ±7-cent vibrato) mapped through a triangle, which
+  is the correct macro behaviour but not a per-step bit-match.
+* The VRC7 rhythm *synthesis* path for HH/SD/TOM/TOP-CYM.
 * RIFF-NSF container variant.
 
 ## Verification

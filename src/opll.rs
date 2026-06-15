@@ -21,16 +21,21 @@
 //! `opll-ym2413-tables.md` for the staged-source chain of custody;
 //! anything beyond that appendix is out-of-scope for this module.
 //!
-//! Numeric tables flagged as provenance-pending in the §"Provenance"
-//! appendix of `opll-ym2413-tables.md` — the §7 AM/VIB LFO depth step
-//! arrays — are not transcribed in this file. The LFO phase *cadence*
-//! (tremolo advances once per 64 operator samples, vibrato once per
-//! 1024, both bypassed under `$0F` bit 3 and held+reset under `$0F`
-//! bit 1, with the `$E000` audio reset clearing tremolo phase but
-//! preserving vibrato phase) IS fully specified by
+//! The exact emulator AM/VIB depth *step arrays* are deliberately not
+//! transcribed (the §7 "Provenance" appendix of `opll-ym2413-tables.md`
+//! cites them to silicon-RE primary sources and keeps the numeric
+//! arrays out of the repo). The AM/VIB LFO is nonetheless **audible**:
+//! its phase *cadence* (tremolo advances once per 64 operator samples,
+//! vibrato once per 1024, both bypassed under `$0F` bit 3 and
+//! held+reset under `$0F` bit 1, with the `$E000` audio reset clearing
+//! tremolo phase but preserving vibrato phase) is fully specified by
 //! `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F" +
-//! §"Audio Reset ($E000)" and is implemented in [`Lfo`]; only the
-//! phase→depth translation awaits the §7 step arrays.
+//! §"Audio Reset ($E000)", and the phase→depth translation is derived
+//! from the §7 *physical* depths — **1.0 dB** AM at ~3.7 Hz and **±7
+//! cents** VIB at ~6.0 Hz — mapped through a triangle in [`Lfo`]
+//! ([`Lfo::tremolo_atten_env_levels`] / [`Lfo::vibrato_pitch_offset_q`]).
+//! No emulator constant array is consulted; the depth follows from the
+//! documented physical quantities.
 //!
 //! Rhythm-mode *register semantics* are fully specified by the
 //! application manual §III-1-7 (the `$0E` RHYTHM register bit table +
@@ -882,6 +887,14 @@ pub struct Operator {
     pub tl: u8,
     /// Half-rectify waveform bit (DC/DM, 0 = full sine, 1 = half).
     pub half_rect: bool,
+    /// AM (tremolo) enable — the operator's `$00`/`$01` D7 bit. When
+    /// set, the chip-wide tremolo LFO adds a 0..1.0 dB attenuation
+    /// (§7) on top of the operator's other attenuation sources.
+    pub am: bool,
+    /// VIB (vibrato) enable — the operator's `$00`/`$01` D6 bit. When
+    /// set, the chip-wide vibrato LFO sweeps this operator's phase
+    /// increment by ±7 cents (§7).
+    pub vib: bool,
 }
 
 impl Operator {
@@ -986,29 +999,78 @@ pub const TREMOLO_LFO_DIVIDER: u32 = 64;
 /// per-operator samples, and once per sample when bit 3 is set.
 pub const VIBRATO_LFO_DIVIDER: u32 = 1024;
 
+/// Tremolo (AM) LFO physical frequency, in Hz. Per
+/// `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §7
+/// ("AM (tremolo) LFO"): "OPL-family AM depth is 1.0 dB peak at
+/// ~3.7 Hz (shared with OPL2, per the OPLx-decapsulated article)."
+pub const TREMOLO_LFO_FREQ_HZ: f32 = 3.7;
+
+/// Vibrato (VIB) LFO physical frequency, in Hz. Per the same §7
+/// ("VIB (vibrato) LFO"): "built-in vibrato oscillator; OPL-family
+/// vibrato depth ~±7 cents (low) / ±14 cents (high) at ~6.0 Hz."
+pub const VIBRATO_LFO_FREQ_HZ: f32 = 6.0;
+
+/// Tremolo (AM) peak depth, in dB. §7: "OPL-family AM depth is
+/// **1.0 dB** peak at ~3.7 Hz". The OPLL/VRC7 use the single
+/// built-in AM oscillator at this fixed depth (there is no AM-depth
+/// select bit on the YM2413, unlike OPL3's `0x01`/`0x40` modes).
+pub const TREMOLO_PEAK_DB: f32 = 1.0;
+
+/// Vibrato (VIB) peak depth, in cents. §7 lists "~±7 cents (low) /
+/// ±14 cents (high)". The YM2413 exposes only the single built-in
+/// vibrato oscillator (no OPL3-style VIB-depth select), so the
+/// documented OPLL value is the low ±7 cents figure.
+pub const VIBRATO_PEAK_CENTS: f32 = 7.0;
+
+/// Number of tremolo phase steps in one full AM triangle period.
+/// Derived from the two §7 facts: the tremolo phase advances once
+/// per [`TREMOLO_LFO_DIVIDER`] (= 64) operator samples (so its step
+/// rate is [`OPLL_SAMPLE_RATE_HZ`] / 64 ≈ 776.8 Hz), and one full
+/// AM period is [`TREMOLO_LFO_FREQ_HZ`] ≈ 3.7 Hz — hence
+/// `(49716 / 64) / 3.7 ≈ 210` phase steps per period. This is a
+/// derived consequence of the two documented physical quantities,
+/// **not** a lifted emulator step-array length.
+pub const TREMOLO_PHASE_PERIOD: u32 = 210;
+
+/// Number of vibrato phase steps in one full VIB period. Derived
+/// the same way: the vibrato phase advances once per
+/// [`VIBRATO_LFO_DIVIDER`] (= 1024) operator samples (step rate
+/// 49716 / 1024 ≈ 48.55 Hz), and one full VIB period is
+/// [`VIBRATO_LFO_FREQ_HZ`] ≈ 6.0 Hz — hence `48.55 / 6.0 ≈ 8` phase
+/// steps per period.
+pub const VIBRATO_PHASE_PERIOD: u32 = 8;
+
+/// AM peak attenuation in envelope-level units. The operator
+/// pipeline expresses attenuation in 16-units-per-3-dB
+/// (≈ 0.1875 dB/unit) per the andete §"envelope levels" convention
+/// used throughout [`Operator::sample`]. The §7 1.0 dB AM peak is
+/// therefore `1.0 / 3.0 * 16 ≈ 5.33` → 5 env-level units at the
+/// triangle peak (0 at the trough). Rounded from the documented
+/// physical depth; no emulator constant is consulted.
+pub const TREMOLO_PEAK_ENV_LEVELS: u32 = 5;
+
 /// The built-in AM (tremolo) + VIB (vibrato) low-frequency
 /// oscillators that drive the per-operator amplitude / pitch
 /// modulation when an operator's `$00`/`$01` AM / VIB bit is set.
 ///
-/// This struct models the **LFO phase cadence and hold/reset
-/// semantics only** — the timing of how often each LFO advances, per
+/// This struct owns the **LFO phase cadence + hold/reset semantics**
+/// — the timing of how often each LFO advances, per
 /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F" (bit 1
 /// hold-and-reset, bit 3 fast-update) and §"Audio Reset ($E000)"
-/// (tremolo phase cleared, vibrato phase preserved). It deliberately
-/// does **not** translate the phase into an attenuation (tremolo) or
-/// a pitch offset (vibrato): the numeric AM/VIB depth step arrays are
-/// flagged provenance-pending in the §7 "Provenance & non-emulator
-/// sourcing" appendix of
-/// `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` and are a
-/// documented DOCS-GAP. Wiring the phase counters now means the
-/// depth-array landing is a single edit on the (currently inert)
-/// phase→depth read, with no new timing machinery required.
+/// (tremolo phase cleared, vibrato phase preserved) — **and** the
+/// phase→depth translation. The translation does not reproduce the
+/// provenance-pending emulator depth *step arrays* (§7 appendix of
+/// `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md`); instead it
+/// maps the free-running phase through a triangle scaled to the §7
+/// *physical* depths — 1.0 dB AM peak ([`Lfo::tremolo_atten_env_levels`])
+/// and ±7-cent VIB peak ([`Lfo::vibrato_pitch_offset_q`]) — both of
+/// which are documented physical quantities, not lifted constants.
 ///
 /// The two phases are independent free-running step counters
-/// (`u32`); the eventual depth arrays will index them modulo their
-/// per-LFO period. The OPL family's AM phase is a triangle that
-/// repeats far below the sample rate, so a `u32` step counter never
-/// wraps in any realistic render length.
+/// (`u32`), folded modulo [`TREMOLO_PHASE_PERIOD`] /
+/// [`VIBRATO_PHASE_PERIOD`] by the depth readers. The OPL family's AM
+/// phase is a triangle that repeats far below the sample rate, so a
+/// `u32` step counter never wraps in any realistic render length.
 ///
 /// The two dividers count down from `N - 1` and step their phase when
 /// they reach 0 (then reload), so the first phase step lands on the
@@ -1098,6 +1160,108 @@ impl Lfo {
         self.tremolo_divider = TREMOLO_LFO_DIVIDER - 1;
         // Vibrato deliberately untouched.
     }
+
+    /// Current AM (tremolo) attenuation contribution, in
+    /// envelope-level units, for an operator whose `$00`/`$01` AM bit
+    /// is set.
+    ///
+    /// The OPL-family AM oscillator is a **triangle** (§7 / the
+    /// `Lfo` struct doc: "The OPL family's AM phase is a triangle that
+    /// repeats far below the sample rate"). The free-running
+    /// [`Self::tremolo_phase`] is folded modulo [`TREMOLO_PHASE_PERIOD`]
+    /// into a 0 → peak → 0 triangle whose peak is
+    /// [`TREMOLO_PEAK_ENV_LEVELS`] (the §7 1.0 dB depth expressed in
+    /// the pipeline's env-level units). Because attenuation only ever
+    /// *reduces* amplitude, the AM oscillation rides between 0 (no
+    /// extra attenuation, loudest) and the 1.0 dB peak, matching the
+    /// physical "amplitude dips by up to 1.0 dB" behaviour.
+    ///
+    /// Returns 0 when the operator's AM bit is clear.
+    #[inline]
+    pub fn tremolo_atten_env_levels(&self, am_on: bool) -> u32 {
+        if !am_on {
+            return 0;
+        }
+        let half = TREMOLO_PHASE_PERIOD / 2;
+        let pos = self.tremolo_phase % TREMOLO_PHASE_PERIOD;
+        // Triangle: rises 0..half over the first half-period, falls
+        // back over the second. `tri` runs 0..=half.
+        let tri = if pos < half {
+            pos
+        } else {
+            TREMOLO_PHASE_PERIOD - pos
+        };
+        // Scale the 0..half triangle to 0..peak env-levels.
+        (tri * TREMOLO_PEAK_ENV_LEVELS) / half
+    }
+
+    /// Current VIB (vibrato) pitch multiplier as a signed offset in
+    /// units of `1 / 2^VIBRATO_PITCH_FRAC_BITS`, for an operator whose
+    /// `$00`/`$01` VIB bit is set.
+    ///
+    /// §7: vibrato depth is ~±[`VIBRATO_PEAK_CENTS`] cents at ~6.0 Hz.
+    /// The built-in vibrato oscillator sweeps the operator pitch
+    /// symmetrically about the nominal frequency. We model it as a
+    /// triangle over [`VIBRATO_PHASE_PERIOD`] phase steps, peaking at
+    /// the documented ±7-cent depth. A cent is `2^(1/1200)`; ±7 cents
+    /// is a multiplicative pitch factor of `2^(±7/1200) ≈ 1 ± 0.00405`.
+    /// The return value is that fractional deviation in
+    /// `Q[VIBRATO_PITCH_FRAC_BITS]` fixed point (positive = sharp,
+    /// negative = flat), ready to scale the phase increment in
+    /// [`OpllChannel::sample_with_test`].
+    ///
+    /// Returns 0 when the operator's VIB bit is clear.
+    #[inline]
+    pub fn vibrato_pitch_offset_q(&self, vib_on: bool) -> i32 {
+        if !vib_on {
+            return 0;
+        }
+        let half = (VIBRATO_PHASE_PERIOD / 2) as i32;
+        let pos = (self.vibrato_phase % VIBRATO_PHASE_PERIOD) as i32;
+        // Symmetric triangle in -half..=half: rises through the first
+        // half, falls through the second.
+        let tri = if pos < half {
+            pos
+        } else {
+            VIBRATO_PHASE_PERIOD as i32 - pos
+        };
+        // `tri` is 0..=half; centre it to -half..=half so the pitch
+        // swings both sharp and flat about the nominal frequency.
+        let centred = 2 * tri - half;
+        // Peak fractional pitch deviation = 2^(7/1200) - 1, in
+        // Q[VIBRATO_PITCH_FRAC_BITS]. Computed at build from the
+        // documented ±7-cent depth (no emulator constant).
+        (centred * VIBRATO_PEAK_OFFSET_Q) / half
+    }
+}
+
+/// Fixed-point fractional bits used by
+/// [`Lfo::vibrato_pitch_offset_q`]. A `Q12` scale keeps the ±7-cent
+/// (~±0.4 %) deviation well above the rounding floor while staying
+/// far inside `i32` for any `fnum << block`.
+pub const VIBRATO_PITCH_FRAC_BITS: u32 = 12;
+
+/// Peak fractional pitch deviation `round((2^(7/1200) - 1) * 2^12)`
+/// for the §7 ±7-cent vibrato depth, in `Q[VIBRATO_PITCH_FRAC_BITS]`.
+/// `2^(7/1200) - 1 ≈ 0.004050` → `0.004050 * 4096 ≈ 16.6` → 17.
+/// Derived from the documented cent depth; not an emulator table.
+pub const VIBRATO_PEAK_OFFSET_Q: i32 = 17;
+
+/// Apply a vibrato pitch offset (in `Q[VIBRATO_PITCH_FRAC_BITS]`
+/// fixed point, from [`Lfo::vibrato_pitch_offset_q`]) to a base
+/// `fnum << block` phase rate. Returns
+/// `fnum_block * (1 + offset / 2^FRAC)`, clamped to non-negative.
+/// `offset == 0` (VIB disabled) returns `fnum_block` unchanged.
+#[inline]
+pub fn apply_vibrato(fnum_block: u32, offset_q: i32) -> u32 {
+    if offset_q == 0 {
+        return fnum_block;
+    }
+    // Widen to i64 so a large fnum_block can't overflow the multiply,
+    // then fold the Q-scaled offset back in: result = base + base*off/2^FRAC.
+    let base = fnum_block as i64;
+    let delta = (base * offset_q as i64) >> VIBRATO_PITCH_FRAC_BITS;
+    (base + delta).max(0) as u32
 }
 
 // -------------------------------------------------------------- test register
@@ -1115,11 +1279,9 @@ pub struct TestRegister {
     pub envs_zero: bool,
     /// `$0F` bit 1 — "Hold LFO phase at zero. This halts, disables,
     /// and resets both the tremolo and vibrato LFO." Consumed by
-    /// [`Lfo::tick`] to pin both LFO phases at zero. The LFO phase
-    /// *cadence* is wired; the numeric AM/VIB depth step arrays that
-    /// translate phase into audible modulation remain a documented
-    /// DOCS-GAP (§7 provenance-pending), so the held phase has no
-    /// audible effect yet.
+    /// [`Lfo::tick`] to pin both LFO phases at zero. With the phase
+    /// held at 0 the triangle-mapped AM / VIB depth is also 0, so this
+    /// bit silences the audible tremolo / vibrato modulation.
     pub hold_lfo: bool,
     /// `$0F` bit 2 — "Holds and resets waveform phase to zero. The
     /// envelopes are not halted, though the output will be silent."
@@ -1354,6 +1516,11 @@ impl OpllChannel {
         self.modulator.mul = p.mod_mult;
         self.modulator.tl = p.mod_tl;
         self.modulator.half_rect = p.mod_wave != 0;
+        // §"Custom Patch" $00 D7/D6 — AM (tremolo) / VIB (vibrato)
+        // enable for the modulator. Consumed per sample via the
+        // chip-wide [`Lfo`].
+        self.modulator.am = p.mod_tremolo;
+        self.modulator.vib = p.mod_vibrato;
         self.modulator.env.load_from_patch(
             p.mod_attack,
             p.mod_decay,
@@ -1371,6 +1538,9 @@ impl OpllChannel {
         self.carrier.mul = p.car_mult;
         self.carrier.tl = 0; // carrier has no TL; volume takes its place
         self.carrier.half_rect = p.car_wave != 0;
+        // §"Custom Patch" $01 D7/D6 — carrier AM / VIB enable.
+        self.carrier.am = p.car_tremolo;
+        self.carrier.vib = p.car_vibrato;
         self.carrier.env.load_from_patch(
             p.car_attack,
             p.car_decay,
@@ -1457,7 +1627,7 @@ impl OpllChannel {
     /// mixer. `test` carries the chip-wide test-register hooks per
     /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F".
     pub fn sample(&mut self) -> i32 {
-        self.sample_with_test(&TestRegister::default())
+        self.sample_with_test(&TestRegister::default(), &Lfo::default())
     }
 
     /// `sample` with the test-register hooks honoured. The 4-bit
@@ -1468,21 +1638,37 @@ impl OpllChannel {
     ///   modulator and carrier. The envelopes are still ticked
     ///   internally, only the per-sample contribution is bypassed.
     /// * bit 1 — hold LFO phase at 0 (halt + reset both tremolo and
-    ///   vibrato). We don't yet implement the LFO numeric step
-    ///   arrays (a documented §7 DOCS-GAP), so this bit is a no-op
-    ///   from the operator's point of view, but it is recorded on
-    ///   the chip so a future LFO landing inherits the gate.
+    ///   vibrato). [`Lfo::tick`] pins both phases at 0 in this state,
+    ///   so the triangle-mapped AM / VIB depth read here is 0 as well.
     /// * bit 2 — hold + reset waveform phase to 0. Both operator
     ///   phase accumulators are pinned at 0 (and reset on entry);
     ///   envelopes keep running but output is silent (sin(0)≈0).
     /// * bit 3 — LFO speed override (tremolo 64×, vibrato 1024×
-    ///   faster). Same no-op-but-recorded story as bit 1.
-    pub fn sample_with_test(&mut self, test: &TestRegister) -> i32 {
+    ///   faster). Handled by [`Lfo::tick`] upstream.
+    ///
+    /// `lfo` is the chip-wide AM/VIB low-frequency oscillator. Its
+    /// triangle-mapped depth — §7 1.0 dB amplitude modulation
+    /// (tremolo) / ±7-cent pitch modulation (vibrato) — is applied per
+    /// operator when that operator's [`Operator::am`] / [`Operator::vib`]
+    /// bit is set.
+    pub fn sample_with_test(&mut self, test: &TestRegister, lfo: &Lfo) -> i32 {
         // Phase generator base rate. The VRC7 vrcvii doc gives:
         //   F = 49722 * fnum / 2^(19 - block)  Hz
         // Equivalent per-49716 Hz sample phase delta:
         //   delta_per_sample = (fnum << block) * MUL_x2 / 2
         let fnum_block = (self.fnum as u32) << (self.block as u32);
+        // §7 VIB — per-operator ±7-cent pitch sweep. The vibrato
+        // multiplier is `1 + offset/2^FRAC`, applied to `fnum_block`
+        // before the MUL stage so both operators stay phase-locked to
+        // their own swept pitch. Operators with VIB clear keep the
+        // unmodulated `fnum_block`.
+        let mod_fnum_block =
+            apply_vibrato(fnum_block, lfo.vibrato_pitch_offset_q(self.modulator.vib));
+        let car_fnum_block =
+            apply_vibrato(fnum_block, lfo.vibrato_pitch_offset_q(self.carrier.vib));
+        // §7 AM — per-operator 0..1.0 dB tremolo attenuation.
+        let mod_am_atten = lfo.tremolo_atten_env_levels(self.modulator.am);
+        let car_am_atten = lfo.tremolo_atten_env_levels(self.carrier.am);
 
         // §"Test Register $0F" bit 2: pin both waveform phases at 0.
         if test.hold_phase {
@@ -1516,11 +1702,14 @@ impl OpllChannel {
         // forced to 0. We do this by sampling with the env-offset
         // pre-cancelled (the env is still ticked below).
         let mod_out = if test.envs_zero {
-            self.modulator
-                .sample_with_env_override(fb_phase, mod_tl_atten + mod_ksl_atten, 0)
+            self.modulator.sample_with_env_override(
+                fb_phase,
+                mod_tl_atten + mod_ksl_atten + mod_am_atten,
+                0,
+            )
         } else {
             self.modulator
-                .sample(fb_phase, mod_tl_atten + mod_ksl_atten)
+                .sample(fb_phase, mod_tl_atten + mod_ksl_atten + mod_am_atten)
         };
 
         // Update modulator feedback history.
@@ -1531,8 +1720,8 @@ impl OpllChannel {
         // §"Test Register $0F" bit 2 also says the phase is *held*,
         // so we skip the step in that case too.
         if !test.hold_phase {
-            self.modulator.step_phase(fnum_block);
-            self.carrier.step_phase(fnum_block);
+            self.modulator.step_phase(mod_fnum_block);
+            self.carrier.step_phase(car_fnum_block);
         }
 
         // Step the envelopes. Per §"Test Register $0F" bit 0: "The
@@ -1553,11 +1742,14 @@ impl OpllChannel {
         let car_volume_atten = (self.volume as u32) * 8;
         let car_ksl_atten = ksl_attenuation_env_levels(self.block, fnum_hi, self.car_ksl);
         if test.envs_zero {
-            self.carrier
-                .sample_with_env_override(car_mod, car_volume_atten + car_ksl_atten, 0)
+            self.carrier.sample_with_env_override(
+                car_mod,
+                car_volume_atten + car_ksl_atten + car_am_atten,
+                0,
+            )
         } else {
             self.carrier
-                .sample(car_mod, car_volume_atten + car_ksl_atten)
+                .sample(car_mod, car_volume_atten + car_ksl_atten + car_am_atten)
         }
     }
 
@@ -2275,7 +2467,7 @@ mod tests {
         };
         let mut peak: i32 = 0;
         for _ in 0..2048 {
-            let s = ch.sample_with_test(&test);
+            let s = ch.sample_with_test(&test, &Lfo::default());
             peak = peak.max(s.abs());
         }
         assert!(
@@ -2302,7 +2494,7 @@ mod tests {
         };
         let mut peak: i32 = 0;
         for _ in 0..2048 {
-            let s = ch.sample_with_test(&test);
+            let s = ch.sample_with_test(&test, &Lfo::default());
             peak = peak.max(s.abs());
         }
         // The +0/-0 1-complement representation of sin(0) gives ±1 LSB
@@ -2332,12 +2524,12 @@ mod tests {
         // Advance into Decay/Sustain, then key-off and step until the
         // carrier envelope is back to Idle (envelopes still ticking).
         for _ in 0..2000 {
-            let _ = ch.sample_with_test(&test);
+            let _ = ch.sample_with_test(&test, &Lfo::default());
         }
         ch.trigger_key_off();
         let mut reached_idle = false;
         for _ in 0..200_000 {
-            let _ = ch.sample_with_test(&test);
+            let _ = ch.sample_with_test(&test, &Lfo::default());
             if matches!(ch.carrier.env.phase, EnvPhase::Idle) {
                 reached_idle = true;
                 break;
@@ -3054,6 +3246,147 @@ mod tests {
         }
         assert_eq!(lfo.tremolo_phase, 0);
         assert_eq!(lfo.vibrato_phase, 0);
+    }
+
+    // -------------------------------------------- §7 AM/VIB depth
+
+    /// An operator with its AM bit clear gets no tremolo attenuation,
+    /// regardless of the LFO phase.
+    #[test]
+    fn tremolo_atten_zero_when_am_disabled() {
+        let mut lfo = Lfo::default();
+        for _ in 0..1000 {
+            lfo.tick(false, false);
+            assert_eq!(lfo.tremolo_atten_env_levels(false), 0);
+        }
+    }
+
+    /// The §7 AM triangle is 0 at the trough (phase 0) and reaches the
+    /// documented 1.0 dB peak ([`TREMOLO_PEAK_ENV_LEVELS`]) at the
+    /// half-period; it never exceeds the peak.
+    #[test]
+    fn tremolo_atten_is_bounded_triangle() {
+        let mut lfo = Lfo::default();
+        // Phase 0 → trough (no extra attenuation).
+        assert_eq!(lfo.tremolo_atten_env_levels(true), 0);
+        let mut saw_peak = 0u32;
+        // Drive the phase across a full period (fast mode = 1 step per
+        // tick) and record the maximum attenuation seen.
+        for _ in 0..TREMOLO_PHASE_PERIOD {
+            lfo.tick(false, true);
+            let a = lfo.tremolo_atten_env_levels(true);
+            assert!(a <= TREMOLO_PEAK_ENV_LEVELS, "atten {a} exceeds peak");
+            saw_peak = saw_peak.max(a);
+        }
+        assert_eq!(
+            saw_peak, TREMOLO_PEAK_ENV_LEVELS,
+            "triangle should reach the 1.0 dB peak somewhere in the period"
+        );
+    }
+
+    /// A held LFO (`$0F` bit 1) pins the phase at 0, so the audible AM
+    /// attenuation is 0 even for an AM-enabled operator.
+    #[test]
+    fn tremolo_atten_zero_while_lfo_held() {
+        let mut lfo = Lfo::default();
+        for _ in 0..200 {
+            lfo.tick(true, false);
+            assert_eq!(lfo.tremolo_atten_env_levels(true), 0);
+        }
+    }
+
+    /// An operator with its VIB bit clear gets no pitch offset.
+    #[test]
+    fn vibrato_offset_zero_when_vib_disabled() {
+        let mut lfo = Lfo::default();
+        for _ in 0..1000 {
+            lfo.tick(false, false);
+            assert_eq!(lfo.vibrato_pitch_offset_q(false), 0);
+        }
+    }
+
+    /// The §7 vibrato swings the pitch both sharp (positive offset) and
+    /// flat (negative offset) about the nominal frequency, bounded by
+    /// the ±7-cent peak ([`VIBRATO_PEAK_OFFSET_Q`]).
+    #[test]
+    fn vibrato_offset_is_symmetric_and_bounded() {
+        let mut lfo = Lfo::default();
+        let mut min = i32::MAX;
+        let mut max = i32::MIN;
+        // Cover several full periods in fast mode.
+        for _ in 0..(VIBRATO_PHASE_PERIOD * 8) {
+            lfo.tick(false, true);
+            let o = lfo.vibrato_pitch_offset_q(true);
+            assert!(o.abs() <= VIBRATO_PEAK_OFFSET_Q, "offset {o} exceeds peak");
+            min = min.min(o);
+            max = max.max(o);
+        }
+        assert!(max > 0, "vibrato must swing sharp");
+        assert!(min < 0, "vibrato must swing flat");
+    }
+
+    /// `apply_vibrato` is the identity when the offset is 0 (VIB
+    /// disabled) and shifts the rate up for a positive (sharp) offset,
+    /// down for a negative (flat) one.
+    #[test]
+    fn apply_vibrato_scales_phase_rate() {
+        let base = 1000u32 << 3; // a representative fnum << block
+        assert_eq!(apply_vibrato(base, 0), base, "offset 0 is identity");
+        assert!(
+            apply_vibrato(base, VIBRATO_PEAK_OFFSET_Q) > base,
+            "sharp raises rate"
+        );
+        assert!(
+            apply_vibrato(base, -VIBRATO_PEAK_OFFSET_Q) < base,
+            "flat lowers rate"
+        );
+        // ±7-cent peak is a ~0.4 % deviation — small but non-zero.
+        let up = apply_vibrato(base, VIBRATO_PEAK_OFFSET_Q);
+        assert!(up - base < base / 100, "deviation under 1%");
+    }
+
+    /// End-to-end: an AM-enabled carrier produces a *time-varying*
+    /// output amplitude (the tremolo audibly modulates the level),
+    /// whereas the same channel with AM disabled holds a steadier
+    /// amplitude envelope over the same window.
+    #[test]
+    fn am_enabled_operator_modulates_output_amplitude() {
+        // Build a steady-state channel: full sine carrier, key-on,
+        // fastest attack so the envelope settles immediately.
+        let patch = Vrc7Patch {
+            car_attack: 0x0F,
+            mod_attack: 0x0F,
+            car_tremolo: true, // carrier AM on
+            ..Vrc7Patch::default()
+        };
+
+        let mut ch = OpllChannel::default();
+        ch.load_patch(&patch, 0); // volume 0 = loudest
+        ch.fnum = 0x180;
+        ch.block = 4;
+        ch.refresh_rks();
+        ch.trigger_key_on();
+
+        let mut lfo = Lfo::default();
+        // Settle the envelope.
+        for _ in 0..2000 {
+            lfo.tick(false, true);
+            let _ = ch.sample_with_test(&TestRegister::default(), &lfo);
+        }
+        // Collect a window of |output| and confirm it varies — the AM
+        // triangle should push the level up and down across the period.
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        for _ in 0..(TREMOLO_PHASE_PERIOD * 2) {
+            lfo.tick(false, true);
+            let s = ch.sample_with_test(&TestRegister::default(), &lfo).abs();
+            lo = lo.min(s);
+            hi = hi.max(s);
+        }
+        assert!(
+            hi > lo,
+            "AM should make the carrier amplitude vary (lo={lo}, hi={hi})"
+        );
     }
 
     // ----------------------------------------------- §III-1-7 rhythm
