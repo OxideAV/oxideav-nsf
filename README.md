@@ -47,7 +47,10 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * **Expansion chips** (`expansion`) — summed into the APU mixer:
   * **VRC6** — 2 pulses (16-step duty down-counter) + 14-step sawtooth.
   * **MMC5** — 2 pulses with the chip's fixed 240 Hz envelope + length
-    unit, plus 8-bit raw PCM with `$5010` PCM Mode/IRQ semantics.
+    unit, plus 8-bit raw PCM with `$5010` PCM Mode/IRQ semantics and the
+    analog Pin 2 DAC transfer curve (the
+    `Voltage = (DAC/255)·0.4·AVcc + 0.1·AVcc` characteristic, AC-coupled
+    about its 0.3·AVcc midpoint).
   * **Sunsoft 5B** — 3 squares with AY-style log-volume envelopes
     (17-bit LFSR noise, 32-step envelope shapes, select-port write
     lock-out).
@@ -87,7 +90,6 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   live but the phase→depth translation is provenance-pending in the
   staged docs, so the LFO is not yet audible) and the VRC7 rhythm
   *synthesis* path for HH/SD/TOM/TOP-CYM.
-* MMC5 analog "Pin 2 DAC Characteristic" transfer curve.
 * RIFF-NSF container variant.
 
 ## Verification

@@ -417,6 +417,33 @@ impl Mmc5Pulse {
     }
 }
 
+/// MMC5 raw-PCM full-scale swing as a fraction of AVcc, taken from the
+/// analog Pin 2 DAC transfer curve in
+/// `docs/audio/nsf/mmc5-audio-wiki.html` §"Pin 2 DAC Characteristic":
+/// the `(DAC value / 255) * (0.4 * AVcc)` term — i.e. the DAC pin
+/// covers a 0.4·AVcc range as the byte sweeps `$00..=$FF`.
+const MMC5_PIN2_DAC_SWING: f32 = 0.4;
+
+/// MMC5 raw-PCM DAC value at the centre of the §"Pin 2 DAC
+/// Characteristic" swing. The curve runs from DAC=0 (`0.1·AVcc`) to
+/// DAC=255 (`0.5·AVcc`); the DC-coupled signal is recentred about the
+/// DAC=127.5 midpoint so the channel sits at 0 when idle.
+const MMC5_PIN2_DAC_MIDPOINT: f32 = 127.5;
+
+/// Map an 8-bit MMC5 raw-PCM DAC byte through the analog Pin 2 DAC
+/// transfer curve to an AC-coupled audio sample in units of AVcc.
+///
+/// Per `docs/audio/nsf/mmc5-audio-wiki.html` §"Pin 2 DAC Characteristic"
+/// the no-load Pin 2 voltage is
+/// `Voltage = [(DAC/255) * (0.4·AVcc)] + (0.1·AVcc)`, spanning
+/// `0.1·AVcc` (DAC=`$00`) to `0.5·AVcc` (DAC=`$FF`). The cartridge AC
+/// couples the output, removing the `0.3·AVcc` DC midpoint, so the
+/// audible value is the §-quoted swing recentred about DAC=127.5:
+/// `(DAC/255 − 127.5/255) · 0.4 = ((DAC − 127.5)/255) · 0.4`.
+fn pin2_dac_ac(dac: u8) -> f32 {
+    (dac as f32 - MMC5_PIN2_DAC_MIDPOINT) / 255.0 * MMC5_PIN2_DAC_SWING
+}
+
 impl Mmc5 {
     pub fn new() -> Self {
         Self::default()
@@ -617,10 +644,18 @@ impl Mmc5 {
         } else {
             95.88 / (8128.0 / pulse_sum + 100.0)
         };
-        // Raw PCM channel: 8-bit unsigned, treated as a pure DC offset
-        // around the midline. Mix in linearly — empirical scale tracks
-        // the 2A03 DMC contribution.
-        let pcm_out = (self.pcm as f32 - 128.0) / 256.0 * 0.6;
+        // Raw PCM channel mapped through the analog Pin 2 DAC transfer
+        // curve. Per `docs/audio/nsf/mmc5-audio-wiki.html`
+        // §"Pin 2 DAC Characteristic": "Pin 2 no-load voltage very
+        // closely follows the equation:
+        //   Voltage = [(DAC value / 255) * (0.4 * AVcc)] + (0.1 * AVcc)".
+        // So the DAC pin spans 0.1·AVcc (DAC=0) .. 0.5·AVcc (DAC=255),
+        // an affine map with a fixed 0.1·AVcc floor and a 0.4·AVcc
+        // full-scale swing. AC-coupling on the cartridge strips the
+        // 0.3·AVcc midpoint DC offset, so the audible signal (in units
+        // of AVcc) is the swing recentred about that midpoint:
+        //   ((DAC/255)·0.4 + 0.1) − 0.3 = (DAC/255 − 0.5) · 0.4.
+        let pcm_out = pin2_dac_ac(self.pcm);
         pulse_out + pcm_out
     }
 }
@@ -3023,6 +3058,30 @@ mod tests {
         chip.write(0x5011, 0x7F);
         assert_eq!(chip.pcm, 0x7F);
         assert!(!chip.irq_trip);
+    }
+
+    #[test]
+    fn mmc5_pin2_dac_curve_matches_spec_equation() {
+        // §"Pin 2 DAC Characteristic": Voltage =
+        //   [(DAC/255)·(0.4·AVcc)] + (0.1·AVcc).
+        // pin2_dac_ac returns the AC-coupled value = absolute pin
+        // voltage (in AVcc units) minus the 0.3·AVcc DC midpoint. Drive
+        // the full §-quoted equation independently and compare.
+        let spec_ac = |dac: u8| ((dac as f32 / 255.0) * 0.4 + 0.1) - 0.3;
+        for &dac in &[0u8, 1, 64, 127, 128, 200, 255] {
+            let got = pin2_dac_ac(dac);
+            let want = spec_ac(dac);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "DAC {dac:#04x}: got {got}, spec {want}"
+            );
+        }
+        // Endpoints: DAC=0 sits at the bottom of the swing (−0.2·AVcc),
+        // DAC=255 at the top (+0.2·AVcc); the curve is symmetric about
+        // the 127.5 midpoint.
+        assert!((pin2_dac_ac(0) - (-0.2)).abs() < 1e-6);
+        assert!((pin2_dac_ac(255) - 0.2).abs() < 1e-6);
+        assert!((pin2_dac_ac(0) + pin2_dac_ac(255)).abs() < 1e-6);
     }
 
     #[test]

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- MMC5: raw-PCM analog Pin 2 DAC transfer curve — replace the empirical
+  PCM scale with the §"Pin 2 DAC Characteristic" affine equation
+  `Voltage = (DAC/255)·0.4·AVcc + 0.1·AVcc` (AC-coupled about the
+  0.3·AVcc midpoint) (round 315)
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.2...v0.0.3) - 2026-06-15
 
 ### Other
