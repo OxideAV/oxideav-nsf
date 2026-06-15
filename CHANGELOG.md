@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NSFe `mixe` per-device default mix levels** (round 311): every NSF
+  now mixes its expansion-audio chips at the relative loudness the
+  `mixe` chunk documents as the default, per
+  `docs/audio/nsf/nsfe-nesdev-wiki.html` §"mixe" — "Any omitted device
+  should instead use a default mix." The chunk's device-byte list
+  tabulates a signed-millibel default for every id (`0 APU Squares = 0`,
+  `1 APU Triangle/Noise/DPCM = -20`, `2 VRC6 = 0`, `3 VRC7 = 1100`,
+  `4 FDS = 700`, `5 MMC5 = 0`, `6 N163 = 1100 or 1900`, `7 Sunsoft
+  5B = -130`). Previously the `Apu2A03` per-device gain table was seeded
+  flat at `1.0` (0 dB) and only diverged from it when an NSFe `mixe`
+  chunk explicitly overrode a device — so a plain NSF v1 / NSF2 rip, or
+  an NSFe rip that omits a device, mixed VRC7 / FDS / N163 ~11 / ~7 /
+  ~11 dB too quiet (and the 5B / triangle-noise-DPCM block slightly too
+  loud) relative to the APU squares reference. The table is now seeded
+  from the new `apu::DEFAULT_MIX_MILLIBELS` via the shared
+  `apu::mix_millibels_to_gain` helper (the `dB = 20·log10(linear)`
+  amplitude convention `10^(mB/2000)` the override path already used);
+  `apu::default_device_gains()` exposes the seeded linear table.
+  `apply_mixe_overrides` is unchanged in spirit — a present `mixe` entry
+  still replaces only the device it names, and now correctly leaves the
+  other devices at their tabulated default rather than a flat 0 dB. The
+  N163 row's "1100 or 1900" is a documented spec ambiguity (the §mixe
+  preamble notes N163 mixing varies per-game); the lower bound 1100 is
+  seeded — it matches the VRC7 default and is overridden by an NSFe
+  `mixe` chunk, the spec's intended N163 per-game mechanism. 5 new tests
+  (2 in `apu`, 3 in `tests/parse_header.rs`): the default millibel table
+  + conversion-helper spot-checks, the fresh-APU seed matching
+  `10^(mB/2000)` for all 8 devices with louder/quieter cross-checks,
+  the override-replaces-only-named-device preservation of FDS/N163
+  defaults, and the updated unmentioned-slot assertion in the existing
+  `mixe_overrides_set_per_device_gain_table` (5B now ≈0.861, not 1.0).
+
 - **Sunsoft 5B select-port data-write lock-out** (round 307): per
   `docs/audio/nsf/sunsoft-5b-audio-wiki.html` §"Audio Register Select
   ($C000-$DFFF)" the select byte is `DDDDRRRR` — the high nibble

@@ -460,6 +460,26 @@ zero-high-nibble select restores the port and the write propagates to
 the channel-period derivation), and the full every-nonzero-high-nibble
 truth table (only high nibble 0 allows the write).
 
+Round 311 lands the NSFe `mixe` per-device default mix levels per
+`docs/audio/nsf/nsfe-nesdev-wiki.html` §"mixe" — "Any omitted device
+should instead use a default mix." The chunk's device-byte list
+tabulates a signed-millibel default for every id (APU squares 0, APU
+triangle/noise/DPCM -20, VRC6 0, VRC7 1100, FDS 700, MMC5 0, N163
+1100, Sunsoft 5B -130). The `Apu2A03` per-device gain table was
+previously seeded flat at 0 dB and only diverged when an NSFe `mixe`
+chunk explicitly overrode a device, so a plain NSF v1 / NSF2 rip (no
+`mixe` chunk at all) mixed VRC7 / FDS / N163 ~11 / ~7 / ~11 dB too
+quiet relative to the APU squares reference. The table is now seeded
+from the new `apu::DEFAULT_MIX_MILLIBELS` via the shared
+`apu::mix_millibels_to_gain` helper (the `10^(mB/2000)` amplitude
+convention the override path already used), with
+`apu::default_device_gains()` exposing the linear table; a present
+`mixe` entry still overrides only the device it names and now leaves the
+rest at their documented default rather than 0 dB. The N163 row's "1100
+or 1900" is a documented spec ambiguity (the §mixe preamble notes N163
+mixing varies per-game) — the lower bound 1100 is seeded, matching the
+VRC7 default, and an NSFe `mixe` chunk overrides it. 5 new tests.
+
 ## Round 2 scope
 
 * **Header parser** ([`parse_nsf`]):

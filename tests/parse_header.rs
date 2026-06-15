@@ -637,9 +637,63 @@ fn mixe_overrides_set_per_device_gain_table() {
     assert!((g[0] - 1.0).abs() < 1e-6);
     assert!((g[1] - 0.1).abs() < 1e-4);
     assert!((g[4] - 10.0).abs() < 1e-3);
-    // Unmentioned slots stay at the default 1.0.
+    // Unmentioned slots keep the §"mixe" tabulated default mix, not a
+    // flat 1.0: VRC6 (device 2) is 0 mB → 1.0, but Sunsoft 5B
+    // (device 7) is -130 mB → 10^(-130/2000) ≈ 0.8609.
     assert!((g[2] - 1.0).abs() < 1e-6);
-    assert!((g[7] - 1.0).abs() < 1e-6);
+    let s5b_default = 10.0f32.powf(-130.0 / 2000.0);
+    assert!((g[7] - s5b_default).abs() < 1e-4);
+}
+
+#[test]
+fn fresh_apu_seeds_documented_default_mix_levels() {
+    // A fresh APU (no NSFe `mixe` chunk applied) must already carry the
+    // §"mixe" tabulated default mix for every device — "Any omitted
+    // device should instead use a default mix" — rather than a flat
+    // 0 dB. Verify each device against 10^(mB / 2000).
+    use oxideav_nsf::Apu2A03;
+    let g = Apu2A03::new().device_gains();
+    let want_mb: [i16; 8] = [0, -20, 0, 1100, 700, 0, 1100, -130];
+    for (i, &mb) in want_mb.iter().enumerate() {
+        let want = 10.0f32.powf(mb as f32 / 2000.0);
+        assert!(
+            (g[i] - want).abs() < 1e-4,
+            "device {i}: expected default gain {want} for {mb} mB, got {}",
+            g[i]
+        );
+    }
+    // Spot-check the headline louder-than-square defaults exceed unity
+    // and the 5B / TND defaults fall just below it.
+    assert!(g[3] > 3.5, "VRC7 default should be ~3.55x (+11 dB)");
+    assert!(g[4] > 2.2, "FDS default should be ~2.24x (+7 dB)");
+    assert!(g[6] > 3.5, "N163 default should be ~3.55x (+11 dB)");
+    assert!(
+        g[7] < 1.0 && g[7] > 0.85,
+        "5B default should be ~0.86x (-1.3 dB)"
+    );
+    assert!(
+        g[1] < 1.0 && g[1] > 0.97,
+        "APU TND default should be ~0.998x (-0.2 dB)"
+    );
+}
+
+#[test]
+fn mixe_override_replaces_only_named_device_default() {
+    // A `mixe` chunk that names just VRC7 must override VRC7 while the
+    // other devices retain their tabulated defaults (FDS stays +700 mB,
+    // N163 stays +1100 mB, etc.).
+    use oxideav_nsf::Apu2A03;
+    let mut apu = Apu2A03::new();
+    apu.apply_mixe_overrides(&[NsfeMixerEntry {
+        device: 3,
+        millibel: 0,
+    }]);
+    let g = apu.device_gains();
+    assert!((g[3] - 1.0).abs() < 1e-6, "VRC7 override to 0 mB → 1.0");
+    let fds_default = 10.0f32.powf(700.0 / 2000.0);
+    let n163_default = 10.0f32.powf(1100.0 / 2000.0);
+    assert!((g[4] - fds_default).abs() < 1e-4, "FDS default preserved");
+    assert!((g[6] - n163_default).abs() < 1e-4, "N163 default preserved");
 }
 
 #[test]

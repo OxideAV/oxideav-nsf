@@ -617,6 +617,69 @@ pub mod mixe_device {
     pub const S5B: u8 = 7;
 }
 
+/// Default per-device mix levels, in signed millibels (1/100 dB)
+/// relative to the built-in APU square channel at its default volume,
+/// per `docs/audio/nsf/nsfe-nesdev-wiki.html` §"mixe". The chunk's own
+/// preamble states "Any omitted device should instead use a default
+/// mix", and the device-byte list tabulates that default for every id:
+///
+/// ```text
+/// 0 APU Squares ................. 0
+/// 1 APU Triangle/Noise/DPCM .... -20  (compared via triangle)
+/// 2 VRC6 ........................ 0
+/// 3 VRC7 ..................... 1100  (compared via the §pseudo-square)
+/// 4 FDS ...................... 700
+/// 5 MMC5 ........................ 0
+/// 6 N163 ..................... 1100  (compared in 1-channel mode)
+/// 7 Sunsoft 5B ............... -130  (compared at volume 12 / $C)
+/// ```
+///
+/// These apply to **every** NSF — a plain NSF v1 / NSF2 rip with no
+/// `mixe` chunk, and an NSFe rip whose `mixe` chunk omits a device, all
+/// inherit the tabulated default rather than a flat 0 dB. A present
+/// `mixe` entry overrides only the device it names
+/// ([`Apu2A03::apply_mixe_overrides`]).
+///
+/// Spec ambiguity (documented, not resolved here): the N163 row reads
+/// "Default: 1100 or 1900" — the chunk preamble notes N163 mixing
+/// "varies on a per-game basis", and the two listed values bracket that
+/// range without the spec choosing one. We seed the lower bound 1100,
+/// which coincides with the VRC7 default and is the conservative
+/// reference point; an NSFe `mixe` chunk (the spec's intended N163
+/// per-game mechanism) overrides it when the rip needs the louder mix.
+pub const DEFAULT_MIX_MILLIBELS: [i16; MIXE_DEVICE_COUNT] = [
+    0,    // APU squares (the reference)
+    -20,  // APU triangle / noise / DPCM
+    0,    // VRC6
+    1100, // VRC7
+    700,  // FDS
+    0,    // MMC5
+    1100, // N163 (spec: "1100 or 1900"; lower bound seeded)
+    -130, // Sunsoft 5B
+];
+
+/// Convert a signed-millibel `mixe` level into a linear amplitude gain.
+///
+/// The `mixe` chunk specifies "millibels (1/100 dB) comparison with APU
+/// square volume"; with the `dB = 20·log10(linear)` amplitude
+/// convention this is `linear = 10^(mB / 2000)` (mB → dB is `/100`,
+/// dB → linear amplitude is `10^(dB/20)`).
+pub fn mix_millibels_to_gain(millibels: i16) -> f32 {
+    10.0f32.powf(millibels as f32 / 2000.0)
+}
+
+/// The default per-device linear gain table derived from
+/// [`DEFAULT_MIX_MILLIBELS`] via [`mix_millibels_to_gain`]. This is the
+/// table a fresh [`Apu2A03`] starts with, before any NSFe `mixe`
+/// override is applied.
+pub fn default_device_gains() -> [f32; MIXE_DEVICE_COUNT] {
+    let mut gains = [1.0f32; MIXE_DEVICE_COUNT];
+    for (slot, &mb) in gains.iter_mut().zip(DEFAULT_MIX_MILLIBELS.iter()) {
+        *slot = mix_millibels_to_gain(mb);
+    }
+    gains
+}
+
 /// 2A03 APU — five channels + frame counter + status / mixer + the
 /// expansion-chip aggregate.
 pub struct Apu2A03 {
@@ -647,13 +710,15 @@ pub struct Apu2A03 {
     /// PAL flag — toggles the DMC rate table.
     pal: bool,
 
-    /// Linear gain per NSFe `mixe` device id. `1.0` = unchanged.
+    /// Linear gain per NSFe `mixe` device id. `1.0` = 0 dB / unchanged.
     /// Index 0 = APU squares, 1 = APU triangle/noise/DPCM, 2..=7 =
-    /// VRC6 / VRC7 / FDS / MMC5 / N163 / 5B. Populated from a
-    /// `Vec<NsfeMixerEntry>` via [`Apu2A03::apply_mixe_overrides`].
-    /// All gains default to `1.0`; an override of `+X` millibels
-    /// produces `10^(X/2000)` (using the
-    /// `dB = 20 * log10(linear)` convention from the §mixe spec).
+    /// VRC6 / VRC7 / FDS / MMC5 / N163 / 5B. Seeded from the §"mixe"
+    /// tabulated [`DEFAULT_MIX_MILLIBELS`] (so a rip with no `mixe`
+    /// chunk still mixes expansion audio at the documented relative
+    /// loudness), then overridden per-device from a `Vec<NsfeMixerEntry>`
+    /// via [`Apu2A03::apply_mixe_overrides`]. An override of `+X`
+    /// millibels produces `10^(X/2000)` via [`mix_millibels_to_gain`]
+    /// (the `dB = 20 * log10(linear)` convention from the §mixe spec).
     device_gain: [f32; MIXE_DEVICE_COUNT],
 
     /// Aggregate of the active expansion chips.
@@ -681,7 +746,7 @@ impl Apu2A03 {
             frame_acc: 0,
             frame_step: 0,
             pal: false,
-            device_gain: [1.0; MIXE_DEVICE_COUNT],
+            device_gain: default_device_gains(),
             expansion: crate::expansion::Expansion::new(),
         }
     }
@@ -689,15 +754,16 @@ impl Apu2A03 {
     /// Apply NSFe `mixe` per-device millibel overrides. The spec says
     /// each entry is a signed 16-bit millibel comparison with the
     /// reference square at maximum volume — the player converts it to
-    /// a linear gain via `10^(mB/2000)` and multiplies the channel's
-    /// post-mixer contribution by that gain. Devices not mentioned by
-    /// the entries keep their existing gain (default `1.0`).
+    /// a linear gain via [`mix_millibels_to_gain`] and multiplies the
+    /// channel's post-mixer contribution by that gain. Devices not
+    /// mentioned by the entries keep their existing gain, which — per
+    /// the §"mixe" "Any omitted device should instead use a default
+    /// mix" rule — is the tabulated [`DEFAULT_MIX_MILLIBELS`] level a
+    /// fresh [`Apu2A03`] is seeded with, not a flat 0 dB.
     pub fn apply_mixe_overrides(&mut self, entries: &[crate::nsfe::NsfeMixerEntry]) {
         for entry in entries {
             if (entry.device as usize) < MIXE_DEVICE_COUNT {
-                let mb = entry.millibel as f32;
-                let linear = 10.0f32.powf(mb / 2000.0);
-                self.device_gain[entry.device as usize] = linear;
+                self.device_gain[entry.device as usize] = mix_millibels_to_gain(entry.millibel);
             }
         }
     }
@@ -976,6 +1042,40 @@ impl Apu2A03 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_mix_table_matches_spec_millibels() {
+        // §"mixe" device-byte list defaults, in millibels.
+        assert_eq!(DEFAULT_MIX_MILLIBELS, [0, -20, 0, 1100, 700, 0, 1100, -130]);
+        // The conversion helper is the amplitude convention 10^(mB/2000).
+        assert!((mix_millibels_to_gain(0) - 1.0).abs() < 1e-9);
+        assert!((mix_millibels_to_gain(2000) - 10.0).abs() < 1e-4); // +20 dB
+        assert!((mix_millibels_to_gain(-2000) - 0.1).abs() < 1e-5); // -20 dB
+                                                                    // +6 dB ≈ 1.995x; -6 dB ≈ 0.501x.
+        assert!((mix_millibels_to_gain(600) - 1.99526).abs() < 1e-3);
+        assert!((mix_millibels_to_gain(-600) - 0.50119).abs() < 1e-3);
+    }
+
+    #[test]
+    fn default_device_gains_seed_from_default_table() {
+        let g = default_device_gains();
+        for (i, &mb) in DEFAULT_MIX_MILLIBELS.iter().enumerate() {
+            assert!((g[i] - mix_millibels_to_gain(mb)).abs() < 1e-9);
+        }
+        // A fresh APU starts from exactly this table.
+        assert_eq!(Apu2A03::new().device_gains(), g);
+        // VRC7 / FDS / N163 are louder than the square reference; the 5B
+        // and TND defaults are quieter.
+        assert!(g[mixe_device::VRC7 as usize] > 1.0);
+        assert!(g[mixe_device::FDS as usize] > 1.0);
+        assert!(g[mixe_device::N163 as usize] > 1.0);
+        assert!(g[mixe_device::S5B as usize] < 1.0);
+        assert!(g[mixe_device::APU_TND as usize] < 1.0);
+        // VRC6, MMC5 and the square reference are at unity.
+        assert!((g[mixe_device::VRC6 as usize] - 1.0).abs() < 1e-9);
+        assert!((g[mixe_device::MMC5 as usize] - 1.0).abs() < 1e-9);
+        assert!((g[mixe_device::APU_SQUARES as usize] - 1.0).abs() < 1e-9);
+    }
 
     #[test]
     fn pulse_writes_and_outputs_nonzero() {
