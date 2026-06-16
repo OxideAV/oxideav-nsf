@@ -66,7 +66,10 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     III-2 / III-5), the `$0F` test register, `$E000` audio reset, the
     audible AM/VIB LFO (the §7 1.0 dB tremolo / ±7-cent vibrato
     physical depths mapped through a triangle onto each operator's
-    `$00`/`$01` AM / VIB bit), and rhythm-mode register decoding.
+    `$00`/`$01` AM / VIB bit), rhythm-mode register decoding, and
+    bass-drum (BD) rhythm synthesis (`RhythmBassDrum`) — the §V-4
+    two-slot FM pair on channel 7, keyed from the `$0E` BD bit, with
+    the §III-4 percussion ×2 DAC doubling.
   * **FDS** — wavetable + frequency-modulation unit, the volume + mod
     envelope ramp generators (`c = 8·(e+1)·(m+1)` timer), the `$4023`
     master sound-enable / waveform-halt, and the `$4090..=$4097` read
@@ -94,7 +97,10 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   repo). The LFO is now audible via the documented *physical* depths
   (1.0 dB tremolo / ±7-cent vibrato) mapped through a triangle, which
   is the correct macro behaviour but not a per-step bit-match.
-* The VRC7 rhythm *synthesis* path for HH/SD/TOM/TOP-CYM.
+* The VRC7 rhythm *synthesis* path for HH/SD/TOM/TOP-CYM (BD is now
+  synthesised as the §V-4 two-slot FM pair; the other four need the
+  §V-4 noise-mixed phase generator, whose exact per-instrument phase
+  formulas are not in the staged docs).
 * RIFF-NSF container variant.
 
 ## Verification
