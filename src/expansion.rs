@@ -1078,9 +1078,20 @@ pub struct N163 {
     pub next_chan_slot: u8,
     /// Sample-and-hold register: the chip drives a single shared DAC
     /// at the channel-update rate, so the audible output is the last
-    /// channel's update. Sum-of-active-channels matches the audible
-    /// average since outputs alternate at the update rate.
+    /// channel's update. Retained as the most-recently-ticked
+    /// channel's held sample for the per-channel read tests / status.
     pub last_output: f32,
+    /// Per-channel (1..=8 → index 0..=7) sample-and-hold of the last
+    /// value each channel computed on its update slot. The chip
+    /// time-multiplexes one DAC across the active channels at the
+    /// channel-update rate; rather than reproduce the (often
+    /// inaudible-but-aliasing) switching waveform, §"Mixing" of
+    /// `docs/audio/nsf/namco-163-audio-wiki.html` recommends summing
+    /// the active channels and dividing by their count. We hold each
+    /// channel's last update here so [`N163::output`] can form that
+    /// sum instead of presenting whichever single channel happened to
+    /// tick most recently.
+    pub chan_hold: [f32; 8],
 }
 
 impl Default for N163 {
@@ -1094,6 +1105,7 @@ impl Default for N163 {
             cycle_accum: 0,
             next_chan_slot: 0,
             last_output: 0.0,
+            chan_hold: [0.0; 8],
         }
     }
 }
@@ -1264,7 +1276,12 @@ impl N163 {
         // 163 outputs through an external resistor ladder. Normalise
         // here so the linear mixer in `Expansion::output` stays in
         // a reasonable range.
-        self.last_output = signed as f32 * dec.volume as f32 / 128.0;
+        let sample = signed as f32 * dec.volume as f32 / 128.0;
+        // Hold this channel's sample for the §"Mixing" sum, and keep
+        // `last_output` pointed at whichever channel ticked most
+        // recently (the single-DAC view used by status reads).
+        self.chan_hold[(ch - 1) as usize] = sample;
+        self.last_output = sample;
 
         // Round-robin pointer through the active set.
         self.next_chan_slot = (slot + 1) % self.channels_active;
@@ -1284,8 +1301,29 @@ impl N163 {
         }
     }
 
+    /// Mixed N163 output. Per §"Mixing" of
+    /// `docs/audio/nsf/namco-163-audio-wiki.html`: "it is often
+    /// preferred to simply sum the channel outputs, and divide the
+    /// output volume by the number of active channels." Each active
+    /// channel contributes its held sample (`chan_hold`), and the sum
+    /// is scaled by `1 / channels_active`. This keeps a multi-voice
+    /// track balanced — without it the chip presented only whichever
+    /// single channel ticked most recently, so at the host sample rate
+    /// a `c`-channel song dropped roughly `(c-1)/c` of its voices at
+    /// any instant. The doc notes the approximation runs "slightly too
+    /// loud" for `c >= 6` because it does not compensate for the energy
+    /// the real multiplexer transfers; we accept that documented bound
+    /// rather than reproduce the audible switching waveform.
     pub fn output(&self) -> f32 {
-        self.last_output
+        if self.channels_active == 0 {
+            return 0.0;
+        }
+        let mut sum = 0.0f32;
+        for slot in 0..self.channels_active {
+            let ch = self.active_channel(slot);
+            sum += self.chan_hold[(ch - 1) as usize];
+        }
+        sum / self.channels_active as f32
     }
 
     /// Channel-update rate in Hz for the current `channels_active`,
@@ -4288,6 +4326,101 @@ mod tests {
         assert_eq!(chip.addr, 0x32);
         assert_eq!(chip.read(0x4800), 0x33);
         assert_eq!(chip.addr, 0x33);
+    }
+
+    /// Configure one N163 channel directly in sound RAM so a test can
+    /// drive a deterministic held sample. `ch` is 1-based; the
+    /// frequency is kept at 0 so the phase (and therefore the sampled
+    /// nibble) is stable across `tick_one_channel`. `wave_addr`
+    /// selects the nibble index and `volume` is the 4-bit linear
+    /// volume.
+    fn n163_setup_channel(chip: &mut N163, ch: u8, wave_addr: u8, volume: u8) {
+        let base = N163::chan_base(ch);
+        chip.ram[base] = 0; // low freq
+        chip.ram[base + 1] = 0; // low phase
+        chip.ram[base + 2] = 0; // mid freq
+        chip.ram[base + 3] = 0; // mid phase
+        chip.ram[base + 4] = 0; // L=0 → wave_len 256, high freq 0
+        chip.ram[base + 5] = 0; // high phase
+        chip.ram[base + 6] = wave_addr; // wave address
+        chip.ram[base + 7] = volume & 0x0F; // linear volume
+    }
+
+    #[test]
+    fn n163_output_sums_active_channels_divided_by_count() {
+        // §"Mixing": "it is often preferred to simply sum the channel
+        // outputs, and divide the output volume by the number of active
+        // channels." With two channels enabled the audible output must
+        // be the *average* of both held samples, not just whichever one
+        // ticked most recently.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        // Two active channels → ch7 (slot 0) + ch8 (slot 1).
+        chip.channels_active = 2;
+        // Nibble 0 of the wave RAM = low nibble of byte 0; nibble 1 =
+        // high nibble of byte 0. Set byte 0 so nibble 0 = 0xF (→ +7)
+        // and nibble 1 = 0x0 (→ -8).
+        chip.ram[0] = 0x0F;
+        // Channel 7 reads nibble 0 (+7), channel 8 reads nibble 1 (-8),
+        // both at full volume 15.
+        n163_setup_channel(&mut chip, 7, 0, 15);
+        n163_setup_channel(&mut chip, 8, 1, 15);
+
+        // Tick both channels once (round-robin: slot 0 then slot 1).
+        chip.tick_one_channel();
+        chip.tick_one_channel();
+
+        let ch7 = 7.0f32 * 15.0 / 128.0; // (+7) * vol / 128
+        let ch8 = -8.0f32 * 15.0 / 128.0; // (-8) * vol / 128
+        let expected = (ch7 + ch8) / 2.0;
+        assert!(
+            (chip.output() - expected).abs() < 1e-6,
+            "output {} should be the 2-channel average {}",
+            chip.output(),
+            expected
+        );
+        // `last_output` still reflects the single most-recent tick (ch8).
+        assert!((chip.last_output - ch8).abs() < 1e-6);
+        // The averaged mix must differ from the bare last-channel value
+        // — the property the §"Mixing" sum exists to fix.
+        assert!((chip.output() - chip.last_output).abs() > 1e-3);
+    }
+
+    #[test]
+    fn n163_single_channel_output_equals_its_sample() {
+        // With one active channel the sum/divide reduces to that
+        // channel's held sample (divide by 1), so the mix matches the
+        // single-DAC `last_output`.
+        let mut chip = N163::new();
+        chip.enabled = true;
+        chip.channels_active = 1; // only ch8 active
+        chip.ram[0] = 0x0F; // nibble 0 = +7
+        n163_setup_channel(&mut chip, 8, 0, 15);
+        chip.tick_one_channel();
+        let expected = 7.0f32 * 15.0 / 128.0;
+        assert!((chip.output() - expected).abs() < 1e-6);
+        assert!((chip.output() - chip.last_output).abs() < 1e-6);
+    }
+
+    #[test]
+    fn n163_inactive_channel_holds_are_excluded_from_mix() {
+        // A stale hold on a now-inactive channel must not leak into the
+        // sum — `output()` iterates only the active set (top-down per
+        // `$7F` `1+C`).
+        let mut chip = N163::new();
+        chip.enabled = true;
+        // Park a large stale value on channel 1 (inactive when only the
+        // top channels are enabled).
+        chip.chan_hold[0] = 99.0;
+        chip.channels_active = 1; // only ch8 active
+        chip.ram[0] = 0x0F;
+        n163_setup_channel(&mut chip, 8, 0, 15);
+        chip.tick_one_channel();
+        let expected = 7.0f32 * 15.0 / 128.0;
+        assert!(
+            (chip.output() - expected).abs() < 1e-6,
+            "stale channel-1 hold must not enter the 1-channel mix"
+        );
     }
 
     #[test]

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- N163: multi-channel mixing per §"Mixing" of
+  `docs/audio/nsf/namco-163-audio-wiki.html`. The chip time-multiplexes
+  a single DAC across the active channels at the channel-update rate;
+  the doc recommends "simply sum the channel outputs, and divide the
+  output volume by the number of active channels" rather than reproduce
+  the (aliasing / often-inaudible) switching waveform. The chip now
+  sample-and-holds each active channel's last update separately
+  (`chan_hold`) and `output()` averages them. Previously only the
+  most-recently-ticked channel's sample was emitted, so a `c`-channel
+  song dropped roughly `(c-1)/c` of its voices at any host sample —
+  multi-voice N163 tracks were unbalanced. Single-channel output is
+  unchanged (sum/1). Per the doc the approximation runs "slightly too
+  loud" for `c >= 6`; that documented bound is accepted (round 327)
 - OPLL rhythm mode: bass-drum (BD) percussion synthesis
   (`RhythmBassDrum`). Per YM2413 Application Manual §V-4 ("two slots
   are used to synthesize FM sounds") + Table III-9 (BD = slots 13+16 =

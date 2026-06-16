@@ -55,8 +55,11 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     (17-bit LFSR noise, 32-step envelope shapes, select-port write
     lock-out).
   * **Namco 163** — wavetable RAM, up to 8 channels, per-channel timer
-    accumulators (one update / 15 CPU cycles), and the documented
-    emitted-frequency / channel-update-rate calibration.
+    accumulators (one update / 15 CPU cycles), the documented
+    emitted-frequency / channel-update-rate calibration, and the
+    §"Mixing" multi-channel mix (sum the active channels' held samples
+    and divide by their count) so multi-voice tracks stay balanced
+    instead of presenting only the most-recently-updated channel.
   * **VRC7** — 6 FM channels driven by the OPLL (YM2413) operator
     pipeline: 19-bit phase generator, log-sin / exp ROMs, MUL / FB
     tables, half-rectified waveforms, modulator self-feedback, the
