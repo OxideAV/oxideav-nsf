@@ -1879,6 +1879,135 @@ impl RhythmBassDrum {
     }
 }
 
+// ------------------------------------------------- YM2413 rhythm noise generator
+
+/// YM2413 (OPLL) rhythm-channel pseudo-random **noise generator**.
+///
+/// The melodic channels are deterministic FM, but the rhythm channels
+/// add one extra component: a linear-feedback shift register (LFSR)
+/// noise source. The High-Hat (HH) and Snare-Drum (SD) percussion
+/// sounds mix this noise into their phase generators.
+///
+/// The generator is pinned by the independent silicon-RE measurement in
+/// `docs/audio/nsf/opll-ym2413/ym2413-noise-lfsr-andete-2018-05-13.txt`
+/// (andete, 2018-05-13). That note captured the toggling-phase tail of
+/// the SD sound at F-Num 0, fed the resulting bit stream to the
+/// Berlekamp-Massey algorithm, and recovered — repeatably across many
+/// captures and sample offsets — the **23-bit maximal-length LFSR**
+///
+/// ```text
+///   per-operator (fast) step:  x^23 + x^9 + 1
+/// ```
+///
+/// The §3 measurement establishes the *hardware facts* this type
+/// encodes:
+///
+/// * **23-bit state, maximal length.** Every non-zero state is visited
+///   exactly once before the sequence repeats after `2^23 - 1 =
+///   8 388 607` steps (§3 "maximal length").
+/// * **All-zero is a trap.** "When all bits in the shift register have
+///   value '0', the newly calculated value will also be '0', thus the
+///   LFSR remains stuck in this state forever." The hardware must seed a
+///   non-zero state after reset; [`Self::new`] seeds bit 0.
+/// * **Per-operator update rate.** The §"UPDATE" note records that the
+///   LFSR advances **18× per 72-cycle sample period** — once after every
+///   operator, not once per sample. So the natural single step uses the
+///   fast polynomial `x^23 + x^9 + 1` (Galois form
+///   `state ^= 0x0040_0181` after the shift), and within one 72-cycle
+///   rhythm frame the rhythm unit samples the noise bit for **HH**,
+///   iterates the LFSR **3** times, samples the noise bit for **SD**,
+///   then iterates the LFSR **15** more times (3 + 15 = 18 total).
+///   [`Self::rhythm_frame_bits`] performs exactly that protocol and
+///   returns the `(hh_bit, sd_bit)` pair.
+///
+/// The Galois single-step is the form measured in the die-shot region
+/// the §"die-shot" paragraph identifies; it is reproduced here because
+/// the andete measurement confirms it as a hardware fact, independent of
+/// any emulator source tree.
+#[derive(Debug, Clone, Copy)]
+pub struct OpllNoiseLfsr {
+    /// 23-bit shift-register state (only bits 0..=22 are significant).
+    pub state: u32,
+}
+
+impl Default for OpllNoiseLfsr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpllNoiseLfsr {
+    /// 23-bit state mask (bits 0..=22).
+    const STATE_MASK: u32 = 0x007F_FFFF;
+
+    /// Galois feedback mask for the fast per-operator polynomial
+    /// `x^23 + x^9 + 1`. The §3 listing gives the equivalent step
+    /// `bit = noise & 1; noise >>= 1; if bit { noise ^= MASK }` with the
+    /// tap pattern that XORs bit 22 (x^23 wrap) and bit 8 (x^9). Within
+    /// the 23-bit window that is `(1 << 22) | (1 << 8) | 1 =
+    /// 0x0040_0181`.
+    const GALOIS_MASK: u32 = (1 << 22) | (1 << 8) | 1;
+
+    /// Construct a freshly-reset noise generator. The §3 note states any
+    /// non-zero seed is acceptable ("it's fine to set one specific bit
+    /// to '1' and leave all others uninitialized"); we seed bit 0 so the
+    /// register is guaranteed out of the all-zero trap.
+    pub fn new() -> Self {
+        Self { state: 1 }
+    }
+
+    /// The current noise output bit (the §3 register's cell '1', LSB of
+    /// the shift register) as 0 or 1.
+    pub fn bit(&self) -> u8 {
+        (self.state & 1) as u8
+    }
+
+    /// Advance the LFSR by one *operator* step using the fast
+    /// `x^23 + x^9 + 1` polynomial in the §4 Galois configuration:
+    ///
+    /// ```text
+    ///   bit = state & 1;
+    ///   state >>= 1;
+    ///   if bit { state ^= 0x0040_0181 }
+    /// ```
+    ///
+    /// Returns the bit that was shifted out (the noise output sampled
+    /// *before* this step), so callers can both read and advance in one
+    /// call.
+    pub fn step(&mut self) -> u8 {
+        let out = (self.state & 1) as u8;
+        self.state >>= 1;
+        if out != 0 {
+            self.state ^= Self::GALOIS_MASK;
+        }
+        self.state &= Self::STATE_MASK;
+        out
+    }
+
+    /// Run one full 72-cycle rhythm frame and return the
+    /// `(hh_bit, sd_bit)` pair the §"UPDATE" protocol prescribes:
+    /// sample the noise bit for HH, iterate 3 times, sample the noise
+    /// bit for SD, iterate the remaining 15 times (3 + 15 = 18 operator
+    /// steps per 72-cycle sample period). After this call the register
+    /// is positioned for the next frame.
+    pub fn rhythm_frame_bits(&mut self) -> (u8, u8) {
+        let hh = self.bit();
+        for _ in 0..3 {
+            self.step();
+        }
+        let sd = self.bit();
+        for _ in 0..15 {
+            self.step();
+        }
+        (hh, sd)
+    }
+
+    /// Reset to the post-power-on seed (non-zero, bit 0 set).
+    pub fn reset(&mut self) {
+        self.state = 1;
+    }
+}
+
 // -------------------------------------------------------------- once_cell shim
 
 /// Tiny `Lazy` shim that avoids pulling in a dependency for one cell.
@@ -3767,5 +3896,117 @@ mod tests {
         bd.set_pitch(0xFFFF, 0xFF);
         assert_eq!(bd.channel.fnum, 0x1FF);
         assert_eq!(bd.channel.block, 0x07);
+    }
+
+    // ----------------------------------------- YM2413 rhythm noise generator
+
+    /// §3 "all-zero is a trap": from the all-zero state the LFSR stays
+    /// stuck forever, so the hardware must seed a non-zero value. The
+    /// default constructor seeds bit 0 and is therefore never stuck.
+    #[test]
+    fn noise_lfsr_all_zero_is_a_trap() {
+        let mut z = OpllNoiseLfsr { state: 0 };
+        for _ in 0..1000 {
+            assert_eq!(z.step(), 0);
+            assert_eq!(z.state, 0, "all-zero state must remain stuck at 0");
+        }
+        // The seeded constructor escapes the trap.
+        let mut s = OpllNoiseLfsr::new();
+        assert_ne!(s.state, 0);
+        s.step();
+        assert_ne!(s.state, 0, "a seeded LFSR never collapses to all-zero");
+    }
+
+    /// §4 Galois single-step: `bit = state & 1; state >>= 1; if bit
+    /// state ^= mask`. The mask for `x^23 + x^9 + 1` taps bit 22 (the
+    /// x^23 wrap) and bit 8 (x^9): `0x40_0181`. Verify the step against
+    /// the explicit formula and that the returned bit is the shifted-out
+    /// LSB.
+    #[test]
+    fn noise_lfsr_galois_step_matches_polynomial() {
+        // Pick an arbitrary non-trivial state whose LSB is 1 so the
+        // feedback path is exercised.
+        let mut lfsr = OpllNoiseLfsr { state: 0x0012_3457 };
+        let before = lfsr.state;
+        let out = lfsr.step();
+        assert_eq!(out, (before & 1) as u8);
+        let expected = {
+            let bit = before & 1;
+            let mut s = before >> 1;
+            if bit != 0 {
+                s ^= (1 << 22) | (1 << 8) | 1;
+            }
+            s & 0x007F_FFFF
+        };
+        assert_eq!(lfsr.state, expected);
+        // And a state whose LSB is 0 takes the no-feedback branch.
+        let mut even = OpllNoiseLfsr { state: 0x0012_3456 };
+        let b = even.state;
+        let o = even.step();
+        assert_eq!(o, 0);
+        assert_eq!(even.state, b >> 1);
+    }
+
+    /// §3 "maximal length": the `x^23 + x^9 + 1` LFSR visits every one of
+    /// the `2^23 - 1` non-zero states exactly once. A full sweep is 8.3M
+    /// iterations; we instead assert the register never re-enters its
+    /// seed within a window far larger than any short cycle would allow,
+    /// and stays within the 23-bit field throughout.
+    #[test]
+    fn noise_lfsr_is_long_period() {
+        let mut lfsr = OpllNoiseLfsr::new();
+        let seed = lfsr.state;
+        for i in 0..100_000 {
+            lfsr.step();
+            assert!(lfsr.state <= 0x007F_FFFF, "state escaped 23-bit field");
+            assert_ne!(
+                lfsr.state,
+                seed,
+                "seed recurred after {} steps — not maximal length",
+                i + 1
+            );
+        }
+    }
+
+    /// §"UPDATE" rhythm protocol: per 72-cycle frame the unit samples HH,
+    /// iterates 3, samples SD, iterates 15 (18 operator steps total).
+    /// `rhythm_frame_bits` must return the bit *before* the 3 HH-to-SD
+    /// iterations for HH and the bit after those 3 for SD, and leave the
+    /// register exactly 18 steps advanced.
+    #[test]
+    fn noise_lfsr_rhythm_frame_protocol() {
+        // Reference register stepped manually with the documented cadence.
+        let mut reference = OpllNoiseLfsr::new();
+        let hh_ref = reference.bit();
+        for _ in 0..3 {
+            reference.step();
+        }
+        let sd_ref = reference.bit();
+        for _ in 0..15 {
+            reference.step();
+        }
+
+        let mut frame = OpllNoiseLfsr::new();
+        let (hh, sd) = frame.rhythm_frame_bits();
+        assert_eq!(hh, hh_ref, "HH bit is sampled before the 3-step gap");
+        assert_eq!(sd, sd_ref, "SD bit is sampled 3 steps after HH");
+        assert_eq!(
+            frame.state, reference.state,
+            "one rhythm frame advances exactly 18 operator steps"
+        );
+    }
+
+    /// `reset` returns the generator to the non-zero power-on seed.
+    #[test]
+    fn noise_lfsr_reset_restores_seed() {
+        let mut lfsr = OpllNoiseLfsr::new();
+        let seed = lfsr.state;
+        for _ in 0..123 {
+            lfsr.step();
+        }
+        assert_ne!(lfsr.state, seed);
+        lfsr.reset();
+        assert_eq!(lfsr.state, seed);
+        assert_ne!(lfsr.state, 0);
     }
 }

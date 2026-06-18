@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- OPLL rhythm: YM2413 rhythm-channel pseudo-random **noise generator**
+  (`opll::OpllNoiseLfsr`). The HH + SD percussion voices mix a noise
+  source into their phase generators; per the independent silicon-RE
+  measurement in
+  `docs/audio/nsf/opll-ym2413/ym2413-noise-lfsr-andete-2018-05-13.txt`
+  that source is a 23-bit maximal-length LFSR with polynomial
+  `x^23 + x^9 + 1` (recovered repeatably by Berlekamp-Massey from the
+  toggling-phase tail of the F-Num-0 snare-drum capture). The type
+  encodes the measured hardware facts: the Galois single-operator step
+  (`bit = state & 1; state >>= 1; if bit state ^= 0x40_0181`), the
+  all-zero trap (a 0 state stays stuck — the chip must seed non-zero;
+  `new()` seeds bit 0), the `2^23 - 1` maximal period, and the
+  §"UPDATE" per-72-cycle rhythm-frame tap protocol (`rhythm_frame_bits`
+  samples HH, iterates 3, samples SD, iterates 15 — 18 operator steps
+  total). This is the shared noise source the §V-4 noise-mixed phase
+  generators for HH/SD/TOM/TOP-CYM consume; their per-instrument phase
+  formulas remain a docs gap (round 331)
+
 - N163: multi-channel mixing per §"Mixing" of
   `docs/audio/nsf/namco-163-audio-wiki.html`. The chip time-multiplexes
   a single DAC across the active channels at the channel-update rate;
