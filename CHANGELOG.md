@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- OPLL tests: add **per-channel synthesis property tests** that validate
+  the §8a/§8b LFO depth tables on the live `OpllChannel::sample_with_test`
+  path (not just the bare table readers). A keyed-on full-volume carrier
+  is rendered with AM/VIB enabled: `am_depth_on_synthesis_path_*` asserts
+  the carrier peak dips by the measured ≈ 4.8 dB between the AM trough
+  (level 0) and crest (level 13); `am_enabled_modulates_peak_across_period`
+  asserts the peak is LFO-phase-invariant with AM off and modulated with
+  AM on; `vib_enabled_sweeps_phase_rate_on_synthesis_path` asserts the
+  carrier's per-sample phase increment is larger at the §8b sharp column
+  (2) than the flat column (6) and constant with VIB off.
+
 - OPLL envelope: stage the **silicon-measured §7 EG rate-increment
   model** (`opll::EG_SELECT_TABLE`, `EG_HIGHRATE_TABLE`,
   `eg_decay_advance`). The YM2413 EG has 128 levels (0.375 dB each — the

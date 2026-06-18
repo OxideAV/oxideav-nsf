@@ -997,12 +997,14 @@ pub struct Operator {
     /// Half-rectify waveform bit (DC/DM, 0 = full sine, 1 = half).
     pub half_rect: bool,
     /// AM (tremolo) enable — the operator's `$00`/`$01` D7 bit. When
-    /// set, the chip-wide tremolo LFO adds a 0..1.0 dB attenuation
-    /// (§7) on top of the operator's other attenuation sources.
+    /// set, the chip-wide tremolo LFO adds the §8a [`AM_LFO_LEVELS`]
+    /// attenuation (0 .. ≈ 4.8 dB) on top of the operator's other
+    /// attenuation sources.
     pub am: bool,
     /// VIB (vibrato) enable — the operator's `$00`/`$01` D6 bit. When
     /// set, the chip-wide vibrato LFO sweeps this operator's phase
-    /// increment by ±7 cents (§7).
+    /// increment by the §8b [`VIB_PM_TABLE`] phase-modulation (≈ ±14
+    /// cents at the top of the pitch range).
     pub vib: bool,
 }
 
@@ -1975,10 +1977,10 @@ impl OpllChannel {
     ///   faster). Handled by [`Lfo::tick`] upstream.
     ///
     /// `lfo` is the chip-wide AM/VIB low-frequency oscillator. Its
-    /// triangle-mapped depth — §7 1.0 dB amplitude modulation
-    /// (tremolo) / ±7-cent pitch modulation (vibrato) — is applied per
-    /// operator when that operator's [`Operator::am`] / [`Operator::vib`]
-    /// bit is set.
+    /// silicon-measured depth — §8a amplitude modulation (the 14-level
+    /// [`AM_LFO_LEVELS`] triangle, ≈ 4.8 dB peak) / §8b phase modulation
+    /// (the [`VIB_PM_TABLE`] sweep) — is applied per operator when that
+    /// operator's [`Operator::am`] / [`Operator::vib`] bit is set.
     pub fn sample_with_test(&mut self, test: &TestRegister, lfo: &Lfo) -> i32 {
         // Phase generator base rate. The VRC7 vrcvii doc gives:
         //   F = 49722 * fnum / 2^(19 - block)  Hz
@@ -4551,5 +4553,201 @@ mod tests {
         lfsr.reset();
         assert_eq!(lfsr.state, seed);
         assert_ne!(lfsr.state, 0);
+    }
+
+    // --------------------------------------------- §8a/§8b synthesis property
+
+    /// Build a keyed-on OPLL channel producing a steady full-volume
+    /// carrier tone (fast attack, sustained envelope, no modulator
+    /// feedback / TL), with the carrier's AM/VIB bits set per the args.
+    /// The carrier is driven directly (mul=1) so it behaves like a near-
+    /// pure sine for the property measurements below.
+    fn steady_carrier_channel(am: bool, vib: bool) -> OpllChannel {
+        let mut ch = OpllChannel {
+            fnum: 0x100,
+            block: 4,
+            volume: 0, // loudest
+            ..OpllChannel::default()
+        };
+        // Modulator silenced (TL max) so the carrier is the only voice.
+        ch.modulator.mul = 1;
+        ch.modulator.tl = 63;
+        ch.modulator.env.load_from_patch(15, 0, 0, 15, true); // instant attack, hold
+                                                              // Carrier: fast attack, sustained tone, AM/VIB per request.
+        ch.carrier.mul = 1;
+        ch.carrier.am = am;
+        ch.carrier.vib = vib;
+        ch.carrier.env.load_from_patch(15, 0, 0, 15, true);
+        ch.refresh_rks();
+        ch.trigger_key_on();
+        // Settle the attack so the carrier reaches full amplitude.
+        for _ in 0..64 {
+            let _ = ch.sample();
+        }
+        ch
+    }
+
+    /// Render a channel for `n` samples (advancing the supplied LFO each
+    /// sample) and return the peak absolute carrier amplitude.
+    fn peak_over(ch: &mut OpllChannel, lfo: &mut Lfo, fast: bool, n: usize) -> i32 {
+        let mut peak = 0;
+        let test = TestRegister::default();
+        for _ in 0..n {
+            let s = ch.sample_with_test(&test, lfo).abs();
+            peak = peak.max(s);
+            lfo.tick(false, fast);
+        }
+        peak
+    }
+
+    /// §8a synthesis property: an AM-enabled carrier's peak amplitude
+    /// dips by the silicon-measured ≈ 4.8 dB between the AM trough
+    /// (level 0) and crest (level 13), on the live synthesis path. We
+    /// hold the LFO at each extreme and compare the rendered peaks.
+    #[test]
+    fn am_depth_on_synthesis_path_is_measured_4p8_db() {
+        // Trough: LFO phase 0 → AM level 0 → no extra attenuation.
+        let mut trough = steady_carrier_channel(true, false);
+        let mut lfo0 = Lfo::default();
+        let peak_trough = peak_over(&mut trough, &mut lfo0, false, 256);
+
+        // Crest: advance a fresh LFO (fast clock) to the AM peak level
+        // (13), then hold there by re-reading the same phase. We find a
+        // tremolo_phase whose table entry is 13.
+        let crest_phase = AM_LFO_LEVELS.iter().position(|&l| l == 13).unwrap() as u32;
+        let mut crest = steady_carrier_channel(true, false);
+        let mut lfo_crest = Lfo {
+            tremolo_phase: crest_phase,
+            ..Lfo::default()
+        };
+        assert_eq!(lfo_crest.tremolo_am_level(true), 13, "set LFO to AM crest");
+        // Render without advancing the LFO phase (divider keeps it on
+        // the crest table entry for the whole window).
+        let test = TestRegister::default();
+        let mut peak_crest = 0;
+        for _ in 0..256 {
+            peak_crest = peak_crest.max(crest.sample_with_test(&test, &lfo_crest).abs());
+            // Keep the phase pinned on the crest entry.
+            lfo_crest.tremolo_phase = crest_phase;
+        }
+
+        assert!(peak_trough > 0 && peak_crest > 0, "carrier produced audio");
+        assert!(
+            peak_crest < peak_trough,
+            "AM crest ({peak_crest}) should attenuate below trough ({peak_trough})"
+        );
+        // Depth in dB: 20*log10(crest/trough) ≈ -4.8 dB. Allow a modest
+        // band for quantisation in the 4-bit-dropped exp output.
+        let depth_db = 20.0 * (peak_crest as f64 / peak_trough as f64).log10();
+        assert!(
+            (-5.6..=-4.0).contains(&depth_db),
+            "AM depth {depth_db:.2} dB outside the measured ≈4.8 dB band \
+             (trough peak {peak_trough}, crest peak {peak_crest})"
+        );
+    }
+
+    /// §8a synthesis property: with AM disabled the carrier peak is
+    /// constant regardless of the LFO phase (no tremolo), but with AM
+    /// enabled the peak amplitude is modulated by it (the tremolo is
+    /// audible). Peaks are measured over a 256-sample window with the
+    /// LFO held at a fixed AM level.
+    #[test]
+    fn am_enabled_modulates_peak_across_period() {
+        let test = TestRegister::default();
+        let crest_phase = AM_LFO_LEVELS.iter().position(|&l| l == 13).unwrap() as u32;
+        // Peak over a window with the tremolo phase pinned to `phase`.
+        let peak_pinned = |am: bool, phase: u32| -> i32 {
+            let mut ch = steady_carrier_channel(am, false);
+            let lfo = Lfo {
+                tremolo_phase: phase,
+                ..Lfo::default()
+            };
+            let mut peak = 0;
+            for _ in 0..256 {
+                peak = peak.max(ch.sample_with_test(&test, &lfo).abs());
+            }
+            peak
+        };
+
+        // AM off: peak identical at trough phase and crest phase.
+        assert_eq!(
+            peak_pinned(false, 0),
+            peak_pinned(false, crest_phase),
+            "AM-disabled carrier ignores the LFO phase"
+        );
+
+        // AM on: crest phase attenuates the peak below the trough phase.
+        let p_on_trough = peak_pinned(true, 0);
+        let p_on_crest = peak_pinned(true, crest_phase);
+        assert!(
+            p_on_crest < p_on_trough,
+            "AM-enabled carrier is modulated by the LFO phase \
+             (trough {p_on_trough}, crest {p_on_crest})"
+        );
+    }
+
+    /// §8b synthesis property: a VIB-enabled carrier's phase advances at
+    /// a different rate at the vibrato sweep extremes (columns 2 and 6 of
+    /// the top F-Number row), proving the §8b table drives the live
+    /// phase-step. With VIB off the phase rate is constant.
+    #[test]
+    fn vib_enabled_sweeps_phase_rate_on_synthesis_path() {
+        // fnum 0x1c0 → fnum>>6 = 7 (the largest-sweep row).
+        let make = |vib: bool| -> OpllChannel {
+            let mut ch = OpllChannel {
+                fnum: 0x1c0,
+                block: 6,
+                volume: 0,
+                ..OpllChannel::default()
+            };
+            ch.modulator.mul = 1;
+            ch.modulator.tl = 63;
+            ch.modulator.env.load_from_patch(15, 0, 0, 15, true);
+            ch.carrier.mul = 1;
+            ch.carrier.vib = vib;
+            ch.carrier.env.load_from_patch(15, 0, 0, 15, true);
+            ch.refresh_rks();
+            ch.trigger_key_on();
+            ch
+        };
+        // Measure the carrier phase increment over one sample at the
+        // positive-peak vibrato column (2) vs the negative-peak (6).
+        let phase_inc_at = |col: u32| -> u32 {
+            let mut ch = make(true);
+            let lfo = Lfo {
+                vibrato_phase: col,
+                ..Lfo::default()
+            };
+            let before = ch.carrier.phase_acc;
+            let _ = ch.sample_with_test(&TestRegister::default(), &lfo);
+            ch.carrier.phase_acc.wrapping_sub(before)
+        };
+        let inc_sharp = phase_inc_at(2); // +7 correction
+        let inc_flat = phase_inc_at(6); // -7 correction
+        assert!(
+            inc_sharp > inc_flat,
+            "vibrato column 2 (sharp, {inc_sharp}) must exceed column 6 (flat, {inc_flat})"
+        );
+        // VIB off: the increment is the same regardless of LFO column.
+        let mut off = make(false);
+        let lfo_a = Lfo {
+            vibrato_phase: 2,
+            ..Lfo::default()
+        };
+        let before_a = off.carrier.phase_acc;
+        let _ = off.sample_with_test(&TestRegister::default(), &lfo_a);
+        let inc_a = off.carrier.phase_acc.wrapping_sub(before_a);
+        let mut off2 = make(false);
+        let lfo_b = Lfo {
+            vibrato_phase: 6,
+            ..Lfo::default()
+        };
+        let before_b = off2.carrier.phase_acc;
+        let _ = off2.sample_with_test(&TestRegister::default(), &lfo_b);
+        let inc_b = off2.carrier.phase_acc.wrapping_sub(before_b);
+        assert_eq!(
+            inc_a, inc_b,
+            "VIB-disabled carrier has a constant phase rate"
+        );
     }
 }
