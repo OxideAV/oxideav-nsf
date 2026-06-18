@@ -687,6 +687,111 @@ pub struct Envelope {
 /// log-sin maximum of 2137, ensuring silence.
 pub const ENV_MAX_LEVEL: u32 = 127;
 
+// ----------------------------------------------------- §7 EG rate-increment
+
+/// The four §7 `eg_select` increment patterns (8 entries each), selected
+/// by `eg_select = rate & 3`. Each entry is the number of EG levels to
+/// advance on the samples where the global counter's `eg_shift` window
+/// rolls over — duty `4/8`, `5/8`, `6/8`, `7/8` respectively.
+///
+/// Source:
+/// `docs/audio/nsf/opll-ym2413/tables/envelope-rate-increment.csv` (§7
+/// of `opll-ym2413-tables.md`, #138) — andete RE notes 2015-03-20.
+/// Independent silicon RE: decay rates 4,9,14,19,48,49,50,51 and the
+/// `{1024,1024,2048}`-sample segment pattern were measured directly on a
+/// real YM2413. (andete also *corrected* the Burczynski emulator's
+/// 256-level count — the YM2413 has 128 EG levels.)
+pub const EG_SELECT_TABLE: [[u8; 8]; 4] = [
+    [0, 1, 0, 1, 0, 1, 0, 1], // eg_select 0 — 4/8
+    [0, 1, 0, 1, 1, 1, 0, 1], // eg_select 1 — 5/8
+    [0, 1, 1, 1, 0, 1, 1, 1], // eg_select 2 — 6/8
+    [0, 1, 1, 1, 1, 1, 1, 1], // eg_select 3 — 7/8
+];
+
+/// §7 high-rate correction tables for effective decay/release rates
+/// **52..=59**, indexed by `(global_counter >> eg_shift) & 15`. A value
+/// of `2` means the EG advances two levels in that sample. andete
+/// measured that the generic 8-entry algorithm does **not** match real
+/// silicon for these rates (the generic `eg_shift` goes negative for
+/// rate ≥ 56); these 16-entry tables reproduce the captured behaviour.
+///
+/// Row index is `rate - 52` (so row 0 = rate 52 … row 7 = rate 59).
+///
+/// Source:
+/// `docs/audio/nsf/opll-ym2413/tables/envelope-rate-increment-highrate.csv`
+/// (§7 of `opll-ym2413-tables.md`, #138) — andete RE notes 2015-03-20.
+/// Independent silicon RE that **corrects** the emulator model (e.g.
+/// rate 54 shows the measured `2,2,1,1,1,1` transition detail).
+pub const EG_HIGHRATE_TABLE: [[u8; 16]; 8] = [
+    [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1], // 52
+    [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1], // 53
+    [0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1], // 54
+    [0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // 55
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // 56
+    [2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // 57
+    [2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1], // 58
+    [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1], // 59
+];
+
+/// §7 decay / release EG-level advance for one output sample, given the
+/// 6-bit effective `rate` (0..=63) and the shared chip-wide
+/// `global_counter` value **after** its per-sample increment.
+///
+/// Returns the number of EG levels (`0`, `1`, or `2`) to add to the
+/// operator's attenuation this sample. Release behaves identically to
+/// decay. Per `tables/envelope-rate-increment.csv` (§7, #138):
+///
+/// * `rate <= 3`: never advance (returns 0).
+/// * `rate >= 60`: advance `+2` every sample (the table's "rates 60..63
+///   decay/release +2 levels each sample").
+/// * `52..=59`: indexed via the 16-entry [`EG_HIGHRATE_TABLE`]
+///   (`(global_counter >> eg_shift) & 15`, with `eg_shift = 13 -
+///   rate/4`, here `0` or negative → 16-window).
+/// * otherwise: `eg_shift = 13 - rate/4`, `eg_select = rate & 3`, and
+///   the advance is [`EG_SELECT_TABLE`]`[eg_select][(global_counter >>
+///   eg_shift) & 7]`.
+///
+/// The advance is consulted **only on the samples where the
+/// `eg_shift`-windowed counter rolls over** — i.e. when
+/// `(global_counter >> eg_shift)` changes after the per-sample
+/// increment, which (since the counter is incremented by 1 each sample)
+/// is exactly the samples whose low `eg_shift` bits are zero. On all
+/// other samples the EG holds. The `0`-entries in the duty pattern then
+/// thin those rollover events down to the measured 4/8…7/8 duty. (For
+/// rates ≥ 52, `eg_shift ≤ 0`, so every sample is a "rollover".)
+///
+/// The worked example (decay rate 14 → `eg_shift = 10` → a rollover
+/// every 1024 samples, `eg_select = 2` = 6/8 duty → repeating segment
+/// lengths `1024, 1024, 2048` samples) is reproduced bit-exact by a
+/// test.
+#[inline]
+pub fn eg_decay_advance(rate: u8, global_counter: u32) -> u8 {
+    if rate <= 3 {
+        return 0;
+    }
+    if rate >= 60 {
+        return 2;
+    }
+    if (52..=59).contains(&rate) {
+        // eg_shift = 13 - rate/4 is 0 for 52..55 and negative for
+        // 56..59; the measured 16-entry window uses the low 4 bits of
+        // the counter directly (every sample is a rollover here).
+        let eg_shift = 13i32 - (rate as i32) / 4;
+        let shift = eg_shift.max(0) as u32;
+        let idx = ((global_counter >> shift) & 15) as usize;
+        return EG_HIGHRATE_TABLE[(rate - 52) as usize][idx];
+    }
+    let eg_shift = 13 - (rate / 4);
+    // Hold on every sample except the one that rolls the eg_shift window
+    // (low eg_shift bits all zero after the per-sample increment).
+    if global_counter & ((1u32 << eg_shift) - 1) != 0 {
+        return 0;
+    }
+    let eg_select = (rate & 3) as usize;
+    let idx = ((global_counter >> eg_shift) & 7) as usize;
+    EG_SELECT_TABLE[eg_select][idx]
+}
+
 impl Envelope {
     /// Integer attenuation level (0..=127).
     #[inline]
@@ -3808,6 +3913,70 @@ mod tests {
         }
         // The 64th tick advances to the next table entry.
         assert_eq!(slow.tremolo_am_level(true), AM_LFO_LEVELS[1]);
+    }
+
+    /// §7 EG rate-increment: the four `eg_select` duty patterns have the
+    /// documented 4/8, 5/8, 6/8, 7/8 advance counts, and the high-rate
+    /// 16-entry tables advance up to 2 levels per sample.
+    #[test]
+    fn eg_rate_increment_tables_match_silicon() {
+        let duties = [4u8, 5, 6, 7];
+        for (sel, &duty) in duties.iter().enumerate() {
+            let advances: u8 = EG_SELECT_TABLE[sel].iter().sum();
+            assert_eq!(advances, duty, "eg_select {sel} duty");
+        }
+        // High-rate tables: rate 54 shows the measured 2,2,1,1,1,1 detail
+        // on the first six rolling windows; rate 59 advances 2 levels for
+        // the first twelve windows then 1.
+        assert_eq!(EG_HIGHRATE_TABLE[54 - 52][..6], [0, 1, 0, 1, 1, 1]);
+        let r59_twos = EG_HIGHRATE_TABLE[59 - 52]
+            .iter()
+            .filter(|&&v| v == 2)
+            .count();
+        assert_eq!(r59_twos, 12, "rate 59 advances 2 for twelve windows");
+    }
+
+    /// §7 worked example: decay rate 14 → `eg_shift = 10` (a rollover
+    /// window of 1024 samples), `eg_select = 2` (6/8 duty) → the EG
+    /// advances exactly one level on six of every eight 1024-sample
+    /// windows, producing the silicon-measured repeating segment lengths
+    /// `2048, 1024, 1024` (`ym2413-envelope-decay-rates-andete-2015-03-20.txt`).
+    #[test]
+    fn eg_decay_advance_reproduces_rate14_segments() {
+        let rate = 14u8;
+        // Walk the global counter and record the sample distance between
+        // successive EG-level advances over one full 8-window cycle.
+        let mut last_advance: Option<u32> = None;
+        let mut segments = Vec::new();
+        for counter in 1..=(16u32 * 1024) {
+            if eg_decay_advance(rate, counter) > 0 {
+                if let Some(prev) = last_advance {
+                    segments.push(counter - prev);
+                }
+                last_advance = Some(counter);
+            }
+        }
+        // The 6/8 duty pattern [0,1,1,1,0,1,1,1] over eight 1024-sample
+        // windows yields inter-advance gaps repeating "1024,1024,2048"
+        // (the §7 doc's measured pattern; the phase at which we start
+        // sampling determines the rotation).
+        assert_eq!(&segments[..6], &[1024, 1024, 2048, 1024, 1024, 2048]);
+    }
+
+    /// §7 boundary behaviour: rate ≤ 3 never advances; rate ≥ 60 advances
+    /// +2 every sample.
+    #[test]
+    fn eg_decay_advance_rate_extremes() {
+        for rate in 0..=3 {
+            for counter in 0..2048 {
+                assert_eq!(eg_decay_advance(rate, counter), 0, "rate {rate} halts");
+            }
+        }
+        for rate in 60..=63 {
+            for counter in 0..256 {
+                assert_eq!(eg_decay_advance(rate, counter), 2, "rate {rate} +2/sample");
+            }
+        }
     }
 
     /// A held LFO (`$0F` bit 1) pins the phase at 0, so the audible AM

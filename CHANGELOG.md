@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- OPLL envelope: stage the **silicon-measured §7 EG rate-increment
+  model** (`opll::EG_SELECT_TABLE`, `EG_HIGHRATE_TABLE`,
+  `eg_decay_advance`). The YM2413 EG has 128 levels (0.375 dB each — the
+  datasheet's "0.325 dB" is a measured typo) advanced by a shared
+  chip-wide global counter: `eg_shift = 13 - rate/4`, `eg_select = rate &
+  3` picks one of four duty patterns (4/8, 5/8, 6/8, 7/8), and the EG
+  advances only on the samples where the `eg_shift`-windowed counter
+  rolls over. Effective rates 52..=59 use 16-entry high-rate tables that
+  andete found **correct the emulator model** (e.g. rate 54's measured
+  `2,2,1,1,1,1` detail). The §7 worked example — decay rate 14 →
+  `eg_shift = 10`, 6/8 duty → repeating segment lengths `1024, 1024,
+  2048` samples — is reproduced bit-exact by a test
+  (`docs/audio/nsf/opll-ym2413/ym2413-envelope-decay-rates-andete-2015-03-20.txt`,
+  `tables/envelope-rate-increment*.csv`, §7 #138). The model is landed as
+  validated public building blocks; wiring it into `Envelope::step` (the
+  per-call chip-wide counter threading) is a tracked followup.
+
 - OPLL AM: the per-operator amplitude modulation (tremolo) now uses the
   **silicon-measured §8a AM waveform table** instead of the earlier
   1.0 dB linear-triangle approximation. `opll::AM_LFO_LEVELS` is the
