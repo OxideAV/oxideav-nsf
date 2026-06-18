@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- OPLL VIB: the per-operator vibrato (frequency modulation) now uses the
+  **silicon-measured §8b phase-modulation table** instead of the earlier
+  cents-scaled triangle approximation. `opll::VIB_PM_TABLE` is the exact
+  8×8 integer `pmTable[fnum>>6][counter>>10]` andete independently
+  confirmed on real hardware
+  (`docs/audio/nsf/opll-ym2413/ym2413-vib-lfo-andete-2015-12-01.txt`,
+  `tables/vib-lfo-pm.csv`): the top three F-Number bits select a row and
+  the vibrato phase (one column per 1024 samples, 8192-sample period ≈
+  6.07 Hz) selects a column. `Lfo::vibrato_pm` reads it and
+  `Operator::step_phase_pm` folds the signed correction into the exact
+  phase-step `(((2*fnum + lfo_pm) * mlTab[ML]) << block) >> 2`. The
+  per-sample synthesis path (`OpllChannel::sample_with_test`) now drives
+  both operators through this formula; with VIB clear it reduces exactly
+  to the prior `((fnum * mlTab[ML]) << block) >> 1` step. The §8b worked
+  example (`fnum=0x1c0, block=6, ML=1` → step sizes
+  `28672,28768,28896,28768,28672,28576,28448,28576`) is reproduced
+  bit-exact by a test. The legacy `vibrato_pitch_offset_q` /
+  `apply_vibrato` cents helpers remain as public utilities but are no
+  longer on the synthesis path.
+
 - OPLL rhythm: YM2413 rhythm-channel pseudo-random **noise generator**
   (`opll::OpllNoiseLfsr`). The HH + SD percussion voices mix a noise
   source into their phase generators; per the independent silicon-RE

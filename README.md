@@ -67,9 +67,13 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     per-RATE attack/decay/release step magnitudes (from the YM2413
     Application Manual Table III-7), KSR + KSL attenuation (Tables
     III-2 / III-5), the `$0F` test register, `$E000` audio reset, the
-    audible AM/VIB LFO (the §7 1.0 dB tremolo / ±7-cent vibrato
-    physical depths mapped through a triangle onto each operator's
-    `$00`/`$01` AM / VIB bit), rhythm-mode register decoding, and
+    audible AM/VIB LFO — the VIB (vibrato) sweep now applies the
+    **silicon-measured §8b 8×8 phase-modulation table** (`VIB_PM_TABLE`,
+    indexed `pmTable[fnum>>6][vib_phase]`) through the exact phase-step
+    `(((2*fnum + lfo_pm) * mlTab[ML]) << block) >> 2`, and the AM
+    (tremolo) uses the §8a 1.0 dB physical depth via a triangle, each on
+    its operator's `$00`/`$01` AM / VIB bit — rhythm-mode register
+    decoding, and
     bass-drum (BD) rhythm synthesis (`RhythmBassDrum`) — the §V-4
     two-slot FM pair on channel 7, keyed from the `$0E` BD bit, with
     the §III-4 percussion ×2 DAC doubling. The shared rhythm **noise
@@ -100,12 +104,14 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   DMC CPU-stall accounting); envelope tick timers are stepped in
   CPU-cycle batches — adequate for music, not cycle-exact.
-* OPLL §7 AM/VIB LFO *exact* numeric depth step arrays — these stay a
-  documented DOCS-GAP (the §7 provenance appendix cites them to
-  silicon-RE primary sources and keeps the emulator arrays out of the
-  repo). The LFO is now audible via the documented *physical* depths
-  (1.0 dB tremolo / ±7-cent vibrato) mapped through a triangle, which
-  is the correct macro behaviour but not a per-step bit-match.
+* OPLL AM (tremolo) *exact* numeric depth step array — the §8a AM
+  triangle is applied via the documented *physical* 1.0 dB depth mapped
+  through a triangle (correct macro behaviour, not yet a per-step
+  bit-match against the `am-lfo-triangle.csv` 14-level schedule). The
+  VIB (vibrato) path is now bit-exact: it drives the silicon-measured
+  §8b `VIB_PM_TABLE` through the exact integer phase-step formula
+  (validated against the andete worked example, step sizes
+  `28672…28448…28576`).
 * The VRC7 rhythm *synthesis* path for HH/SD/TOM/TOP-CYM (BD is now
   synthesised as the §V-4 two-slot FM pair, and the shared noise LFSR
   the §V-4 noise-mixed phase generator consumes is now pinned as

@@ -917,6 +917,40 @@ impl Operator {
         self.phase_acc = self.phase_acc.wrapping_add(inc) & (modulus - 1);
     }
 
+    /// Step the operator phase generator by one sample using the
+    /// silicon-measured §8b **vibrato phase-step formula** (the exact
+    /// integer form, not the cents approximation):
+    ///
+    /// ```text
+    ///   phase-step = (((2 * fnum + lfo_pm) * mlTab[ML]) << block) >> 2
+    /// ```
+    ///
+    /// where `mlTab[ML]` is [`MUL_TIMES_TWO`] and `lfo_pm` is the signed
+    /// VIB correction from [`Lfo::vibrato_pm`] / [`VIB_PM_TABLE`]
+    /// (`docs/audio/nsf/opll-ym2413/ym2413-vib-lfo-andete-2015-12-01.txt`,
+    /// §8b). With `lfo_pm == 0` this reduces to
+    /// `((fnum * mlTab[ML]) << block) >> 1` — i.e. exactly
+    /// [`Self::step_phase`] with `fnum_block = fnum << block` — so a
+    /// VIB-disabled operator advances identically to the un-swept path.
+    ///
+    /// `fnum` is the channel's **raw 9-bit F-Number** (NOT pre-shifted by
+    /// `block`); the formula folds in `block` itself, matching the
+    /// silicon's `(... << block)` ordering so the `>> 2` truncation
+    /// happens after the block shift exactly as measured.
+    #[inline]
+    pub fn step_phase_pm(&mut self, fnum: u32, block: u32, lfo_pm: i32) {
+        let ml = MUL_TIMES_TWO[self.mul as usize & 0x0F] as i64;
+        // `2 * fnum + lfo_pm` can be negative only if lfo_pm pushed it
+        // below zero, which the §8b table never does (|lfo_pm| <= 7 and
+        // the formula is only used with the channel's actual fnum, where
+        // 2*fnum >= 0); compute in i64 then clamp non-negative for
+        // safety before the unsigned phase add.
+        let two_fnum_pm = 2 * fnum as i64 + lfo_pm as i64;
+        let inc = (((two_fnum_pm * ml) << block) >> 2).max(0) as u32;
+        let modulus = PHASE_STEPS_PER_PERIOD << PHASE_ACC_FRAC_BITS;
+        self.phase_acc = self.phase_acc.wrapping_add(inc) & (modulus - 1);
+    }
+
     /// 10-bit phase index for the sine table, with an optional
     /// modulation offset applied (the modulator's previous output
     /// shifted by `feedback_shift(fb)` is added to the modulator's
@@ -1058,13 +1092,23 @@ pub const TREMOLO_PEAK_ENV_LEVELS: u32 = 5;
 /// `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F" (bit 1
 /// hold-and-reset, bit 3 fast-update) and §"Audio Reset ($E000)"
 /// (tremolo phase cleared, vibrato phase preserved) — **and** the
-/// phase→depth translation. The translation does not reproduce the
-/// provenance-pending emulator depth *step arrays* (§7 appendix of
-/// `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md`); instead it
-/// maps the free-running phase through a triangle scaled to the §7
-/// *physical* depths — 1.0 dB AM peak ([`Lfo::tremolo_atten_env_levels`])
-/// and ±7-cent VIB peak ([`Lfo::vibrato_pitch_offset_q`]) — both of
-/// which are documented physical quantities, not lifted constants.
+/// phase→depth translation.
+///
+/// The VIB (vibrato) depth is the **silicon-measured §8b
+/// phase-modulation table** ([`Lfo::vibrato_pm`] → [`VIB_PM_TABLE`],
+/// `docs/audio/nsf/opll-ym2413/ym2413-vib-lfo-andete-2015-12-01.txt`):
+/// the free-running [`Self::vibrato_phase`] selects a column and the
+/// channel's top three F-Number bits select a row, yielding the exact
+/// integer `lfo_pm` the chip folds into its phase-step generator. This
+/// is the measurement-confirmed hardware form, not the earlier
+/// cents-scaled approximation. (The legacy [`Lfo::vibrato_pitch_offset_q`]
+/// / [`apply_vibrato`] cents path is retained as a public utility but is
+/// no longer on the per-sample synthesis path.)
+///
+/// The AM (tremolo) depth still maps the free-running phase through a
+/// triangle scaled to the §8a *physical* 1.0 dB peak
+/// ([`Lfo::tremolo_atten_env_levels`]), a documented physical quantity
+/// rather than a lifted constant.
 ///
 /// The two phases are independent free-running step counters
 /// (`u32`), folded modulo [`TREMOLO_PHASE_PERIOD`] /
@@ -1233,7 +1277,65 @@ impl Lfo {
         // documented ±7-cent depth (no emulator constant).
         (centred * VIBRATO_PEAK_OFFSET_Q) / half
     }
+
+    /// Silicon-measured VIB phase-modulation correction `lfo_pm`, the
+    /// signed integer the §8b [`VIB_PM_TABLE`] adds to the phase-step
+    /// generator's `2 * fnum` term (see [`Operator::step_phase_pm`]).
+    ///
+    /// `fnum_hi3` is the **top three bits of the channel's 9-bit
+    /// F-Number** (`fnum >> 6`, 0..=7); it selects the table row. The
+    /// current [`Self::vibrato_phase`] (advanced once per
+    /// [`VIBRATO_LFO_DIVIDER`] samples) folded modulo
+    /// [`VIBRATO_PHASE_PERIOD`] (= 8) selects the column — exactly the
+    /// `pmTable[fnum>>6][counter>>10]` indexing the §8b note specifies.
+    ///
+    /// Returns 0 when the operator's VIB bit is clear, so an
+    /// FM-disabled operator reproduces the un-modulated phase-step.
+    #[inline]
+    pub fn vibrato_pm(&self, fnum_hi3: u8, vib_on: bool) -> i32 {
+        if !vib_on {
+            return 0;
+        }
+        let row = (fnum_hi3 & 0x07) as usize;
+        let col = (self.vibrato_phase % VIBRATO_PHASE_PERIOD) as usize;
+        VIB_PM_TABLE[row][col] as i32
+    }
 }
+
+/// Silicon-measured YM2413/OPLL **VIB (vibrato) phase-modulation
+/// table** `pmTable[fnum>>6][counter>>10]`, the exact integer
+/// frequency-correction the chip adds to its phase-step generator.
+///
+/// Rows are indexed by the **top three bits of the 9-bit F-Number**
+/// (`fnum >> 6`, 0..=7); columns are the **8 vibrato phase positions**,
+/// one advanced every [`VIBRATO_LFO_DIVIDER`] (= 1024) operator samples,
+/// so the full pattern repeats every `8 × 1024 = 8192` samples
+/// (`(49716 / 8192) ≈ 6.07 Hz`, the §8b measured vibrato frequency).
+///
+/// Source:
+/// `docs/audio/nsf/opll-ym2413/ym2413-vib-lfo-andete-2015-12-01.txt`
+/// and `docs/audio/nsf/opll-ym2413/tables/vib-lfo-pm.csv` (§8b of
+/// `opll-ym2413-tables.md`, #138). andete **independently confirmed**
+/// these values on real silicon: the 1024-sample-per-step timing, the
+/// 8192-sample period, and the bottom row `0,+3,+7,+3,0,-3,-7,-3` were
+/// all verified by direct hardware measurement (frequency-corrected
+/// sines matched against the captured waveform). Reproduced here as a
+/// measurement-confirmed hardware fact, not as emulator code.
+///
+/// The peak entry per row equals `fnum >> 6` (column 2), and the other
+/// columns are halved / negated copies — i.e. the table is the
+/// triangular ±depth sweep whose amplitude grows with pitch, giving the
+/// roughly-constant ~±14-cent depth the manual documents.
+pub const VIB_PM_TABLE: [[i8; 8]; 8] = [
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 1, 0, 0, 0, -1, 0],
+    [0, 1, 2, 1, 0, -1, -2, -1],
+    [0, 1, 3, 1, 0, -1, -3, -1],
+    [0, 2, 4, 2, 0, -2, -4, -2],
+    [0, 2, 5, 2, 0, -2, -5, -2],
+    [0, 3, 6, 3, 0, -3, -6, -3],
+    [0, 3, 7, 3, 0, -3, -7, -3],
+];
 
 /// Fixed-point fractional bits used by
 /// [`Lfo::vibrato_pitch_offset_q`]. A `Q12` scale keeps the ±7-cent
@@ -1656,16 +1758,18 @@ impl OpllChannel {
         //   F = 49722 * fnum / 2^(19 - block)  Hz
         // Equivalent per-49716 Hz sample phase delta:
         //   delta_per_sample = (fnum << block) * MUL_x2 / 2
-        let fnum_block = (self.fnum as u32) << (self.block as u32);
-        // §7 VIB — per-operator ±7-cent pitch sweep. The vibrato
-        // multiplier is `1 + offset/2^FRAC`, applied to `fnum_block`
-        // before the MUL stage so both operators stay phase-locked to
-        // their own swept pitch. Operators with VIB clear keep the
-        // unmodulated `fnum_block`.
-        let mod_fnum_block =
-            apply_vibrato(fnum_block, lfo.vibrato_pitch_offset_q(self.modulator.vib));
-        let car_fnum_block =
-            apply_vibrato(fnum_block, lfo.vibrato_pitch_offset_q(self.carrier.vib));
+        // §8b VIB — per-operator phase-modulation sweep. The exact
+        // silicon-measured form indexes [`VIB_PM_TABLE`] by the top
+        // three F-Number bits and the current vibrato phase, then folds
+        // the signed integer correction `lfo_pm` into the phase-step via
+        // `(((2*fnum + lfo_pm) * mlTab[ML]) << block) >> 2`
+        // ([`Operator::step_phase_pm`]). Operators with VIB clear get
+        // `lfo_pm == 0`, reproducing the un-swept step.
+        let fnum = self.fnum as u32;
+        let block = self.block as u32;
+        let fnum_hi3 = ((self.fnum >> 6) & 0x07) as u8;
+        let mod_pm = lfo.vibrato_pm(fnum_hi3, self.modulator.vib);
+        let car_pm = lfo.vibrato_pm(fnum_hi3, self.carrier.vib);
         // §7 AM — per-operator 0..1.0 dB tremolo attenuation.
         let mod_am_atten = lfo.tremolo_atten_env_levels(self.modulator.am);
         let car_am_atten = lfo.tremolo_atten_env_levels(self.carrier.am);
@@ -1720,8 +1824,8 @@ impl OpllChannel {
         // §"Test Register $0F" bit 2 also says the phase is *held*,
         // so we skip the step in that case too.
         if !test.hold_phase {
-            self.modulator.step_phase(mod_fnum_block);
-            self.carrier.step_phase(car_fnum_block);
+            self.modulator.step_phase_pm(fnum, block, mod_pm);
+            self.carrier.step_phase_pm(fnum, block, car_pm);
         }
 
         // Step the envelopes. Per §"Test Register $0F" bit 0: "The
@@ -3591,6 +3695,101 @@ mod tests {
         // ±7-cent peak is a ~0.4 % deviation — small but non-zero.
         let up = apply_vibrato(base, VIBRATO_PEAK_OFFSET_Q);
         assert!(up - base < base / 100, "deviation under 1%");
+    }
+
+    /// The §8b silicon-measured VIB phase-modulation table matches the
+    /// values andete confirmed on hardware
+    /// (`docs/audio/nsf/opll-ym2413/tables/vib-lfo-pm.csv`). Row 0 is
+    /// all-zero (no sweep at the lowest pitch); each row's peak (column
+    /// 2) equals `fnum >> 6`; columns 0 and 4 are always zero (the
+    /// triangle's zero-crossings); and the second half negates the
+    /// first.
+    #[test]
+    fn vib_pm_table_matches_measured_silicon() {
+        assert_eq!(VIB_PM_TABLE[0], [0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(VIB_PM_TABLE[7], [0, 3, 7, 3, 0, -3, -7, -3]);
+        for (row_idx, row) in VIB_PM_TABLE.iter().enumerate() {
+            // Peak column (2) equals fnum>>6 (= the row index).
+            assert_eq!(row[2] as usize, row_idx, "row {row_idx} peak");
+            // Zero-crossings at columns 0 and 4.
+            assert_eq!(row[0], 0, "row {row_idx} col0");
+            assert_eq!(row[4], 0, "row {row_idx} col4");
+            // Second half is the negation of the first half.
+            assert_eq!(row[5], -row[1], "row {row_idx} antisymmetry col5");
+            assert_eq!(row[6], -row[2], "row {row_idx} antisymmetry col6");
+            assert_eq!(row[7], -row[3], "row {row_idx} antisymmetry col7");
+        }
+    }
+
+    /// `Lfo::vibrato_pm` returns 0 for a VIB-disabled operator and walks
+    /// the §8b table column-by-column (advancing one column every
+    /// [`VIBRATO_LFO_DIVIDER`] samples) for an enabled one.
+    #[test]
+    fn vibrato_pm_indexes_table_by_phase_and_fnum() {
+        let mut lfo = Lfo::default();
+        // VIB disabled → always 0 regardless of phase.
+        assert_eq!(lfo.vibrato_pm(7, false), 0);
+
+        // Walk all 8 columns of row 7 using the fast LFO clock so each
+        // tick advances the vibrato phase by one column.
+        let expected_row7 = VIB_PM_TABLE[7];
+        for (col, &want) in expected_row7.iter().enumerate() {
+            assert_eq!(lfo.vibrato_pm(7, true), want as i32, "row 7 column {col}");
+            lfo.tick(false, true); // fast: one column per tick
+        }
+        // Wrapped back to column 0.
+        assert_eq!(lfo.vibrato_pm(7, true), expected_row7[0] as i32);
+    }
+
+    /// End-to-end reproduction of the exact §8b worked example from
+    /// `ym2413-vib-lfo-andete-2015-12-01.txt`: with `fnum = 0x1c0`,
+    /// `block = 6`, `ML = 1`, the phase-step takes the documented eight
+    /// values `28672, 28768, 28896, 28768, 28672, 28576, 28448, 28576`
+    /// in sequence (one held for each 1024-sample vibrato column).
+    #[test]
+    fn step_phase_pm_matches_andete_worked_example() {
+        let mut lfo = Lfo::default();
+        let mut op = Operator {
+            mul: 1, // ML=1 → mlTab[1] = 2
+            ..Operator::default()
+        };
+        let fnum = 0x1c0u32; // 448
+        let block = 6u32;
+        let fnum_hi3 = ((fnum >> 6) & 0x07) as u8; // = 7
+        let expected = [28672, 28768, 28896, 28768, 28672, 28576, 28448, 28576];
+        for (col, &want) in expected.iter().enumerate() {
+            let pm = lfo.vibrato_pm(fnum_hi3, true);
+            let before = op.phase_acc;
+            op.step_phase_pm(fnum, block, pm);
+            let inc = op.phase_acc.wrapping_sub(before);
+            assert_eq!(inc, want, "vibrato column {col} phase-step");
+            lfo.tick(false, true); // advance one column (fast clock)
+        }
+    }
+
+    /// With `lfo_pm == 0` (VIB disabled), `step_phase_pm` advances the
+    /// phase identically to the legacy `step_phase` fed
+    /// `fnum_block = fnum << block` — the §8b formula reduces to
+    /// `((fnum * mlTab[ML]) << block) >> 1`.
+    #[test]
+    fn step_phase_pm_zero_matches_legacy_step_phase() {
+        for &mul in &[0u8, 1, 5, 15] {
+            for &fnum in &[1u32, 100, 0x1ff] {
+                for &block in &[0u32, 3, 7] {
+                    let mut a = Operator {
+                        mul,
+                        ..Operator::default()
+                    };
+                    let mut b = a;
+                    a.step_phase_pm(fnum, block, 0);
+                    b.step_phase(fnum << block);
+                    assert_eq!(
+                        a.phase_acc, b.phase_acc,
+                        "mul={mul} fnum={fnum} block={block}"
+                    );
+                }
+            }
+        }
     }
 
     /// End-to-end: an AM-enabled carrier produces a *time-varying*
