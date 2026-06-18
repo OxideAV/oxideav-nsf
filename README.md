@@ -67,13 +67,15 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     per-RATE attack/decay/release step magnitudes (from the YM2413
     Application Manual Table III-7), KSR + KSL attenuation (Tables
     III-2 / III-5), the `$0F` test register, `$E000` audio reset, the
-    audible AM/VIB LFO — the VIB (vibrato) sweep now applies the
-    **silicon-measured §8b 8×8 phase-modulation table** (`VIB_PM_TABLE`,
-    indexed `pmTable[fnum>>6][vib_phase]`) through the exact phase-step
+    audible AM/VIB LFO — both modulation paths now apply their
+    **silicon-measured depth tables**: the VIB (vibrato) sweep uses the
+    §8b 8×8 phase-modulation table (`VIB_PM_TABLE`, indexed
+    `pmTable[fnum>>6][vib_phase]`) through the exact phase-step
     `(((2*fnum + lfo_pm) * mlTab[ML]) << block) >> 2`, and the AM
-    (tremolo) uses the §8a 1.0 dB physical depth via a triangle, each on
-    its operator's `$00`/`$01` AM / VIB bit — rhythm-mode register
-    decoding, and
+    (tremolo) uses the §8a 210-entry 14-level (0..13) truncated-triangle
+    waveform (`AM_LFO_LEVELS`) applied as `16 * am` in the operator exp
+    index for the measured ≈ 4.8 dB peak depth — each on its operator's
+    `$00`/`$01` AM / VIB bit — rhythm-mode register decoding, and
     bass-drum (BD) rhythm synthesis (`RhythmBassDrum`) — the §V-4
     two-slot FM pair on channel 7, keyed from the `$0E` BD bit, with
     the §III-4 percussion ×2 DAC doubling. The shared rhythm **noise
@@ -104,14 +106,17 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   DMC CPU-stall accounting); envelope tick timers are stepped in
   CPU-cycle batches — adequate for music, not cycle-exact.
-* OPLL AM (tremolo) *exact* numeric depth step array — the §8a AM
-  triangle is applied via the documented *physical* 1.0 dB depth mapped
-  through a triangle (correct macro behaviour, not yet a per-step
-  bit-match against the `am-lfo-triangle.csv` 14-level schedule). The
-  VIB (vibrato) path is now bit-exact: it drives the silicon-measured
-  §8b `VIB_PM_TABLE` through the exact integer phase-step formula
-  (validated against the andete worked example, step sizes
-  `28672…28448…28576`).
+* OPLL envelope: the per-RATE step magnitudes on the *live* envelope
+  path still derive from the YM2413 Application Manual Table III-7 ms
+  timings. The silicon-measured §7 global-counter rate-increment model
+  (`EG_SELECT_TABLE` / `EG_HIGHRATE_TABLE` / `eg_decay_advance`, the
+  `eg_shift`/`eg_select` algorithm with the rate-52..59 high-rate
+  corrections) is landed and validated against the andete worked example
+  (decay rate 14 → segment lengths `1024,1024,2048`), but wiring it into
+  `Envelope::step` requires threading the chip-wide global counter
+  through every call site — a tracked followup. The §7a *attack-level*
+  per-step recurrence remains a documented DOCS-GAP (andete measured the
+  timing but not the exact level sequence).
 * The VRC7 rhythm *synthesis* path for HH/SD/TOM/TOP-CYM (BD is now
   synthesised as the §V-4 two-slot FM pair, and the shared noise LFSR
   the §V-4 noise-mixed phase generator consumes is now pinned as
