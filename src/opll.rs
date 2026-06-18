@@ -22,20 +22,24 @@
 //! anything beyond that appendix is out-of-scope for this module.
 //!
 //! The exact emulator AM/VIB depth *step arrays* are deliberately not
-//! transcribed (the §7 "Provenance" appendix of `opll-ym2413-tables.md`
-//! cites them to silicon-RE primary sources and keeps the numeric
-//! arrays out of the repo). The AM/VIB LFO is nonetheless **audible**:
-//! its phase *cadence* (tremolo advances once per 64 operator samples,
-//! vibrato once per 1024, both bypassed under `$0F` bit 3 and
-//! held+reset under `$0F` bit 1, with the `$E000` audio reset clearing
-//! tremolo phase but preserving vibrato phase) is fully specified by
+//! transcribed (the "Provenance" appendix of `opll-ym2413-tables.md`
+//! cites them to independent silicon-RE primary sources). The AM/VIB
+//! LFO depth tables were staged under
+//! `docs/audio/nsf/opll-ym2413/` (§8a/§8b, #138) as andete's
+//! hardware-measured arrays, so both LFOs now use the exact
+//! silicon-measured forms rather than the earlier physical-depth
+//! approximations. Their phase *cadence* (tremolo advances once per 64
+//! operator samples, vibrato once per 1024, both bypassed under `$0F`
+//! bit 3 and held+reset under `$0F` bit 1, with the `$E000` audio reset
+//! clearing tremolo phase but preserving vibrato phase) is specified by
 //! `docs/audio/nsf/vrc7-audio-wiki.html` §"Test Register $0F" +
-//! §"Audio Reset ($E000)", and the phase→depth translation is derived
-//! from the §7 *physical* depths — **1.0 dB** AM at ~3.7 Hz and **±7
-//! cents** VIB at ~6.0 Hz — mapped through a triangle in [`Lfo`]
-//! ([`Lfo::tremolo_atten_env_levels`] / [`Lfo::vibrato_pitch_offset_q`]).
-//! No emulator constant array is consulted; the depth follows from the
-//! documented physical quantities.
+//! §"Audio Reset ($E000)". The AM depth is the §8a 210-entry
+//! 14-level (0..13) truncated triangle ([`AM_LFO_LEVELS`], applied as
+//! `16 * am` in the operator's exp index → ≈ 4.8 dB peak) and the VIB
+//! depth is the §8b 8×8 phase-modulation table ([`VIB_PM_TABLE`]), both
+//! read via [`Lfo`] ([`Lfo::tremolo_atten_exp_units`] /
+//! [`Lfo::vibrato_pm`]). Every numeric array is sourced from andete's
+//! independent silicon measurement, not from any emulator tree.
 //!
 //! Rhythm-mode *register semantics* are fully specified by the
 //! application manual §III-1-7 (the `$0E` RHYTHM register bit table +
@@ -1074,14 +1078,100 @@ pub const TREMOLO_PHASE_PERIOD: u32 = 210;
 /// steps per period.
 pub const VIBRATO_PHASE_PERIOD: u32 = 8;
 
-/// AM peak attenuation in envelope-level units. The operator
-/// pipeline expresses attenuation in 16-units-per-3-dB
-/// (≈ 0.1875 dB/unit) per the andete §"envelope levels" convention
-/// used throughout [`Operator::sample`]. The §7 1.0 dB AM peak is
-/// therefore `1.0 / 3.0 * 16 ≈ 5.33` → 5 env-level units at the
-/// triangle peak (0 at the trough). Rounded from the documented
-/// physical depth; no emulator constant is consulted.
+/// AM peak attenuation in envelope-level units (legacy approximation).
+///
+/// **Superseded by the §8a silicon-measured [`AM_LFO_LEVELS`] table.**
+/// The original triangle approximation scaled the AM oscillator to the
+/// then-assumed §7 1.0 dB depth (`1.0 / 3.0 * 16 ≈ 5.33` → 5 env-level
+/// units at the peak). andete's 2015-11-28 silicon measurement
+/// established the true depth is ≈ **4.8 dB** (a 14-level 0..13 ramp
+/// applied as `16 * am`), not 1.0 dB, so this constant is retained only
+/// for the deprecated [`Lfo::tremolo_atten_env_levels`] compatibility
+/// shim and is no longer on the synthesis path.
 pub const TREMOLO_PEAK_ENV_LEVELS: u32 = 5;
+
+/// Peak AM (tremolo) level in the silicon-measured §8a truncated
+/// triangle: the OPLL drops the low bit of the OPL-family 0..26 ramp,
+/// giving **14 distinct levels (0..13)**. Level 13 is the trough of the
+/// *amplitude* (the peak of the *attenuation*); see [`AM_LFO_LEVELS`].
+/// Source: `docs/audio/nsf/opll-ym2413/ym2413-am-lfo-andete-2015-11-28.txt`
+/// + `tables/am-lfo-triangle.csv` (§8a of `opll-ym2413-tables.md`, #138).
+pub const AM_LFO_PEAK_LEVEL: u8 = 13;
+
+/// Length of one full §8a AM (tremolo) LFO period, in *tremolo phase
+/// steps*. Each step is held for 64 output samples, so the period is
+/// `210 × 64 = 13440` samples → `49716 / 13440 ≈ 3.699 Hz` (the manual's
+/// "3.7 Hz"). This is the silicon-measured 210-entry length, **not** a
+/// derived approximation — see [`AM_LFO_LEVELS`].
+pub const AM_LFO_PERIOD_STEPS: usize = 210;
+
+/// The exp-table weight applied to one §8a AM level. andete's operator
+/// model is `expTable[sineTable[phase] + 128*vol + 16*env + 16*am]`
+/// (`ym2413-am-lfo-andete-2015-11-28.txt` lines 182, 185–186): the AM
+/// level enters the exp index multiplied by **16**, exactly as the
+/// envelope level does ([`Envelope::exp_offset`] = `level * 16`). So the
+/// peak attenuation is `16 × 13 = 208` exp units ≈ `6.0206 × 208/256 ≈
+/// 4.89 dB`, matching the measured ≈ 4.8 dB depth.
+pub const AM_LFO_EXP_WEIGHT: u32 = 16;
+
+/// Silicon-measured §8a AM (tremolo) LFO waveform: 210 entries, one per
+/// tremolo phase step (each held 64 output samples). Values are the
+/// OPLL-truncated 14-level triangle (0..13) andete measured directly on
+/// real silicon; applied to the operator's exp index as `16 * am`.
+///
+/// The waveform rises 0 → 13 and falls 13 → 1 with the measured hold
+/// durations: level 0 held 15 steps (960 samples), levels 1..=12 held 8
+/// steps (512 samples) each, level 13 held 3 steps (192 samples), then
+/// 12..=1 descending 8 steps each. `15 + 12·8 + 3 + 12·8 = 210`.
+///
+/// Source: `docs/audio/nsf/opll-ym2413/ym2413-am-lfo-andete-2015-11-28.txt`
+/// (lines 99–106, 144–152) + `tables/am-lfo-triangle.csv` (§8a of
+/// `opll-ym2413-tables.md`, #138). Independent silicon RE — the triangle
+/// shape, the 14-level low-bit truncation, the 960/512/192-sample
+/// segment durations, and the ≈ 4.8 dB depth were all measured on a real
+/// YM2413 (not lifted from emu2413 / Nuked-OPLL / ymfm).
+pub const AM_LFO_LEVELS: [u8; AM_LFO_PERIOD_STEPS] = build_am_lfo_levels();
+
+/// Build the §8a AM waveform from the measured per-level hold durations
+/// (`tables/am-lfo-triangle.csv`). Rising 0..=13 then falling 13..=1;
+/// level 0 held 15 steps, levels 1..=12 held 8 steps, level 13 held 3.
+const fn build_am_lfo_levels() -> [u8; AM_LFO_PERIOD_STEPS] {
+    let mut out = [0u8; AM_LFO_PERIOD_STEPS];
+    let mut i = 0usize;
+    // Rising edge: level 0 (15 steps), then levels 1..=13 with their
+    // measured hold counts (1..=12 → 8 steps; 13 → 3 steps).
+    let mut level = 0u8;
+    while level <= AM_LFO_PEAK_LEVEL {
+        let holds = if level == 0 {
+            15
+        } else if level == AM_LFO_PEAK_LEVEL {
+            3
+        } else {
+            8
+        };
+        let mut h = 0;
+        while h < holds {
+            out[i] = level;
+            i += 1;
+            h += 1;
+        }
+        level += 1;
+    }
+    // Falling edge: levels 12..=1, 8 steps each (level 0 and level 13
+    // are not repeated — the triangle's apex and trough are single
+    // segments, already emitted on the rising edge).
+    let mut level = AM_LFO_PEAK_LEVEL - 1;
+    while level >= 1 {
+        let mut h = 0;
+        while h < 8 {
+            out[i] = level;
+            i += 1;
+            h += 1;
+        }
+        level -= 1;
+    }
+    out
+}
 
 /// The built-in AM (tremolo) + VIB (vibrato) low-frequency
 /// oscillators that drive the per-operator amplitude / pitch
@@ -1205,22 +1295,53 @@ impl Lfo {
         // Vibrato deliberately untouched.
     }
 
-    /// Current AM (tremolo) attenuation contribution, in
-    /// envelope-level units, for an operator whose `$00`/`$01` AM bit
-    /// is set.
+    /// Current §8a AM (tremolo) level (0..=13) from the silicon-measured
+    /// [`AM_LFO_LEVELS`] waveform, for an operator whose `$00`/`$01` AM
+    /// bit is set.
     ///
-    /// The OPL-family AM oscillator is a **triangle** (§7 / the
-    /// `Lfo` struct doc: "The OPL family's AM phase is a triangle that
-    /// repeats far below the sample rate"). The free-running
-    /// [`Self::tremolo_phase`] is folded modulo [`TREMOLO_PHASE_PERIOD`]
-    /// into a 0 → peak → 0 triangle whose peak is
-    /// [`TREMOLO_PEAK_ENV_LEVELS`] (the §7 1.0 dB depth expressed in
-    /// the pipeline's env-level units). Because attenuation only ever
-    /// *reduces* amplitude, the AM oscillation rides between 0 (no
-    /// extra attenuation, loudest) and the 1.0 dB peak, matching the
-    /// physical "amplitude dips by up to 1.0 dB" behaviour.
+    /// The free-running [`Self::tremolo_phase`] (one step per
+    /// [`TREMOLO_LFO_DIVIDER`] = 64 output samples) folded modulo
+    /// [`AM_LFO_PERIOD_STEPS`] (= 210) indexes the truncated-triangle
+    /// table. This is the exact OPLL-truncated 14-level form andete
+    /// measured on real silicon (the OPL-family 0..26 ramp with its low
+    /// bit dropped), **not** a derived linear approximation.
     ///
     /// Returns 0 when the operator's AM bit is clear.
+    #[inline]
+    pub fn tremolo_am_level(&self, am_on: bool) -> u8 {
+        if !am_on {
+            return 0;
+        }
+        AM_LFO_LEVELS[(self.tremolo_phase % AM_LFO_PERIOD_STEPS as u32) as usize]
+    }
+
+    /// Current §8a AM (tremolo) attenuation contribution in **exp-table
+    /// units** (the same units as [`Envelope::exp_offset`] and the
+    /// per-channel volume / TL / KSL attenuations folded into the
+    /// operator's exp index), for an operator whose `$00`/`$01` AM bit
+    /// is set.
+    ///
+    /// Per andete's measured operator model `expTable[sineTable[phase] +
+    /// 128*vol + 16*env + 16*am]`, the AM level enters the exp index as
+    /// `16 * am` ([`AM_LFO_EXP_WEIGHT`]). The peak `16 × 13 = 208` exp
+    /// units gives ≈ 4.89 dB, matching the measured ≈ 4.8 dB depth.
+    ///
+    /// Returns 0 when the operator's AM bit is clear.
+    #[inline]
+    pub fn tremolo_atten_exp_units(&self, am_on: bool) -> u32 {
+        AM_LFO_EXP_WEIGHT * self.tremolo_am_level(am_on) as u32
+    }
+
+    /// Legacy AM contribution in the old "env-level" approximation
+    /// (peak [`TREMOLO_PEAK_ENV_LEVELS`] = 5). **Superseded by the §8a
+    /// silicon-measured [`Self::tremolo_atten_exp_units`].**
+    ///
+    /// Retained only so out-of-tree callers that depended on the
+    /// pre-§8a behaviour keep compiling; the per-sample synthesis path
+    /// no longer uses it. Returns the old 0..=5 linear triangle (a 1.0 dB
+    /// peak, the depth assumed before andete's 4.8 dB measurement).
+    #[deprecated(note = "use tremolo_atten_exp_units (§8a silicon-measured AM table); \
+                this is the pre-§8a 1.0 dB approximation")]
     #[inline]
     pub fn tremolo_atten_env_levels(&self, am_on: bool) -> u32 {
         if !am_on {
@@ -1770,9 +1891,12 @@ impl OpllChannel {
         let fnum_hi3 = ((self.fnum >> 6) & 0x07) as u8;
         let mod_pm = lfo.vibrato_pm(fnum_hi3, self.modulator.vib);
         let car_pm = lfo.vibrato_pm(fnum_hi3, self.carrier.vib);
-        // §7 AM — per-operator 0..1.0 dB tremolo attenuation.
-        let mod_am_atten = lfo.tremolo_atten_env_levels(self.modulator.am);
-        let car_am_atten = lfo.tremolo_atten_env_levels(self.carrier.am);
+        // §8a AM — per-operator tremolo attenuation from the
+        // silicon-measured 210-entry / 14-level [`AM_LFO_LEVELS`] table,
+        // applied as `16 * am` exp units (≈ 4.8 dB peak depth). Operators
+        // with AM clear contribute 0, leaving the un-modulated index.
+        let mod_am_atten = lfo.tremolo_atten_exp_units(self.modulator.am);
+        let car_am_atten = lfo.tremolo_atten_exp_units(self.carrier.am);
 
         // §"Test Register $0F" bit 2: pin both waveform phases at 0.
         if test.hold_phase {
@@ -3609,31 +3733,81 @@ mod tests {
         let mut lfo = Lfo::default();
         for _ in 0..1000 {
             lfo.tick(false, false);
-            assert_eq!(lfo.tremolo_atten_env_levels(false), 0);
+            assert_eq!(lfo.tremolo_am_level(false), 0);
+            assert_eq!(lfo.tremolo_atten_exp_units(false), 0);
         }
     }
 
-    /// The §7 AM triangle is 0 at the trough (phase 0) and reaches the
-    /// documented 1.0 dB peak ([`TREMOLO_PEAK_ENV_LEVELS`]) at the
-    /// half-period; it never exceeds the peak.
+    /// The §8a silicon AM table has exactly the measured structure: 210
+    /// entries, 14 distinct levels (0..=13), the documented per-level
+    /// hold counts (level 0 → 15 steps, levels 1..=12 → 8 steps each,
+    /// level 13 → 3 steps), and a symmetric rise/fall.
     #[test]
-    fn tremolo_atten_is_bounded_triangle() {
+    fn am_lfo_table_matches_measured_silicon() {
+        assert_eq!(AM_LFO_LEVELS.len(), 210);
+        // Distinct levels are exactly 0..=13.
+        let max = *AM_LFO_LEVELS.iter().max().unwrap();
+        let min = *AM_LFO_LEVELS.iter().min().unwrap();
+        assert_eq!((min, max), (0, AM_LFO_PEAK_LEVEL));
+        // Per-level hold counts (number of 64-sample steps at each
+        // level across the whole period).
+        let mut holds = [0u32; 14];
+        for &l in AM_LFO_LEVELS.iter() {
+            holds[l as usize] += 1;
+        }
+        // Apex (13) and trough (0) appear once per period; the
+        // intermediate levels 1..=12 appear on both the rising and the
+        // falling edge (8 + 8 = 16 steps each).
+        assert_eq!(holds[0], 15, "level 0 held 15 steps (960 samples), once");
+        for (lvl, h) in holds.iter().enumerate().take(13).skip(1) {
+            assert_eq!(*h, 16, "level {lvl} held 8 steps on each edge (16 total)");
+        }
+        assert_eq!(holds[13], 3, "level 13 held 3 steps (192 samples), once");
+        // Rising edge: the first 15 entries are level 0, then it climbs
+        // monotonically to 13; after the apex it descends monotonically.
+        let apex = AM_LFO_LEVELS.iter().position(|&l| l == 13).unwrap();
+        for w in AM_LFO_LEVELS[..=apex].windows(2) {
+            assert!(w[1] >= w[0], "rising edge non-monotone");
+        }
+        for w in AM_LFO_LEVELS[apex..].windows(2) {
+            assert!(w[1] <= w[0], "falling edge non-monotone");
+        }
+        // Period sums to 13440 samples = 210 × 64 → 3.699 Hz.
+        assert_eq!(AM_LFO_LEVELS.len() * TREMOLO_LFO_DIVIDER as usize, 13440);
+    }
+
+    /// The §8a AM oscillator rides between 0 (trough, loudest) and a
+    /// `16 × 13 = 208` exp-unit peak (≈ 4.8 dB), advancing one table
+    /// entry per [`TREMOLO_LFO_DIVIDER`] = 64 samples in normal mode.
+    #[test]
+    fn tremolo_atten_exp_units_walks_silicon_table() {
         let mut lfo = Lfo::default();
-        // Phase 0 → trough (no extra attenuation).
-        assert_eq!(lfo.tremolo_atten_env_levels(true), 0);
+        // Phase 0 → trough (level 0, no extra attenuation).
+        assert_eq!(lfo.tremolo_am_level(true), 0);
+        assert_eq!(lfo.tremolo_atten_exp_units(true), 0);
         let mut saw_peak = 0u32;
-        // Drive the phase across a full period (fast mode = 1 step per
-        // tick) and record the maximum attenuation seen.
-        for _ in 0..TREMOLO_PHASE_PERIOD {
+        // Walk a full period in fast mode (one table step per tick).
+        for _ in 0..AM_LFO_PERIOD_STEPS {
             lfo.tick(false, true);
-            let a = lfo.tremolo_atten_env_levels(true);
-            assert!(a <= TREMOLO_PEAK_ENV_LEVELS, "atten {a} exceeds peak");
-            saw_peak = saw_peak.max(a);
+            let lvl = lfo.tremolo_am_level(true);
+            let units = lfo.tremolo_atten_exp_units(true);
+            assert_eq!(units, 16 * lvl as u32, "16 * am weighting");
+            assert!(lvl <= AM_LFO_PEAK_LEVEL, "level {lvl} exceeds peak");
+            saw_peak = saw_peak.max(units);
         }
         assert_eq!(
-            saw_peak, TREMOLO_PEAK_ENV_LEVELS,
-            "triangle should reach the 1.0 dB peak somewhere in the period"
+            saw_peak,
+            16 * AM_LFO_PEAK_LEVEL as u32,
+            "peak = 16 × 13 = 208"
         );
+        // Normal-mode cadence: 64 ticks per table step.
+        let mut slow = Lfo::default();
+        for _ in 0..(TREMOLO_LFO_DIVIDER) {
+            assert_eq!(slow.tremolo_am_level(true), AM_LFO_LEVELS[0]);
+            slow.tick(false, false);
+        }
+        // The 64th tick advances to the next table entry.
+        assert_eq!(slow.tremolo_am_level(true), AM_LFO_LEVELS[1]);
     }
 
     /// A held LFO (`$0F` bit 1) pins the phase at 0, so the audible AM
@@ -3643,7 +3817,8 @@ mod tests {
         let mut lfo = Lfo::default();
         for _ in 0..200 {
             lfo.tick(true, false);
-            assert_eq!(lfo.tremolo_atten_env_levels(true), 0);
+            assert_eq!(lfo.tremolo_am_level(true), 0);
+            assert_eq!(lfo.tremolo_atten_exp_units(true), 0);
         }
     }
 

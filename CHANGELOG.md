@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- OPLL AM: the per-operator amplitude modulation (tremolo) now uses the
+  **silicon-measured §8a AM waveform table** instead of the earlier
+  1.0 dB linear-triangle approximation. `opll::AM_LFO_LEVELS` is the
+  exact 210-entry, 14-level (0..13) truncated triangle andete measured
+  on a real YM2413
+  (`docs/audio/nsf/opll-ym2413/ym2413-am-lfo-andete-2015-11-28.txt`,
+  `tables/am-lfo-triangle.csv`, §8a #138): the OPLL drops the low bit of
+  the OPL-family 0..26 ramp, holding level 0 for 15 steps (960 samples),
+  levels 1..=12 for 8 steps each, and level 13 for 3 steps before
+  descending — full period `210 × 64 = 13440` samples ≈ 3.7 Hz. The
+  level is applied to the operator's exp index as `16 * am`
+  (`AM_LFO_EXP_WEIGHT`), exactly as the envelope level is, giving a peak
+  attenuation of `16 × 13 = 208` exp units ≈ 4.8 dB — the measured depth,
+  which **corrects the previously-assumed 1.0 dB**. `Lfo::tremolo_am_level`
+  reads the table and `Lfo::tremolo_atten_exp_units` returns `16 * am`;
+  `OpllChannel::sample_with_test` now drives both operators through it.
+  The old `Lfo::tremolo_atten_env_levels` (1.0 dB approximation) is
+  retained `#[deprecated]` as a compatibility shim, off the synthesis
+  path. Closes the crate's named §7 OPLL/VRC7 LFO depth-step-array gap.
+
 - OPLL VIB: the per-operator vibrato (frequency modulation) now uses the
   **silicon-measured §8b phase-modulation table** instead of the earlier
   cents-scaled triangle approximation. `opll::VIB_PM_TABLE` is the exact
