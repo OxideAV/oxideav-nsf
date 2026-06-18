@@ -699,8 +699,7 @@ pub const ENV_MAX_LEVEL: u32 = 127;
 /// of `opll-ym2413-tables.md`, #138) — andete RE notes 2015-03-20.
 /// Independent silicon RE: decay rates 4,9,14,19,48,49,50,51 and the
 /// `{1024,1024,2048}`-sample segment pattern were measured directly on a
-/// real YM2413. (andete also *corrected* the Burczynski emulator's
-/// 256-level count — the YM2413 has 128 EG levels.)
+/// real YM2413, which has 128 EG levels.
 pub const EG_SELECT_TABLE: [[u8; 8]; 4] = [
     [0, 1, 0, 1, 0, 1, 0, 1], // eg_select 0 — 4/8
     [0, 1, 0, 1, 1, 1, 0, 1], // eg_select 1 — 5/8
@@ -1236,7 +1235,7 @@ pub const AM_LFO_EXP_WEIGHT: u32 = 16;
 /// `opll-ym2413-tables.md`, #138). Independent silicon RE — the triangle
 /// shape, the 14-level low-bit truncation, the 960/512/192-sample
 /// segment durations, and the ≈ 4.8 dB depth were all measured on a real
-/// YM2413 (not lifted from emu2413 / Nuked-OPLL / ymfm).
+/// YM2413.
 pub const AM_LFO_LEVELS: [u8; AM_LFO_PERIOD_STEPS] = build_am_lfo_levels();
 
 /// Build the §8a AM waveform from the measured per-level hold durations
