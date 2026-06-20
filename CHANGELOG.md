@@ -26,7 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a documented reverse-engineering gap (only the attack timing — not the
   per-step level sequence — is silicon-measured). Both melody channels and
   the channel-7 bass-drum rhythm voice share the one counter, as on the
-  die. New `step_eg` cadence/attack/halt/counter unit tests cover it.
+  die. New `step_eg` cadence/attack/halt/counter unit tests cover it,
+  plus two end-to-end `tests/vrc7_frame_render.rs` integration tests that
+  program a decaying carrier through the `$9010`/`$9030` register ports
+  and confirm the rendered PCM amplitude ramps down per the §7 model and
+  that a faster decay rate quiets sooner — proving the model drives the
+  audible path, not just the unit envelope.
 
 ### Fixed
 

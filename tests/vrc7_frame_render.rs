@@ -215,6 +215,108 @@ fn vrc7_higher_block_renders_higher_pitch() {
     );
 }
 
+/// Program channel 0 with a custom patch whose carrier has a **slow,
+/// measurable decay** toward a near-silent sustain level, so the
+/// rendered envelope visibly ramps down over the frame. This exercises
+/// the §7 global-counter decay path end-to-end through the register
+/// ports (instant attack → slow decay → low sustain), rather than the
+/// flat sustained tone used by `program_pure_carrier`.
+fn program_decaying_carrier(chip: &mut Vrc7, fnum: u16, block: u8, mul: u8, dr: u8, sl: u8) {
+    write_reg(chip, 0x00, mul & 0x0F); // mod: MUL only
+    write_reg(chip, 0x01, 0x20 | (mul & 0x0F)); // car: EGT(sustained)=1, MUL
+    write_reg(chip, 0x02, 0x3F); // mod TL = max → quiet modulator
+    write_reg(chip, 0x03, 0x00); // FB=0
+    write_reg(chip, 0x04, 0xF0); // mod AR=F, DR=0
+    write_reg(chip, 0x05, 0xF0 | (dr & 0x0F)); // car AR=F (instant), DR=dr
+    write_reg(chip, 0x06, 0x00); // mod SL=0, RR=0
+    write_reg(chip, 0x07, (sl & 0x0F) << 4); // car SL=sl, RR=0
+    write_reg(chip, 0x30, 0x01);
+    write_reg(chip, 0x30, 0x00);
+    write_reg(chip, 0x10, (fnum & 0xFF) as u8);
+    let fnum_hi = ((fnum >> 8) & 0x01) as u8;
+    let reg20 = 0x10 | ((block & 0x07) << 1) | fnum_hi;
+    write_reg(chip, 0x20, reg20);
+}
+
+/// Peak absolute amplitude of a rendered window.
+fn peak(samples: &[f32]) -> f32 {
+    samples.iter().cloned().fold(0.0f32, |m, s| m.max(s.abs()))
+}
+
+/// End-to-end §7 decay: a key-on'd channel with a slow carrier decay
+/// rate and a quiet sustain level must render a tone whose amplitude
+/// **ramps down** over successive windows (instant attack to full level,
+/// then the §7 global-counter decay advance reduces the carrier's output
+/// each EG step). This proves the §7 model — not a flat sustained level
+/// — drives the audible decay through the full register-port pipeline.
+#[test]
+fn vrc7_rendered_decay_ramps_down_per_section_7_model() {
+    let mut chip = Vrc7::new();
+    chip.enabled = true;
+
+    // Slow-ish decay (DR=4) toward a near-silent sustain (SL=13), so the
+    // carrier falls steadily across the rendered window. fnum/block give
+    // a clean mid tone; MUL=1.
+    program_decaying_carrier(&mut chip, 0x180, 4, 1, 4, 13);
+
+    // Let the instant attack reach full level, capture the early peak.
+    let early = render(&mut chip, 1024);
+    let early_peak = peak(&early);
+    assert!(
+        early_peak > 0.01,
+        "attack must reach an audible level first: {early_peak}"
+    );
+
+    // Render several later windows; with a live §7 decay the peak must
+    // fall monotonically (within crossing/quantisation noise) and end
+    // well below the post-attack peak.
+    let mut peaks = vec![early_peak];
+    for _ in 0..6 {
+        let w = render(&mut chip, 4096);
+        peaks.push(peak(&w));
+    }
+    let last = *peaks.last().unwrap();
+    assert!(
+        last < early_peak * 0.7,
+        "§7 decay must reduce the carrier amplitude over time: \
+         early={early_peak} late={last} (peaks={peaks:?})"
+    );
+    // Non-increasing trend (allow tiny per-window jitter from the
+    // zero-crossing-relative peak sampling).
+    for pair in peaks.windows(2) {
+        assert!(
+            pair[1] <= pair[0] + 0.02,
+            "decay must not get louder window-to-window: {pair:?}"
+        );
+    }
+}
+
+/// End-to-end §7 rate ordering: a **faster** carrier decay rate must
+/// reach the quiet sustain floor sooner than a slower one, observable in
+/// the rendered PCM. This confirms the §7 `eg_shift`/`eg_select` rate
+/// mapping is wired into the audible path (not just a constant ramp).
+#[test]
+fn vrc7_faster_decay_rate_quiets_sooner() {
+    fn amplitude_after(dr: u8, samples_in: usize) -> f32 {
+        let mut chip = Vrc7::new();
+        chip.enabled = true;
+        program_decaying_carrier(&mut chip, 0x180, 4, 1, dr, 13);
+        let _settle = render(&mut chip, 256); // reach full level
+        let _mid = render(&mut chip, samples_in);
+        peak(&render(&mut chip, 2048))
+    }
+
+    // After the same elapsed render span, a faster decay (DR=8) must be
+    // quieter than a slow decay (DR=3).
+    let span = 6000;
+    let slow = amplitude_after(3, span);
+    let fast = amplitude_after(8, span);
+    assert!(
+        fast < slow,
+        "faster decay rate must be quieter at the same time: slow(DR=3)={slow} fast(DR=8)={fast}"
+    );
+}
+
 #[test]
 fn vrc7_key_off_silences_the_rendered_frame() {
     let mut chip = Vrc7::new();
