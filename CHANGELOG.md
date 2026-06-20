@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OPLL phase-generator pitch**: the phase accumulator's fractional-bit
+  count was 19, but the YM2413 phase counter is **10.9 fixed-point** (10
+  integer sine-index bits + **9** fractional bits) per andete's silicon
+  measurement (`docs/audio/nsf/opll-ym2413/ym2413-phase-counter-andete-2015-03-16.txt`
+  §"conclusion" + `opll-ym2413-tables.md` §9, die-shot = 19 bands). With
+  19 fractional bits the accumulator wrapped 1024× too slowly, so every
+  VRC7/OPLL note rendered ~1024× below pitch (subsonic). `PHASE_ACC_FRAC_BITS`
+  is now 9; one sine period spans `1024 << 9 = 524288` accumulator units,
+  exactly reproducing andete's "#repeats = 512 / step-size" and
+  high-frequency period-length tables (e.g. ML=0, block=0, fnum=256 →
+  step `0x80`, period 4096 samples). The per-sample phase `inc` deltas are
+  unchanged (the existing `step_phase` / `step_phase_pm` unit tests only
+  checked those), so only the audible wrap-period — and pitch — is fixed.
+
 ### Other
+
+- **VRC7 frame-render integration test** (`tests/vrc7_frame_render.rs`):
+  drives the chip end-to-end through the `$9010` / `$9030` register ports,
+  programs a single melody note, renders a full ~1/60 s frame of operator
+  samples, and verifies the PCM is (1) audible and zero-crossing, (2) at
+  the §9 doc-predicted fundamental (recovered by zero-crossing count to
+  within 5 %), (3) one octave higher when `block` increments, and (4)
+  silenced by key-off + fast release. This is the test that surfaced the
+  phase-frac-bits pitch bug above.
 
 - OPLL tests: add **per-channel synthesis property tests** that validate
   the §8a/§8b LFO depth tables on the live `OpllChannel::sample_with_test`
