@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **OPLL envelope decay/release now driven by the §7 silicon-measured
+  global-counter rate-increment model** (`docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md`
+  §7 + `ym2413-envelope-decay-rates-andete-2015-03-20.txt`). A single
+  chip-wide global counter — shared by all 18 operators, incremented once
+  per per-operator output sample in `Lfo::tick` — now drives the live
+  Decay, percussive-Sustain, and Release EG advance through the
+  `eg_shift`/`eg_select` duty algorithm (`Envelope::step_eg`), replacing
+  the earlier Table III-7 *ms-timing* linear approximation
+  (`decay_step_q16_per_sample`) on the audible path. A decaying note now
+  follows the measured stair-stepped per-sample `{0,+1,+2}` EG-level
+  increments (e.g. the `1024/1024/2048`-sample segment cadence for an
+  effective decay rate of 14) instead of a smooth ramp, including the
+  rates-52..59 high-rate correction tables. The **Attack** phase retains
+  the Table III-7 timing because the §7a attack-EG-**level** recurrence is
+  a documented reverse-engineering gap (only the attack timing — not the
+  per-step level sequence — is silicon-measured). Both melody channels and
+  the channel-7 bass-drum rhythm voice share the one counter, as on the
+  die. New `step_eg` cadence/attack/halt/counter unit tests cover it.
+
 ### Fixed
 
 - **OPLL phase-generator pitch**: the phase accumulator's fractional-bit
