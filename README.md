@@ -67,10 +67,14 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     renders at the doc-predicted fundamental and an end-to-end frame-render
     test recovers it from the rendered PCM), log-sin / exp ROMs, MUL / FB
     tables, half-rectified waveforms, modulator self-feedback, the
-    Idle→Attack→Decay→Sustain→Release envelope with EG-TYP behaviour,
-    per-RATE attack/decay/release step magnitudes (from the YM2413
-    Application Manual Table III-7), KSR + KSL attenuation (Tables
-    III-2 / III-5), the `$0F` test register, `$E000` audio reset, the
+    Idle→Attack→Decay→Sustain→Release envelope with EG-TYP behaviour —
+    the **Decay / percussive-Sustain / Release** advance now driven by
+    the silicon-measured §7 global-counter rate-increment model (a
+    chip-wide counter shared by all 18 operators), with **Attack**
+    timing from the YM2413 Application Manual Table III-7 (the §7a
+    attack-level recurrence is an open DOCS-GAP) — KSR + KSL attenuation
+    (Tables III-2 / III-5), the `$0F` test register, `$E000` audio
+    reset, the
     audible AM/VIB LFO — both modulation paths now apply their
     **silicon-measured depth tables**: the VIB (vibrato) sweep uses the
     §8b 8×8 phase-modulation table (`VIB_PM_TABLE`, indexed
@@ -110,17 +114,22 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   DMC CPU-stall accounting); envelope tick timers are stepped in
   CPU-cycle batches — adequate for music, not cycle-exact.
-* OPLL envelope: the per-RATE step magnitudes on the *live* envelope
-  path still derive from the YM2413 Application Manual Table III-7 ms
-  timings. The silicon-measured §7 global-counter rate-increment model
-  (`EG_SELECT_TABLE` / `EG_HIGHRATE_TABLE` / `eg_decay_advance`, the
-  `eg_shift`/`eg_select` algorithm with the rate-52..59 high-rate
-  corrections) is landed and validated against the andete worked example
-  (decay rate 14 → segment lengths `1024,1024,2048`), but wiring it into
-  `Envelope::step` requires threading the chip-wide global counter
-  through every call site — a tracked followup. The §7a *attack-level*
-  per-step recurrence remains a documented DOCS-GAP (andete measured the
-  timing but not the exact level sequence).
+* OPLL envelope *attack*: the per-RATE step magnitude on the *live*
+  **Attack** path derives from the YM2413 Application Manual Table III-7
+  ms timings, because the §7a *attack-level* per-step recurrence remains
+  a documented DOCS-GAP (andete measured the attack timing but not the
+  exact level sequence). The **Decay / percussive-Sustain / Release**
+  path is now driven by the silicon-measured §7 global-counter
+  rate-increment model (`EG_SELECT_TABLE` / `EG_HIGHRATE_TABLE` /
+  `eg_decay_advance`, the `eg_shift`/`eg_select` algorithm with the
+  rate-52..59 high-rate corrections): a chip-wide global counter — shared
+  by all 18 operators, incremented once per output sample in `Lfo::tick`
+  — is threaded through `Envelope::step_eg`, so a decaying note follows
+  the measured stair-stepped per-sample `{0,+1,+2}` EG-level increments
+  (e.g. the `1024/1024/2048`-sample segment cadence for effective decay
+  rate 14) instead of a linearised ramp. End-to-end frame-render tests
+  confirm the rendered PCM amplitude ramps down per the model and that a
+  faster decay rate quiets sooner.
 * The VRC7 rhythm *synthesis* path for HH/SD/TOM/TOP-CYM (BD is now
   synthesised as the §V-4 two-slot FM pair, and the shared noise LFSR
   the §V-4 noise-mixed phase generator consumes is now pinned as
