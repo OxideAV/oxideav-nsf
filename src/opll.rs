@@ -99,13 +99,28 @@ pub const OPLL_SAMPLE_RATE_HZ: f32 = 49_716.0;
 /// confirmed in `opll-ym2413-tables.md` §6.
 pub const PHASE_STEPS_PER_PERIOD: u32 = 1024;
 
-/// Phase accumulator scale. The phase generator runs in 19 fractional
-/// bits over the 10-bit sine index so that the per-sample increment
-/// `fnum * 2^block * MUL` divides down cleanly. The VRC7 register-level
-/// frequency formula is `F = 49722 * fnum / 2^(19 - block)` Hz
-/// (`vrcvii-kevtris.txt` line 189); equivalently the per-49.716 kHz
-/// sample phase advance is `(fnum << block) * MUL_x2 / 2`.
-pub const PHASE_ACC_FRAC_BITS: u32 = 19;
+/// Phase accumulator fractional bits. The OPLL phase generator is a
+/// **10.9-bit fixed-point** counter (10 integer bits indexing the sine
+/// table + **9 fractional bits**), per the silicon measurement in
+/// `docs/audio/nsf/opll-ym2413/ym2413-phase-counter-andete-2015-03-16.txt`
+/// (§"conclusion": "Phase-counter is a 10.9-fixed-point counter") and
+/// `opll-ym2413-tables.md` §9 (the die-shot shows 19 horizontal bands =
+/// 19 bits total: 10 integer + 9 fractional).
+///
+/// One full sine period therefore spans `1024 << 9 = 524288` accumulator
+/// units. With the per-sample step `((fnum * MUL_x2) << block) >> 1` this
+/// reproduces andete's measured "#repeats = 512 / step-size" flat-region
+/// table and the high-frequency period-length table exactly — e.g.
+/// ML=0, block=0, fnum=256 → step-size `0x80` (128), period
+/// `524288 / 128 = 4096` samples (his measured value).
+///
+/// (A previous value of 19 fractional bits made the accumulator wrap
+/// 1024× too slowly, rendering every note ~1024× below pitch — i.e.
+/// subsonic. The unit tests only checked the per-sample `inc` deltas,
+/// which are independent of the fractional-bit count, so the wrap-period
+/// error went undetected until the frame-render integration test
+/// compared the rendered fundamental against the §9 formula.)
+pub const PHASE_ACC_FRAC_BITS: u32 = 9;
 
 // -------------------------------------------------------------- §3 MUL
 
@@ -3203,13 +3218,17 @@ mod tests {
     /// Sanity: phase_index wraps modulo 1024.
     #[test]
     fn operator_phase_index_wraps_at_1024() {
+        // Integer phase index = 1023; some non-zero fractional part
+        // (< 2^PHASE_ACC_FRAC_BITS so it stays inside the 9 fractional
+        // bits and doesn't bleed into the index).
+        let frac = (1u32 << PHASE_ACC_FRAC_BITS) - 1; // all fractional bits set
         let op = Operator {
-            phase_acc: (1023 << PHASE_ACC_FRAC_BITS) | 0x1234,
+            phase_acc: (1023 << PHASE_ACC_FRAC_BITS) | frac,
             ..Default::default()
         };
         let p = op.phase_index(0);
-        assert!(p < 1024);
-        // Adding 1 modulation step at position 1023 → wraps to 0.
+        assert_eq!(p, 1023);
+        // Adding 1 modulation step at index 1023 → wraps to 0.
         let p2 = op.phase_index(1);
         assert_eq!(p2, 0);
     }

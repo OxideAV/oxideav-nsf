@@ -61,7 +61,11 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     and divide by their count) so multi-voice tracks stay balanced
     instead of presenting only the most-recently-updated channel.
   * **VRC7** — 6 FM channels driven by the OPLL (YM2413) operator
-    pipeline: 19-bit phase generator, log-sin / exp ROMs, MUL / FB
+    pipeline: 10.9-bit fixed-point phase generator (10 integer sine-index
+    bits + 9 fractional bits, one sine period = `1024 << 9` accumulator
+    units per the andete §9 silicon measurement, so a key-on'd channel
+    renders at the doc-predicted fundamental and an end-to-end frame-render
+    test recovers it from the rendered PCM), log-sin / exp ROMs, MUL / FB
     tables, half-rectified waveforms, modulator self-feedback, the
     Idle→Attack→Decay→Sustain→Release envelope with EG-TYP behaviour,
     per-RATE attack/decay/release step magnitudes (from the YM2413
