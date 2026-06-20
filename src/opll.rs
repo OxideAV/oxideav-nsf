@@ -4096,27 +4096,30 @@ mod tests {
     }
 
     /// The §7 live envelope path (`step_eg`) follows the silicon-measured
-    /// global-counter cadence: with decay rate 14 (`eg_shift = 10`,
-    /// `eg_select = 2`) the EG level advances by exactly one on the
-    /// `1024/1024/2048` segment pattern, NOT on a linearised ramp. We
-    /// drive the envelope with an incrementing shared counter (as the
-    /// chip does) and confirm the inter-advance gaps match the measured
-    /// `eg_decay_advance` worked example.
+    /// global-counter cadence at **effective decay rate 14** — the §7
+    /// worked example (`eg_shift = 10`, `eg_select = 2` / 6-8 duty),
+    /// whose measured inter-advance gaps are the non-trivial repeating
+    /// `1024/1024/2048` segment pattern, NOT a per-sample linear ramp.
+    ///
+    /// Effective rate 14 is reached as `4·R + Rks` with `R = 3`,
+    /// `Rks = 2` (KSR on, block 1, F-Num MSB 0 → `Rks = block<<1 = 2`),
+    /// so we drive the real `effective_rate` path rather than a faster
+    /// rate. We tick the envelope with an incrementing shared counter (as
+    /// the chip does) and assert the level-change gaps are exactly the
+    /// measured segment lengths.
     #[test]
     fn step_eg_decay_follows_rate14_segment_cadence() {
         let mut e = Envelope::default();
-        // AR=15 (irrelevant here), DR=14, SL=15 (never reached during the
-        // window), RR=15, sustained tone so Decay does not early-exit.
-        e.load_from_patch(15, 14, 15, 15, true);
+        // DR R=3, sustained tone so Decay does not early-exit, SL=15
+        // (well below where we sample), KSR on so Rks contributes.
+        e.load_from_patch(15, 3, 15, 15, true);
+        e.ksr = true;
+        e.update_rks(1, 0); // block 1, fnum MSB 0 → Rks = 2 → effective 14
+        let rate = e.effective_rate(e.decay_rate);
+        assert_eq!(rate, 14, "test must drive the §7 worked-example rate");
         e.phase = EnvPhase::Decay;
         e.level_q16 = 0; // start loudest; decay ramps toward silence
-                         // effective_rate(14) with rks=0 = 4*14 = 56 — too fast. Force the
-                         // raw rate path by using a decay R that maps to effective 14: we
-                         // instead test the function directly through the envelope by
-                         // setting decay_rate so effective_rate == 14. 4*R = 14 has no
-                         // integer R, so drive eg_decay_advance via a known rate and assert
-                         // the envelope's level tracks it.
-        let rate = e.effective_rate(e.decay_rate);
+
         let mut last: Option<u32> = None;
         let mut gaps = Vec::new();
         let mut prev_level = e.level();
@@ -4133,26 +4136,14 @@ mod tests {
                 break;
             }
         }
-        // The gap sequence must equal the gaps emitted by the underlying
-        // §7 model for this exact effective rate (whatever segment lengths
-        // it dictates), proving the envelope advances on the measured
-        // sample boundaries rather than every sample.
-        let mut model_last: Option<u32> = None;
-        let mut model_gaps = Vec::new();
-        for counter in 1..=(16u32 * 1024) {
-            if eg_decay_advance(rate, counter) > 0 {
-                if let Some(p) = model_last {
-                    model_gaps.push(counter - p);
-                }
-                model_last = Some(counter);
-            }
-        }
-        let n = gaps.len().min(model_gaps.len()).min(6);
-        assert!(n > 0, "rate {rate} must produce advances in the window");
+        // 6/8 duty over eight 1024-sample windows → repeating
+        // "1024,1024,2048" gaps (rotation depends on the start phase).
+        assert!(gaps.len() >= 6, "rate 14 must produce stair-step advances");
         assert_eq!(
-            &gaps[..n],
-            &model_gaps[..n],
-            "step_eg decay must advance on the §7 measured sample boundaries (rate {rate})"
+            &gaps[..6],
+            &[1024, 1024, 2048, 1024, 1024, 2048],
+            "step_eg decay at effective rate 14 must follow the §7 measured \
+             1024/1024/2048 segment cadence, not a per-sample ramp"
         );
     }
 
