@@ -1715,13 +1715,21 @@ impl Vrc7 {
                     // test register is chip-wide, not per-channel.
                     self.test_register = crate::opll::TestRegister::from_byte(value);
                 }
-                self.refresh_from_regs();
+                // §"Internal patch set": registers $00-$07 are the
+                // user-programmable instrument (patch slot 0). A write
+                // to any of them must reload the live envelopes of every
+                // channel currently selecting patch 0 — otherwise an
+                // already-keyed user-patch channel keeps the operator
+                // constants captured at its last $3X (patch-select)
+                // write, even though the user just reprogrammed them.
+                let user_patch_write = a <= 0x07;
+                self.refresh_from_regs(user_patch_write);
             }
             _ => {}
         }
     }
 
-    fn refresh_from_regs(&mut self) {
+    fn refresh_from_regs(&mut self, user_patch_write: bool) {
         for ch in 0..6 {
             let new_fnum =
                 (self.regs[0x10 + ch] as u16) | (((self.regs[0x20 + ch] & 0x01) as u16) << 8);
@@ -1756,7 +1764,10 @@ impl Vrc7 {
                 || self.opll_channels[ch].block != new_block;
             self.opll_channels[ch].fnum = new_fnum;
             self.opll_channels[ch].block = new_block;
-            if patch_changed || volume_changed {
+            // A user-patch ($00-$07) write reloads any channel selecting
+            // patch slot 0 with the freshly-reprogrammed constants.
+            let user_patch_reload = user_patch_write && new_patch_index == 0;
+            if patch_changed || volume_changed || user_patch_reload {
                 let p = self.patch(new_patch_index);
                 self.opll_channels[ch].load_patch(&p, new_volume);
                 // Re-apply the channel-level sustain override; the
@@ -5142,6 +5153,43 @@ mod tests {
         vrc7_write_reg(&mut chip, 0x22, 0x20);
         assert!(chip.channels[2].sustain);
         assert!(!chip.channels[2].key_on);
+    }
+
+    /// §"Internal patch set": a write to the user-patch registers
+    /// ($00-$07) must reload the live operator constants of any channel
+    /// already selecting patch slot 0 — even when the $3X patch-index /
+    /// volume bytes are unchanged (so the patch-swap reload path doesn't
+    /// fire). Regression: previously the user-patch AR/DR/etc. only
+    /// reached the envelopes on a $3X patch/volume change, so a track
+    /// that programs $00-$07 *after* selecting patch 0 ran with the
+    /// default (zeroed) operator constants.
+    #[test]
+    fn vrc7_user_patch_write_reloads_patch_zero_channels() {
+        let mut chip = Vrc7::new();
+        // Channel 0 already selects patch 0, volume 0 (the power-on
+        // default) — so the $30 write below is a no-op for the swap path.
+        vrc7_write_reg(&mut chip, 0x30, 0x00);
+        assert_eq!(chip.opll_channels[0].carrier.env.attack_rate, 0);
+        // Now program the user patch with a distinctive carrier AR.
+        vrc7_write_reg(&mut chip, 0x05, 0xF7); // carrier $05: AR=15, DR=7
+        assert_eq!(
+            chip.opll_channels[0].carrier.env.attack_rate, 15,
+            "user-patch $05 write must reload patch-0 channel's carrier AR"
+        );
+        vrc7_write_reg(&mut chip, 0x04, 0xA3); // modulator $04: AR=10, DR=3
+        assert_eq!(
+            chip.opll_channels[0].modulator.env.attack_rate, 10,
+            "user-patch $04 write must reload patch-0 channel's modulator AR"
+        );
+        // A channel on a ROM patch (index 1) must NOT be disturbed by a
+        // user-patch write.
+        vrc7_write_reg(&mut chip, 0x31, 0x10); // channel 1 → patch 1
+        let rom_ar = chip.opll_channels[1].carrier.env.attack_rate;
+        vrc7_write_reg(&mut chip, 0x05, 0x11); // reprogram user patch
+        assert_eq!(
+            chip.opll_channels[1].carrier.env.attack_rate, rom_ar,
+            "user-patch write must not touch a ROM-patch channel"
+        );
     }
 
     #[test]
