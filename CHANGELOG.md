@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OPLL envelope *attack* now also §7 global-counter-driven** with the
+  measured 12-level sequence
+  (`docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §7 +
+  `ym2413-envelope-attack-rates-andete-2015-03-27.txt`). The live attack
+  path (`Envelope::step_eg`) no longer linearises the Table III-7
+  ms-timing: its transition *timing* now reuses the same §7
+  `eg_shift`/`eg_select` global-counter duty as decay (new
+  `eg_attack_advance`), and each transition lands on the next entry of the
+  silicon-measured 12-level `ATTACK_LEVEL_SEQUENCE`
+  (`127,95,71,53,39,28,20,13,9,5,1,0`) that andete found *every* attack
+  passes through regardless of rate. Effective rate ≤ 3 never completes
+  the attack; rate ≥ 60 is instantaneous (jump straight to the loudest
+  level). Only the exact level-generating *recurrence* (and its
+  initial-level dependence) remains the open §7a gap — the measured level
+  *sequence* itself is concrete data. New `step_eg`
+  attack-cadence / level-sequence / boundary unit tests cover it.
+
 - **OPLL envelope decay/release now driven by the §7 silicon-measured
   global-counter rate-increment model** (`docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md`
   §7 + `ym2413-envelope-decay-rates-andete-2015-03-20.txt`). A single
@@ -34,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   audible path, not just the unit envelope.
 
 ### Fixed
+
+- **VRC7 user-patch ($00-$07) writes now reload patch-0 channels**: a
+  write to the user-programmable instrument registers ($00-$07) previously
+  only reached a channel's live operator envelopes via the $3X
+  patch-index/volume *swap* path, so a track that programmed the user
+  patch *after* selecting patch slot 0 (with no subsequent $3X change) ran
+  the operators with the default zeroed AR/DR/SL/RR constants. The chip
+  now reloads every channel currently selecting patch 0 on any $00-$07
+  write (ROM-patch channels are left untouched). Regression test added.
 
 - **OPLL phase-generator pitch**: the phase accumulator's fractional-bit
   count was 19, but the YM2413 phase counter is **10.9 fixed-point** (10

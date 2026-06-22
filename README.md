@@ -68,11 +68,14 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     test recovers it from the rendered PCM), log-sin / exp ROMs, MUL / FB
     tables, half-rectified waveforms, modulator self-feedback, the
     Idle→Attack→Decay→Sustain→Release envelope with EG-TYP behaviour —
-    the **Decay / percussive-Sustain / Release** advance now driven by
-    the silicon-measured §7 global-counter rate-increment model (a
-    chip-wide counter shared by all 18 operators), with **Attack**
-    timing from the YM2413 Application Manual Table III-7 (the §7a
-    attack-level recurrence is an open DOCS-GAP) — KSR + KSL attenuation
+    the **Decay / percussive-Sustain / Release** *and* the **Attack**
+    advance now all driven by the silicon-measured §7 global-counter
+    rate-increment model (a chip-wide counter shared by all 18 operators);
+    the Attack reuses the same `eg_shift`/`eg_select` global-counter
+    *timing* as decay and steps the silicon-measured 12-level
+    `ATTACK_LEVEL_SEQUENCE` (`127,95,71,53,39,28,20,13,9,5,1,0`) that every
+    attack passes through, so only the exact level-generating *recurrence*
+    (the §7a gap) is still open — KSR + KSL attenuation
     (Tables III-2 / III-5), the `$0F` test register, `$E000` audio
     reset, the
     audible AM/VIB LFO — both modulation paths now apply their
@@ -114,11 +117,15 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
   DMC CPU-stall accounting); envelope tick timers are stepped in
   CPU-cycle batches — adequate for music, not cycle-exact.
-* OPLL envelope *attack*: the per-RATE step magnitude on the *live*
-  **Attack** path derives from the YM2413 Application Manual Table III-7
-  ms timings, because the §7a *attack-level* per-step recurrence remains
-  a documented DOCS-GAP (andete measured the attack timing but not the
-  exact level sequence). The **Decay / percussive-Sustain / Release**
+* OPLL envelope *attack*: the live **Attack** path is now §7-driven —
+  its transition *timing* uses the silicon-measured global-counter
+  `eg_shift`/`eg_select` duty (the same model as decay) and each step
+  lands on the next entry of the measured 12-level `ATTACK_LEVEL_SEQUENCE`
+  (`127,95,71,53,39,28,20,13,9,5,1,0`). Only the exact level-generating
+  *recurrence* (and its initial-EG-level dependence) is the open §7a
+  DOCS-GAP — andete measured the timing and the 12-level sequence but
+  could only approximate the generating formula (`x = 127; x += ~x >> 2`
+  diverges near the tail). The **Decay / percussive-Sustain / Release**
   path is now driven by the silicon-measured §7 global-counter
   rate-increment model (`EG_SELECT_TABLE` / `EG_HIGHRATE_TABLE` /
   `eg_decay_advance`, the `eg_shift`/`eg_select` algorithm with the

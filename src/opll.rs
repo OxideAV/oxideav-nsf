@@ -694,6 +694,13 @@ pub struct Envelope {
     /// Updated via [`Envelope::update_rks`] whenever the channel's
     /// fnum / block changes.
     pub rks: u8,
+    /// Index into [`ATTACK_LEVEL_SEQUENCE`] on the §7 attack path
+    /// ([`Envelope::step_eg`]). Reset to `0` on [`Envelope::key_on`];
+    /// each attack-timing fire ([`eg_attack_advance`]) advances it one
+    /// entry until it reaches the loudest level (sequence end), at which
+    /// point the envelope transitions to Decay. Unused by the legacy
+    /// Table III-7 [`Envelope::step`] path.
+    pub attack_step: u8,
 }
 
 /// Maximum envelope level (silence). Per andete §"envelope levels":
@@ -806,6 +813,96 @@ pub fn eg_decay_advance(rate: u8, global_counter: u32) -> u8 {
     EG_SELECT_TABLE[eg_select][idx]
 }
 
+/// §7 measured **attack EG-level sequence** — the 12 attenuation levels the
+/// envelope steps through on its way up from silence (EG-level ≈ 127) to
+/// full amplitude (EG-level 0).
+///
+/// andete's attack-rate measurement
+/// (`ym2413-envelope-attack-rates-andete-2015-03-27.txt`, §7a of
+/// `opll-ym2413-tables.md`) found that *every* attack — independent of rate —
+/// passes through the same 12 amplitude levels, and matched each measured
+/// peak amplitude to its decay-EG level:
+///
+/// ```text
+/// attack-step  amplitude  EG-level (canonical sequence)
+///      1            1       127  (112-127, silenced)
+///      2            4        95  ( 91- 95)
+///      3           11        71  ( 71- 72)
+///      4           25        53
+///      5           47        39
+///      6           75        28
+///      7          107        20
+///      8          145        13
+///      9          172         9
+///     10          205         5
+///     11          244         1
+///     12          255         0  (loudest)
+/// ```
+///
+/// The first three entries were measured as ranges (the low amplitudes
+/// alias multiple EG levels); the doc's "by far, the majority of the cases"
+/// sequence `112-127, 91-95, 71-72, 53, 39, 28, 20, 13, 9, 5, 1, 0` is taken
+/// as canonical, with the range entries pinned to the value the doc's own
+/// `lookupExp` amplitude table assigns that amplitude (127, 95, 71).
+///
+/// The exact generating *recurrence* (and its dependence on the initial EG
+/// level) is the open §7a GAP — but the measured level *sequence* itself is
+/// concrete data, so it drives the live attack envelope here. The attack
+/// *timing* (when each step fires) is fully RE'd and reuses the §7
+/// global-counter algorithm via [`eg_attack_advance`].
+pub const ATTACK_LEVEL_SEQUENCE: [u8; 12] = [127, 95, 71, 53, 39, 28, 20, 13, 9, 5, 1, 0];
+
+/// §7 attack-timing advance for one output sample. Returns `1` when the
+/// attack envelope should advance to its next [`ATTACK_LEVEL_SEQUENCE`]
+/// step this sample, else `0`.
+///
+/// Per §7 of `opll-ym2413-tables.md` the attack transition *timing*
+/// "reuses the same timing logic" as decay/release — the same
+/// `eg_shift`/`eg_select` global-counter duty (`EG_SELECT_TABLE`) decides
+/// which samples fire a step. The special-rate boundaries differ slightly
+/// from decay:
+///
+/// * `rate <= 3`: never advance (attack never completes — matches
+///   `ym2413-envelope-attack-rates-andete-2015-03-27.txt` "rates 0..3 take
+///   infinitely long").
+/// * `rate >= 60`: instantaneous attack — jump straight to the max level
+///   (returns the whole remaining sequence as a single advance; the caller
+///   saturates `attack_step` to the end).
+/// * otherwise: the §7 `eg_shift = 13 - rate/4`, `eg_select = rate & 3`
+///   duty, consulted only on the samples where the `eg_shift`-windowed
+///   counter rolls over (low `eg_shift` bits all zero). The duty pattern
+///   then thins those rollovers to the measured 4/8…7/8 cadence — exactly
+///   as for decay.
+///
+/// Unlike decay this never returns the high-rate `+2` doubling: the attack
+/// advances at most one *step* of the 12-entry sequence per fire (each step
+/// already spans several EG levels). Rates 52..59 reuse the decay
+/// high-rate window to decide whether a sample fires, treating any non-zero
+/// table entry as a single step.
+#[inline]
+pub fn eg_attack_advance(rate: u8, global_counter: u32) -> u8 {
+    if rate <= 3 {
+        return 0;
+    }
+    if rate >= 60 {
+        // Instantaneous attack: caller jumps straight to the end.
+        return ATTACK_LEVEL_SEQUENCE.len() as u8;
+    }
+    if (52..=59).contains(&rate) {
+        let eg_shift = 13i32 - (rate as i32) / 4;
+        let shift = eg_shift.max(0) as u32;
+        let idx = ((global_counter >> shift) & 15) as usize;
+        return u8::from(EG_HIGHRATE_TABLE[(rate - 52) as usize][idx] != 0);
+    }
+    let eg_shift = 13 - (rate / 4);
+    if global_counter & ((1u32 << eg_shift) - 1) != 0 {
+        return 0;
+    }
+    let eg_select = (rate & 3) as usize;
+    let idx = ((global_counter >> eg_shift) & 7) as usize;
+    u8::from(EG_SELECT_TABLE[eg_select][idx] != 0)
+}
+
 impl Envelope {
     /// Integer attenuation level (0..=127).
     #[inline]
@@ -874,8 +971,14 @@ impl Envelope {
     }
 
     /// Key-on: start the attack phase from whatever level we're at.
+    ///
+    /// Resets [`Envelope::attack_step`] so the §7 attack path
+    /// ([`Envelope::step_eg`]) walks [`ATTACK_LEVEL_SEQUENCE`] from its
+    /// silenced first entry.
     pub fn key_on(&mut self) {
         self.phase = EnvPhase::Attack;
+        self.attack_step = 0;
+        self.level_q16 = (ATTACK_LEVEL_SEQUENCE[0] as u32) << 16;
     }
 
     /// Key-off: enter the release phase. The starting level is whatever
@@ -994,12 +1097,17 @@ impl Envelope {
     /// `1024/1024/2048`-sample segment cadence instead of a linearised
     /// ramp.
     ///
-    /// The **Attack** phase still uses the Table III-7 timing
-    /// ([`attack_step_q16_per_sample`]): §7's algorithm fully describes
-    /// attack *timing*, but the exact attack EG-**level** sequence is the
-    /// documented §7a gap (andete measured the timing but only
-    /// approximated the level recurrence), so no measured per-step level
-    /// table exists to drive a §7 attack here.
+    /// The **Attack** phase is now also §7-driven: its *timing* "reuses
+    /// the same timing logic" as decay (the §7 global-counter
+    /// `eg_shift`/`eg_select` duty, via [`eg_attack_advance`]), and its
+    /// per-step *level* walks the measured 12-entry
+    /// [`ATTACK_LEVEL_SEQUENCE`]. andete's attack-rate measurement found
+    /// every attack passes through the same 12 amplitude levels; only the
+    /// exact generating *recurrence* (and its initial-level dependence)
+    /// remains the open §7a gap — the measured level *sequence* itself is
+    /// concrete data. So the live attack no longer linearises the Table
+    /// III-7 ms-timing: it stair-steps through the silicon-measured levels
+    /// on the silicon-measured cadence.
     ///
     /// `global_counter` is the post-increment value of the chip-wide
     /// counter for this sample (caller passes [`Lfo::global_counter`]).
@@ -1013,12 +1121,23 @@ impl Envelope {
                 self.level_q16 = ENV_MAX_LEVEL << 16;
             }
             EnvPhase::Attack => {
-                // §7a gap: attack EG-level recurrence is not measured;
-                // retain the Table III-7 attack-time ramp.
-                let step = attack_step_q16_per_sample(self.effective_rate(self.attack_rate));
-                self.level_q16 = self.level_q16.saturating_sub(step);
-                if self.level_q16 == 0 {
-                    self.phase = EnvPhase::Decay;
+                // §7 attack: the global-counter duty decides when a step
+                // fires; ATTACK_LEVEL_SEQUENCE decides what level it lands
+                // on. rate>=60 fires the whole remaining sequence at once
+                // (instantaneous attack).
+                let rate = self.effective_rate(self.attack_rate);
+                let fire = eg_attack_advance(rate, global_counter);
+                if fire > 0 {
+                    let last = (ATTACK_LEVEL_SEQUENCE.len() - 1) as u8;
+                    self.attack_step = self.attack_step.saturating_add(fire).min(last);
+                    self.level_q16 =
+                        (ATTACK_LEVEL_SEQUENCE[self.attack_step as usize] as u32) << 16;
+                    if self.attack_step >= last {
+                        // Reached the loudest level (EG-level 0): attack
+                        // complete, hand off to Decay.
+                        self.level_q16 = 0;
+                        self.phase = EnvPhase::Decay;
+                    }
                 }
             }
             EnvPhase::Decay => {
@@ -2166,8 +2285,10 @@ impl OpllChannel {
         }
 
         // Step the envelopes via the §7 silicon-measured global-counter
-        // model (decay/sustain/release follow the measured per-sample EG
-        // increments; attack keeps the Table III-7 timing — §7a gap).
+        // model: decay/sustain/release follow the measured per-sample EG
+        // increments, and attack now also uses the §7 global-counter
+        // timing while stepping the measured 12-level ATTACK_LEVEL_SEQUENCE
+        // (only the exact level-generating recurrence remains the §7a gap).
         // Both operators read the SAME chip-wide counter, as on the die.
         // Per §"Test Register $0F" bit 0: "The envelopes are still
         // running while their output is overridden." — so we tick them
@@ -4147,28 +4268,134 @@ mod tests {
         );
     }
 
-    /// `step_eg` attack still uses the Table III-7 timing (the §7a
-    /// attack-EG-level recurrence is a documented gap): a key-on'd
-    /// envelope ramps DOWN toward 0 and transitions to Decay.
+    /// `step_eg` attack now walks the §7 measured [`ATTACK_LEVEL_SEQUENCE`]
+    /// on the §7 global-counter cadence: a key-on'd envelope starts at the
+    /// silenced first level (127), ramps DOWN through the measured levels,
+    /// and transitions to Decay at the loudest (level 0).
     #[test]
     fn step_eg_attack_ramps_to_decay() {
         let mut e = Envelope::default();
         e.load_from_patch(15, 1, 0, 15, true);
         e.key_on();
+        // key_on seeds the silenced first sequence entry.
+        assert_eq!(e.level(), ATTACK_LEVEL_SEQUENCE[0] as u32);
         let before = e.level();
         let mut counter = 0u32;
-        for _ in 0..4000 {
+        for _ in 0..400_000 {
             counter += 1;
             e.step_eg(counter);
             if e.phase != EnvPhase::Attack {
                 break;
             }
         }
-        assert!(
-            e.level() < before || e.phase != EnvPhase::Attack,
-            "attack must move toward 0; phase={:?}",
-            e.phase
+        assert_ne!(e.phase, EnvPhase::Attack, "attack must complete to Decay");
+        assert!(e.level() < before, "attack must end louder than it started");
+    }
+
+    /// The §7 attack path visits exactly the measured 12-entry
+    /// [`ATTACK_LEVEL_SEQUENCE`], in order, and no other levels. Drive a
+    /// mid-range attack rate and collect every distinct level the envelope
+    /// takes while in Attack; it must be a prefix-walk of the sequence.
+    #[test]
+    fn step_eg_attack_visits_measured_level_sequence() {
+        let mut e = Envelope::default();
+        // AR R=5, SL=0, sustained tone; KSR off so effective rate = 4·5 = 20.
+        e.load_from_patch(5, 1, 0, 15, true);
+        e.key_on();
+        let rate = e.effective_rate(e.attack_rate);
+        assert_eq!(rate, 20, "test drives effective attack rate 20");
+
+        let mut visited = Vec::new();
+        visited.push(e.level() as u8);
+        let mut counter = 0u32;
+        for _ in 0..2_000_000 {
+            counter += 1;
+            let was_attack = e.phase == EnvPhase::Attack;
+            e.step_eg(counter);
+            if was_attack {
+                let lvl = e.level() as u8;
+                if *visited.last().unwrap() != lvl {
+                    visited.push(lvl);
+                }
+            }
+            if e.phase != EnvPhase::Attack {
+                break;
+            }
+        }
+        assert_ne!(e.phase, EnvPhase::Attack, "attack must terminate");
+        // Every visited level must come from the measured sequence, in
+        // monotonically-advancing order (the final 0 is set as the Decay
+        // hand-off level).
+        assert_eq!(
+            visited, ATTACK_LEVEL_SEQUENCE,
+            "§7 attack must stair-step the measured 12-level sequence exactly"
         );
+    }
+
+    /// §7 attack timing reuses the decay global-counter duty: at effective
+    /// attack rate 20 (`eg_shift = 13 - 5 = 8` → rollover every 256
+    /// samples, `eg_select = 0` / 4-8 duty `[0,1,0,1,0,1,0,1]`), the
+    /// step-to-step gaps repeat 512 samples (every other rollover fires).
+    #[test]
+    fn step_eg_attack_follows_global_counter_cadence() {
+        let mut e = Envelope::default();
+        e.load_from_patch(5, 1, 0, 15, true); // AR R=5 → effective 20
+        e.key_on();
+        assert_eq!(e.effective_rate(e.attack_rate), 20);
+
+        let mut last: Option<u32> = None;
+        let mut gaps = Vec::new();
+        let mut prev = e.level();
+        for counter in 1..=(64u32 * 256) {
+            let was_attack = e.phase == EnvPhase::Attack;
+            e.step_eg(counter);
+            if was_attack && e.level() != prev {
+                if let Some(p) = last {
+                    gaps.push(counter - p);
+                }
+                last = Some(counter);
+                prev = e.level();
+            }
+            if e.phase != EnvPhase::Attack {
+                break;
+            }
+        }
+        assert!(gaps.len() >= 4, "attack must stair-step several times");
+        // eg_shift = 8 → rollover every 256 samples; eg_select 0 duty
+        // [0,1,0,1,...] fires on every 2nd rollover → 512-sample gaps.
+        assert!(
+            gaps.iter().all(|&g| g == 512),
+            "rate-20 attack gaps must be the §7 512-sample cadence, got {gaps:?}"
+        );
+    }
+
+    /// §7 attack rate boundaries: effective rate ≤ 3 never completes the
+    /// attack (`eg_attack_advance` halts); rate ≥ 60 is instantaneous (the
+    /// envelope jumps straight to the loudest level on the first fire).
+    #[test]
+    fn eg_attack_advance_boundaries() {
+        for rate in 0..=3 {
+            for counter in 0..4096 {
+                assert_eq!(eg_attack_advance(rate, counter), 0, "rate {rate} halts");
+            }
+        }
+        for rate in 60..=63 {
+            assert_eq!(
+                eg_attack_advance(rate, 1) as usize,
+                ATTACK_LEVEL_SEQUENCE.len(),
+                "rate {rate} attack is instantaneous"
+            );
+        }
+        // Instantaneous attack: one step jumps to Decay at the loudest.
+        let mut e = Envelope::default();
+        e.load_from_patch(15, 1, 0, 15, true); // AR R=15
+        e.ksr = true;
+        e.update_rks(7, 1); // maximise Rks so effective AR saturates ≥ 60
+        assert!(e.effective_rate(e.attack_rate) >= 60);
+        e.key_on();
+        e.step_eg(1);
+        assert_eq!(e.phase, EnvPhase::Decay);
+        assert_eq!(e.level(), 0, "instantaneous attack lands at loudest");
     }
 
     /// `step_eg` honours the rate-halt boundary: effective rate 0 (R=0)
