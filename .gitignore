@@ -1,1 +1,12 @@
-Cargo.lock
+# Rust build lockfile — this crate is a library, so we do not commit
+# Cargo.lock at the crate root. Anchored to the crate root with a
+# leading slash so the conventional `fuzz/Cargo.lock` (a separate,
+# non-published cargo-fuzz binary crate) CAN be committed.
+/Cargo.lock
+
+# Cargo-fuzz build + corpus artefacts. The harness sources under
+# `fuzz/fuzz_targets/` ARE committed; build artefacts and accumulated
+# corpora / crash artefacts are not.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

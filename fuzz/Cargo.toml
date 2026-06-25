@@ -1,0 +1,68 @@
+[package]
+name = "oxideav-nsf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The in-tree `tests/parse_fuzz.rs` already drives `parse_nsf` +
+# `NsfPlayer::render` through a deterministic in-process LCG over a
+# hand-enumerated battery (truncated prefixes, every single-byte header
+# mutation, every `$7B` expansion-chip mask, random programs behind a
+# valid header, structured / random NSFe chunk streams). That harness is
+# fast (runs in `cargo test`), reproducible, and is what CI exercises.
+#
+# What it does NOT do is coverage-guided exploration of the parse +
+# render product space. This libfuzzer crate fills that other half. Each
+# target is independent so cargo-fuzz can prioritise corpus per surface:
+#
+# - `parse_nsf`        — the header-dispatch surface: v1 / v2 / NSFe
+#   selection + every length / address / chunk-size guard. Contract: any
+#   byte slice yields `Ok(NsfHeader)` or `Err(NsfError)`, never a panic.
+# - `parse_and_render` — the highest-value target: for inputs that parse,
+#   build an `NsfPlayer` and render a bounded buffer, so the 6502 core,
+#   2A03 APU, and every enabled expansion chip run on adversarial 6502
+#   program bytes. Contract: build + start + render never panics and
+#   always terminates (the player is halt-guarded).
+# - `nsfe_metadata`    — the NSFe extended-metadata chunk decoders
+#   (`auth`/`time`/`fade`/`plst`/`psfx`/`mixe`/`regn`/`RATE`/`VRC7`)
+#   exercised directly through a synthesised `NSFE` container so a
+#   hostile chunk payload can't panic the metadata sub-parsers.
+#
+# Every target's entry point is a public API already covered by the
+# in-tree harness, so a crash here is a real robustness bug in the
+# parser / player, not in any fuzz-only glue.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-nsf]
+path = ".."
+
+# Keep the cargo-fuzz crate out of the umbrella workspace resolve graph:
+# libfuzzer-sys needs nightly and pulls its own deps that don't belong
+# in the umbrella.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_nsf"
+path = "fuzz_targets/parse_nsf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_and_render"
+path = "fuzz_targets/parse_and_render.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "nsfe_metadata"
+path = "fuzz_targets/nsfe_metadata.rs"
+test = false
+doc = false
