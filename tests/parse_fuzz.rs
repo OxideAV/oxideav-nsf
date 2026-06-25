@@ -230,6 +230,37 @@ fn every_expansion_chip_mask_renders() {
 }
 
 #[test]
+fn bankswitched_with_every_chip_mask_and_random_program_never_panic() {
+    // Set a non-zero `bankswitch_init` (header `$70..=$77`) so the
+    // bankswitched load path runs, sweep every expansion-chip mask, and
+    // feed a random program. This exercises the FDS bank-pool copy paths
+    // (`$5FF6/$5FF7` → cart RAM, `$5FF8..` → FDS RAM image) and the
+    // bank_read window resolution against a fuzzer-built bank pool. The
+    // bank-select bytes are also mutated mid-stream by the random
+    // program's writes to `$5FFx`.
+    let mut rng = Lcg::new(0xBA5E_BA11);
+    for _ in 0..256 {
+        let mut buf = minimal_v1();
+        // Chip mask in `$7B`.
+        buf[0x7b] = rng.next_u8() & 0x3F;
+        // Non-zero bankswitch init across all 8 windows.
+        for w in 0..8usize {
+            buf[0x70 + w] = rng.next_u8();
+        }
+        // Random program of a random (sometimes sub-bank, sometimes
+        // multi-bank) length.
+        let prog_len = (rng.next_u64() % 5000) as usize + 1;
+        let mut prog = vec![0u8; prog_len];
+        rng.fill(&mut prog);
+        buf.extend_from_slice(&prog);
+        assert!(
+            drive(&buf),
+            "bankswitched header + chip mask + random program must parse + render",
+        );
+    }
+}
+
+#[test]
 fn nsfe_random_chunk_streams_never_panic() {
     // Build `NSFE` + random chunk bytes. The chunk walker reads a 32-bit
     // size + 4-char tag per chunk; hostile sizes must be caught by the
