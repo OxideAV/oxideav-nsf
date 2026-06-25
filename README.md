@@ -152,6 +152,14 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * `tests/real_rip.rs` fetches a real rip from `samples.oxideav.org`,
   renders 30 wall-clock seconds, and asserts the player never halts
   (network-gated by `OXIDEAV_NETWORK_TESTS=1`).
+* `tests/parse_fuzz.rs` is a deterministic never-panic / never-hang
+  robustness battery: a self-contained LCG drives `parse_nsf` +
+  `NsfPlayer` render through truncated prefixes, every single-byte
+  header mutation, every `$7B` expansion-chip mask (with + without
+  bankswitching), random 6502 programs behind a valid header, and
+  structured / random NSFe chunk streams. The matching coverage-guided
+  `fuzz/` libfuzzer crate (targets `parse_nsf` / `parse_and_render` /
+  `nsfe_metadata`) explores the same surface under `cargo fuzz`.
 * Unit tests cover the CPU, APU, and each expansion chip's register
   decoding and signal generation.
 
