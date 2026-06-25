@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **FDS RAM image is now sized whenever the FDS chip is enabled**, not
+  only on the bankswitched load path. An FDS-flagged header that did not
+  bankswitch (`bankswitch_init` all-zero) left `fds_ram` a zero-length
+  vector, so the first write to `$8000..=$FFFF` (and any non-bankswitched
+  read once FDS turns that window into RAM) indexed an empty vector and
+  panicked. `configure_from_header` now allocates the `$8000`-byte FDS
+  RAM image and primes it from the loaded program for the
+  non-bankswitched case, and the non-bankswitched read path routes
+  `$8000..=$FFFF` through `fds_ram` so a self-modifying FDS program sees
+  its own writes. Found by the new `tests/parse_fuzz.rs` harness.
+
+### Added
+
+- **`tests/parse_fuzz.rs` — never-panic / never-hang robustness battery**
+  for the whole parse + render surface. A self-contained xorshift LCG
+  (no external crates) drives `parse_nsf` and, for inputs that parse, an
+  `NsfPlayer` render through truncated prefixes, every single-byte header
+  mutation, every expansion-chip mask (`$7B` bits 0..5), random byte
+  streams, random programs behind a valid header (so the 6502 + 2A03 APU
+  + expansion render loop runs on adversarial code), and structured /
+  random NSFe chunk streams (so the `auth`/`time`/`fade`/`plst`/`psfx`/
+  `mixe`/`regn`/`RATE`/`VRC7` metadata sub-parsers run on hostile
+  payloads). This is the deterministic, CI-runnable half of the
+  coverage-guided `fuzz/` libfuzzer harness.
+
 ### Changed
 
 - **OPLL envelope *attack* now also §7 global-counter-driven** with the

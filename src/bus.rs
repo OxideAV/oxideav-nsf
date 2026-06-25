@@ -315,6 +315,22 @@ impl NesBus {
             self.load_program(header.load_addr, &header.program);
         }
 
+        // FDS turns `$8000..=$FFFF` into RAM, so every read/write in
+        // that window is serviced from `fds_ram`. The bankswitched path
+        // (`load_bankswitched`) sizes + primes it from the bank pool;
+        // the non-bankswitched `load_program` path leaves the program
+        // in `self.prg`, so mirror it into `fds_ram` here. Without this
+        // an FDS-flagged non-bankswitched header left `fds_ram` empty
+        // and any `$8000..` access (read at `bank_read`, write at
+        // `0x8000..=0xFFFF`) indexed a zero-length vector and panicked.
+        if self.fds_enabled && self.fds_ram.is_empty() {
+            self.fds_ram = vec![0u8; 0x8000];
+            // `self.prg` holds the loaded program at `load_addr - 0x8000`
+            // offsets; copy it into the FDS RAM image so reads see the
+            // program bytes the player just installed.
+            self.fds_ram.copy_from_slice(&self.prg[..0x8000]);
+        }
+
         // NSF2: arm IRQ timer + vector overlay if the feature byte
         // requests it. The player layer drives `arm_vector_overlay`
         // with concrete sentinel addresses; we just gate the
@@ -423,6 +439,13 @@ impl NesBus {
             0x8000..=0xFFFF => {
                 let byte = if self.bankswitched {
                     self.bank_read(addr)
+                } else if self.fds_enabled {
+                    // FDS makes `$8000..=$FFFF` writable RAM; reads must
+                    // come from the same `fds_ram` image the write path
+                    // updates so a self-modifying FDS program sees its
+                    // own writes (the bankswitched path already routes
+                    // through `bank_read` → `fds_ram`).
+                    self.fds_ram[(addr - 0x8000) as usize]
                 } else {
                     self.prg[(addr - 0x8000) as usize]
                 };
