@@ -64,12 +64,89 @@ const MAX_CYCLES_PER_CALL: u32 = 1_000_000;
 pub const NMI_WRAPPER_ADDR: u16 = 0x0200;
 
 /// Player state machine.
+/// Post-DAC analog signal conditioning per
+/// `docs/audio/nsf/apu-mixer-wiki.html` §"The NES hardware follows the
+/// DACs with a surprisingly involved circuit": two first-order high-pass
+/// filters (90 Hz and 440 Hz) followed by a first-order low-pass at
+/// 14 kHz. The high-passes remove the DC bias of the `[0, 1]`-ranged
+/// mixer output (the APU DACs only swing positive) and the low-pass
+/// tames the harshest aliasing, both of which markedly affect how an NSF
+/// rip actually sounds. Filters run at the player's output sample rate.
+struct OutputFilter {
+    /// First-order high-pass state (previous input + output) per stage.
+    hp90_prev_in: f32,
+    hp90_prev_out: f32,
+    hp440_prev_in: f32,
+    hp440_prev_out: f32,
+    /// First-order low-pass state.
+    lp_prev_out: f32,
+    /// Per-stage smoothing coefficients (derived from the cutoff and the
+    /// output sample period).
+    hp90_alpha: f32,
+    hp440_alpha: f32,
+    lp_alpha: f32,
+}
+
+impl OutputFilter {
+    fn new(sample_rate: u32) -> Self {
+        let dt = 1.0 / sample_rate as f32;
+        // First-order high-pass: alpha = RC / (RC + dt) with RC =
+        // 1 / (2*pi*fc).
+        let hp_alpha = |fc: f32| {
+            let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
+            rc / (rc + dt)
+        };
+        // First-order low-pass: alpha = dt / (RC + dt).
+        let lp_alpha = |fc: f32| {
+            let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
+            dt / (rc + dt)
+        };
+        Self {
+            hp90_prev_in: 0.0,
+            hp90_prev_out: 0.0,
+            hp440_prev_in: 0.0,
+            hp440_prev_out: 0.0,
+            lp_prev_out: 0.0,
+            hp90_alpha: hp_alpha(90.0),
+            hp440_alpha: hp_alpha(440.0),
+            lp_alpha: lp_alpha(14_000.0),
+        }
+    }
+
+    /// Push one mixer sample through HP90 → HP440 → LP14k.
+    fn process(&mut self, x: f32) -> f32 {
+        // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+        let y90 = self.hp90_alpha * (self.hp90_prev_out + x - self.hp90_prev_in);
+        self.hp90_prev_in = x;
+        self.hp90_prev_out = y90;
+
+        let y440 = self.hp440_alpha * (self.hp440_prev_out + y90 - self.hp440_prev_in);
+        self.hp440_prev_in = y90;
+        self.hp440_prev_out = y440;
+
+        // y[n] = y[n-1] + alpha * (x[n] - y[n-1])
+        let ylp = self.lp_prev_out + self.lp_alpha * (y440 - self.lp_prev_out);
+        self.lp_prev_out = ylp;
+        ylp
+    }
+
+    fn reset(&mut self) {
+        self.hp90_prev_in = 0.0;
+        self.hp90_prev_out = 0.0;
+        self.hp440_prev_in = 0.0;
+        self.hp440_prev_out = 0.0;
+        self.lp_prev_out = 0.0;
+    }
+}
+
 pub struct NsfPlayer {
     pub cpu: Cpu6502,
     pub bus: NesBus,
     pub header: NsfHeader,
     cpu_hz: u32,
     sample_rate: u32,
+    /// Post-DAC analog filter chain applied to the mixer output.
+    filter: OutputFilter,
     /// Cycles between consecutive `play` calls.
     play_period_cycles: u32,
     /// CPU cycles since the last `play` call.
@@ -132,6 +209,7 @@ impl NsfPlayer {
             header,
             cpu_hz,
             sample_rate,
+            filter: OutputFilter::new(sample_rate),
             play_period_cycles,
             cycles_since_play: 0,
             cycles_per_sample: cpu_hz as f64 / sample_rate as f64,
@@ -228,6 +306,7 @@ impl NsfPlayer {
         self.started = true;
         self.cycles_since_play = 0;
         self.sample_acc = 0.0;
+        self.filter.reset();
     }
 
     /// Push the stop sentinel, seed registers, and jump to INIT.
@@ -328,9 +407,14 @@ impl NsfPlayer {
                 break;
             }
         }
+        // Raw mixer output is in [0, ~1] (the APU DACs only swing
+        // positive). Run it through the documented post-DAC analog
+        // filter chain, which removes the DC bias (centring the signal
+        // about zero) and rolls off the harshest highs, then scale to
+        // i16 with a touch of headroom.
         let level = self.bus.apu.output_sample();
-        // level is in [0, ~1]. Scale to i16 with a touch of headroom.
-        (level * 28_000.0).clamp(-32_768.0, 32_767.0) as i16
+        let filtered = self.filter.process(level);
+        (filtered * 28_000.0).clamp(-32_768.0, 32_767.0) as i16
     }
 
     fn invoke_play(&mut self) {
@@ -470,6 +554,49 @@ pub fn _tiny_test_program() -> ([u8; 0x80], Vec<u8>) {
 mod tests {
     use super::*;
     use crate::header::parse_nsf;
+
+    #[test]
+    fn output_filter_removes_dc_bias() {
+        // A constant input (pure DC, like a held silenced channel) must
+        // decay toward zero through the two high-pass stages.
+        let mut f = OutputFilter::new(44_100);
+        let mut last = 0.0;
+        for _ in 0..44_100 {
+            last = f.process(0.5);
+        }
+        assert!(last.abs() < 1e-3, "DC not removed: {last}");
+    }
+
+    #[test]
+    fn output_filter_passes_audible_ac() {
+        // A 1 kHz square-ish alternating signal (well inside the
+        // 90 Hz..14 kHz passband) must survive with substantial
+        // amplitude rather than being filtered to nothing.
+        let mut f = OutputFilter::new(44_100);
+        // Prime to steady state, then measure peak-to-peak.
+        let mut peak = 0.0f32;
+        for n in 0..44_100 {
+            // ~1 kHz: 44 samples per cycle, swing 0..1 about 0.5.
+            let x = if (n / 22) % 2 == 0 { 1.0 } else { 0.0 };
+            let y = f.process(x);
+            if n > 4_410 {
+                peak = peak.max(y.abs());
+            }
+        }
+        assert!(peak > 0.2, "audible AC over-attenuated: peak {peak}");
+    }
+
+    #[test]
+    fn output_filter_coefficients_are_in_unit_range() {
+        let f = OutputFilter::new(44_100);
+        for a in [f.hp90_alpha, f.hp440_alpha, f.lp_alpha] {
+            assert!((0.0..=1.0).contains(&a), "filter alpha out of range: {a}");
+        }
+        // The 14 kHz low-pass is near Nyquist at 44.1 kHz, so its alpha
+        // is large; the 90 Hz high-pass alpha is very close to 1.
+        assert!(f.hp90_alpha > 0.98);
+        assert!(f.hp90_alpha > f.hp440_alpha);
+    }
 
     #[test]
     fn renders_nonzero_pcm_from_tiny_program() {

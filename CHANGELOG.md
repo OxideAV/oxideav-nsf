@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Post-DAC analog filter chain on the player output.** The mixer doc
+  describes the NES hardware following the channel DACs with two
+  first-order high-pass filters (90 Hz, 440 Hz) and a first-order
+  low-pass at 14 kHz. The player now runs every rendered sample through
+  this chain before scaling to i16: the high-passes centre the
+  positive-only `[0, 1]` mixer output about zero (removing the DC bias —
+  which also cleanly resolves the held-DC level a silenced triangle now
+  produces) and the low-pass rolls off the harshest aliasing. The filter
+  resets on `start_song`. New `output_filter_removes_dc_bias`,
+  `output_filter_passes_audible_ac`, and
+  `output_filter_coefficients_are_in_unit_range` tests.
+
 - **`tests/parse_fuzz.rs` — never-panic / never-hang robustness battery**
   for the whole parse + render surface. A self-contained xorshift LCG
   (no external crates) drives `parse_nsf` and, for inputs that parse, an

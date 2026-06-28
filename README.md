@@ -34,7 +34,28 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   tables), fully-wired DMC (DMA sample fetch, rate tables, looping,
   IRQ), 4-step / 5-step frame counter with `$4017` interrupt-inhibit,
   the non-linear closed-form mixer, and NSFe `mixe` per-device gain
-  (seeded from the documented default mix levels).
+  (seeded from the documented default mix levels). Per-sample accuracy
+  details:
+  * The **noise** channel clocks its LFSR at the full CPU rate (its
+    `$400E` period table is in CPU cycles), so register `$80` produces
+    the documented `1789773 / 4 ≈ 447 kHz` shift rate instead of running
+    ~2.5× too slow.
+  * The **pulse** /2 (APU-cycle) prescaler retains its dropped
+    half-cycle across CPU instructions, so pulse pitch is invariant to
+    however the CPU batches its cycles.
+  * The **triangle** holds its current sequencer position when its
+    length/linear counters expire (rather than snapping to silence),
+    and reports the spec's lowpass-averaged "7.5" level for the
+    ultrasonic (period < 2) silencing case.
+  * The **frame counter** advances through the documented region/mode
+    event schedule, so the 4-step interrupt period is exactly
+    29830 (NTSC) / 33254 (PAL) CPU cycles.
+
+* **Output conditioning** (`NsfPlayer`) — the rendered stream passes
+  through the documented post-DAC analog filter chain (two first-order
+  high-pass filters at 90 Hz + 440 Hz, then a first-order low-pass at
+  14 kHz), removing the positive-only mixer's DC bias and rolling off
+  the harshest aliasing.
 
 * **Bankswitching** (`bus`) — `$5FF8..=$5FFF` bank-select registers
   routing 4 KiB windows; FDS extends with `$5FF6..=$5FF7` and turns
