@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the CPU batches its cycles (new
   `pulse_prescaler_carry_is_chunk_invariant` test).
 
+- **Frame counter now follows the documented region/mode event schedule
+  instead of a uniform 4×7457 approximation.** The quarter-/half-frame
+  events fire at the exact CPU-cycle offsets from the frame-counter spec
+  (NTSC/PAL × 4-step/5-step), so the 4-step interrupt period is exactly
+  the documented 29830 (NTSC) / 33254 (PAL) CPU cycles and the IRQ flag
+  latches at the documented final-step offset (29828 / 33252). NSF tunes
+  that poll `$4015` for the frame IRQ to keep time now see correct
+  cadence. New `frame_counter_irq_fires_on_documented_schedule` and
+  `frame_counter_pal_period_is_documented` tests.
+
 - **Triangle silencing now holds its output position instead of snapping
   to zero.** Previously an ultrasonic or counter-expired triangle returned
   a hard 0, injecting a pop where the hardware simply freezes the

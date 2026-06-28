@@ -960,14 +960,54 @@ impl Apu2A03 {
         // Expansion chips share the CPU clock.
         self.expansion.tick(cycles);
 
-        // Frame counter: NTSC has 4 evenly-spaced quarter-frame ticks
-        // every 7457 CPU cycles (≈ 240 Hz). We don't model the actual
-        // jitter — round 1 just counts cycles per event.
-        const QUARTER_FRAME_CPU: u32 = 7457;
+        // Frame counter: advance through the region- and mode-specific
+        // schedule of quarter-/half-frame events. The event positions
+        // come straight from docs/audio/nsf/apu-frame-counter-wiki.html
+        // §"Mode 0"/"Mode 1" (APU-cycle columns doubled to CPU cycles),
+        // so the 4-step interrupt period is exactly the documented 29830
+        // (NTSC) / 33254 (PAL) CPU cycles rather than a uniform 4×7457
+        // approximation. `frame_acc` counts CPU cycles since the last
+        // sequence reset; each scheduled offset fires its step once.
         self.frame_acc += cycles;
-        while self.frame_acc >= QUARTER_FRAME_CPU {
-            self.frame_acc -= QUARTER_FRAME_CPU;
-            self.advance_frame_counter();
+        loop {
+            let schedule = self.frame_schedule();
+            let n_steps = schedule.len() - 1;
+            let period = schedule[n_steps];
+            if (self.frame_step as usize) < n_steps {
+                // Fire the next scheduled step once we reach its offset.
+                let next_offset = schedule[self.frame_step as usize];
+                if self.frame_acc >= next_offset {
+                    self.advance_frame_counter();
+                } else {
+                    break;
+                }
+            } else {
+                // All steps fired; wait for the period boundary, then
+                // reset the sequence (drop one period, rewind to step 0).
+                if self.frame_acc >= period {
+                    self.frame_acc -= period;
+                    self.frame_step = 0;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// CPU-cycle offsets, within one frame-sequence period, at which
+    /// each step fires — the last entry is the period length itself.
+    /// Derived by doubling the documented APU-cycle positions in
+    /// `docs/audio/nsf/apu-frame-counter-wiki.html`.
+    fn frame_schedule(&self) -> &'static [u32] {
+        match (self.five_step, self.pal) {
+            // 4-step: steps 0..=3 at 3728/7456/11185/14914 APU; reset at
+            // 14915 APU → period 29830 CPU.
+            (false, false) => &[7456, 14912, 22370, 29828, 29830],
+            (false, true) => &[8312, 16626, 24938, 33252, 33254],
+            // 5-step: steps 0..=4 at 3728/7456/11185/14914/18640 APU;
+            // reset at 18641 APU → period 37282 CPU.
+            (true, false) => &[7456, 14912, 22370, 29828, 37280, 37282],
+            (true, true) => &[8312, 16626, 24938, 33252, 41564, 41566],
         }
     }
 
@@ -993,7 +1033,7 @@ impl Apu2A03 {
                 }
                 _ => {}
             }
-            self.frame_step = (self.frame_step + 1) % 5;
+            self.frame_step += 1;
         } else {
             match self.frame_step {
                 0 | 2 => {
@@ -1013,7 +1053,7 @@ impl Apu2A03 {
                 }
                 _ => {}
             }
-            self.frame_step = (self.frame_step + 1) % 4;
+            self.frame_step += 1;
         }
     }
 
@@ -1350,6 +1390,56 @@ mod tests {
         apu.write_frame_counter(0x40); // 4-step, inhibit set
         apu.tick_cpu_cycles(35_000);
         assert!(!apu.irq_line(), "inhibit must suppress frame IRQ");
+    }
+
+    #[test]
+    fn frame_counter_irq_fires_on_documented_schedule() {
+        // docs/audio/nsf/apu-frame-counter-wiki.html §"Mode 0": in
+        // 4-step NTSC mode the frame interrupt flag is set at the final
+        // step (APU 14914 → CPU 29828) and the whole sequence period is
+        // 29830 CPU cycles. Feed cycles one at a time so the first
+        // assertion lands at the documented offset.
+        let mut apu = Apu2A03::new();
+        apu.write_frame_counter(0x00); // 4-step, inhibit clear
+        let mut fired_at = None;
+        for c in 1..=30_000u32 {
+            apu.tick_cpu_cycles(1);
+            if apu.frame_irq_flag {
+                fired_at = Some(c);
+                break;
+            }
+        }
+        assert_eq!(fired_at, Some(29_828), "4-step IRQ flag at CPU 29828");
+
+        // Acknowledge, then confirm the next assertion is exactly one
+        // documented period (29830 CPU cycles) later.
+        apu.read_status();
+        let mut next_at = None;
+        for c in 1..=40_000u32 {
+            apu.tick_cpu_cycles(1);
+            if apu.frame_irq_flag {
+                next_at = Some(c);
+                break;
+            }
+        }
+        assert_eq!(next_at, Some(29_830), "4-step IRQ period = 29830 CPU");
+    }
+
+    #[test]
+    fn frame_counter_pal_period_is_documented() {
+        // PAL 4-step period is 33254 CPU cycles (APU 16627 × 2).
+        let mut apu = Apu2A03::new();
+        apu.set_cpu_hz(1_662_607); // PAL clock
+        apu.write_frame_counter(0x00);
+        let mut fired_at = None;
+        for c in 1..=40_000u32 {
+            apu.tick_cpu_cycles(1);
+            if apu.frame_irq_flag {
+                fired_at = Some(c);
+                break;
+            }
+        }
+        assert_eq!(fired_at, Some(33_252), "PAL 4-step IRQ flag at CPU 33252");
     }
 
     #[test]
