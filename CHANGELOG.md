@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Noise channel now clocks its shift register at the correct rate.**
+  The `$400E` period table is expressed in CPU cycles ("The period
+  determines how many CPU cycles happen between shift register clocks"),
+  but the channel timer was being driven at the APU (CPU/2) rate and
+  reloaded with the full table value, making the noise pitch run roughly
+  2.5× too low. The noise timer is now driven at the full CPU clock and
+  reloads with `period - 1`, so register `$80` (period 4) clocks the
+  LFSR at `1789773 / 4 ≈ 447 kHz` — matching the documented
+  §"Pitches of 93-step noise" NTSC sample rate. Covered by the new
+  `noise_shift_rate_matches_spec_sample_rate` test.
+- **Pulse channels no longer slowly detune under odd CPU cycle chunks.**
+  The pulse /2 (APU-cycle) prescaler dropped the low bit of every
+  `cycles / 2`, so an instruction that consumed an odd number of CPU
+  cycles silently lost half an APU cycle. Over a track this accumulates
+  into an audible pitch drift. A prescaler carry now retains the dropped
+  half-cycle across calls, making the pulse timer phase invariant to how
+  the CPU batches its cycles (new
+  `pulse_prescaler_carry_is_chunk_invariant` test).
+
 - **FDS RAM image is now sized whenever the FDS chip is enabled**, not
   only on the bankswitched load path. An FDS-flagged header that did not
   bankswitch (`bankswitch_init` all-zero) left `fds_ram` a zero-length

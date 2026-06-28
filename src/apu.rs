@@ -397,9 +397,16 @@ impl NoiseChannel {
     }
 
     fn tick_timer(&mut self, cycles: u32) {
+        // The `$400E` period table is in CPU cycles — "The period
+        // determines how many CPU cycles happen between shift register
+        // clocks" (docs/audio/nsf/apu-noise-wiki.html §Registers). So
+        // the noise timer is driven at the full CPU clock and reloads
+        // with `period - 1`, giving exactly `period` CPU cycles between
+        // shifts. (Register $80 / period 4 then clocks at 1789773/4 ≈
+        // 447443 Hz, matching the §"Pitches of 93-step noise" table.)
         for _ in 0..cycles {
             if self.timer == 0 {
-                self.timer = self.timer_period;
+                self.timer = self.timer_period.saturating_sub(1);
                 let tap_bit = if self.mode { 6 } else { 1 };
                 let feedback = (self.shift & 1) ^ ((self.shift >> tap_bit) & 1);
                 self.shift = (self.shift >> 1) | (feedback << 14);
@@ -680,6 +687,15 @@ pub struct Apu2A03 {
     /// PAL flag — toggles the DMC rate table.
     pal: bool,
 
+    /// Carry bit for the pulse channels' /2 (APU-cycle) prescaler. The
+    /// CPU drives the APU one instruction at a time with cycle counts
+    /// that are frequently odd, so dividing `cycles / 2` per call would
+    /// drop up to half an APU cycle each instruction and slowly detune
+    /// the pulse channels. Accumulating the dropped low bit here and
+    /// releasing it on the next odd call keeps the pulse timer exact no
+    /// matter how the CPU chunks its cycles.
+    pulse_prescaler_carry: u32,
+
     /// Linear gain per NSFe `mixe` device id. Index 0 = APU squares,
     /// 1 = APU triangle/noise/DPCM, 2..=7 = VRC6 / VRC7 / FDS / MMC5 /
     /// N163 / 5B. Seeded from the §mixe per-device default mix levels
@@ -716,6 +732,7 @@ impl Apu2A03 {
             frame_acc: 0,
             frame_step: 0,
             pal: false,
+            pulse_prescaler_carry: 0,
             device_gain: Self::default_device_gains(),
             expansion: crate::expansion::Expansion::new(),
         }
@@ -903,12 +920,18 @@ impl Apu2A03 {
     /// Advance every channel timer + the frame counter by `cycles`
     /// CPU clocks.
     pub fn tick_cpu_cycles(&mut self, cycles: u32) {
-        // Pulse / noise channels use a /2 prescaler off the CPU clock.
-        // Triangle ticks every CPU clock.
-        let pulse_cycles = cycles / 2;
+        // Pulse channels use a /2 prescaler off the CPU clock (their
+        // 11-bit timer counts APU cycles). Triangle ticks every CPU
+        // clock. The noise channel's `$400E` period table is already
+        // expressed in CPU cycles (the entries are even because an APU
+        // cycle is 2 CPU cycles), so the noise timer is driven at the
+        // full CPU clock — see `NoiseChannel::tick_timer`.
+        let total = cycles + self.pulse_prescaler_carry;
+        let pulse_cycles = total / 2;
+        self.pulse_prescaler_carry = total & 1;
         self.pulse1.tick_timer(pulse_cycles);
         self.pulse2.tick_timer(pulse_cycles);
-        self.noise.tick_timer(pulse_cycles);
+        self.noise.tick_timer(cycles);
         self.triangle.tick_timer(cycles);
 
         // DMC ticks at the full CPU clock; one bit out per 'timer_period'.
@@ -1076,6 +1099,32 @@ mod tests {
     }
 
     #[test]
+    fn noise_shift_rate_matches_spec_sample_rate() {
+        // docs/audio/nsf/apu-noise-wiki.html §"Pitches of 93-step noise":
+        // register $80 (period index 0 → 4 CPU cycles) clocks the shift
+        // register at 1789773 / 4 ≈ 447443 Hz NTSC. Count shifts over a
+        // known span of CPU cycles and check the implied rate.
+        let mut noise = NoiseChannel::new();
+        noise.timer_period = NoiseChannel::period_for(0, false); // = 4
+        let cpu_cycles = 4_000u32;
+        let mut last = noise.shift;
+        let mut shifts = 0u32;
+        for _ in 0..cpu_cycles {
+            noise.tick_timer(1);
+            if noise.shift != last {
+                shifts += 1;
+                last = noise.shift;
+            }
+        }
+        // 4000 CPU cycles / 4 = 1000 shifts (the LFSR very rarely repeats
+        // an identical 15-bit state, so a missed count is negligible).
+        assert!(
+            (995..=1000).contains(&shifts),
+            "expected ~1000 shifts in 4000 CPU cycles at period 4, got {shifts}"
+        );
+    }
+
+    #[test]
     fn noise_period_table_follows_region() {
         // Default region is NTSC: the fastest index ($F) is 4068 cycles.
         let mut apu = Apu2A03::new();
@@ -1095,6 +1144,34 @@ mod tests {
         // Back to NTSC: the same index re-derives to the NTSC value.
         apu.set_cpu_hz(1_789_773);
         assert_eq!(apu.noise.timer_period, 4068);
+    }
+
+    #[test]
+    fn pulse_prescaler_carry_is_chunk_invariant() {
+        // The pulse /2 prescaler must produce the same duty-step phase
+        // whether the CPU feeds cycles in one big block or many odd
+        // chunks. Run two APUs with identical pulse setup over the same
+        // total CPU cycles, one in a single 1000-cycle call and one in
+        // 1000 single-cycle calls, and require the duty step to agree.
+        let setup = |apu: &mut Apu2A03| {
+            apu.write_status(0x01);
+            apu.write_register(0x4000, 0xBF); // duty 50%, halt, const vol 15
+            apu.write_register(0x4002, 0x05);
+            apu.write_register(0x4003, 0x00); // period = 5
+        };
+        let mut bulk = Apu2A03::new();
+        setup(&mut bulk);
+        bulk.tick_cpu_cycles(1001); // odd total exercises the carry
+        let mut drip = Apu2A03::new();
+        setup(&mut drip);
+        for _ in 0..1001 {
+            drip.tick_cpu_cycles(1);
+        }
+        assert_eq!(
+            bulk.pulse1.duty_step, drip.pulse1.duty_step,
+            "pulse duty step must be invariant to CPU cycle chunking"
+        );
+        assert_eq!(bulk.pulse1.timer, drip.pulse1.timer);
     }
 
     #[test]
