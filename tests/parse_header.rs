@@ -103,6 +103,67 @@ fn end_to_end_render_emits_pcm() {
     assert!(mean_abs > 200.0, "mean amplitude {mean_abs} too low");
 }
 
+/// Build an NSF whose INIT programs the noise channel at a fast period
+/// (`$400E` index 0) with constant volume, exercising the corrected
+/// CPU-rate noise clock end-to-end through the player.
+fn synth_noise_nsf() -> Vec<u8> {
+    let mut header = vec![0u8; 0x80];
+    header[..5].copy_from_slice(b"NESM\x1a");
+    header[0x05] = 1;
+    header[0x06] = 1;
+    header[0x07] = 1;
+    header[0x08..0x0A].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0A..0x0C].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0C..0x0E].copy_from_slice(&0x8030u16.to_le_bytes());
+    header[0x6E..0x70].copy_from_slice(&16666u16.to_le_bytes());
+    header[0x7A] = 0; // NTSC
+
+    // init: enable noise ($4015 = $08), $400C = $30 (halt + const vol 0)?
+    //   We want audible output, so const vol 15: $400C = $3F.
+    //   $400E = $04 (mode clear, period index 4 = 64 CPU cycles).
+    //   $400F = $08 (length load + envelope restart).
+    let prog: Vec<u8> = vec![
+        0xA9, 0x08, 0x8D, 0x15, 0x40, // LDA #$08 / STA $4015
+        0xA9, 0x3F, 0x8D, 0x0C, 0x40, // LDA #$3F / STA $400C  (const vol 15)
+        0xA9, 0x04, 0x8D, 0x0E, 0x40, // LDA #$04 / STA $400E  (period idx 4)
+        0xA9, 0x08, 0x8D, 0x0F, 0x40, // LDA #$08 / STA $400F  (length load)
+        0x60, // RTS
+    ];
+    let mut blob = header.clone();
+    blob.extend_from_slice(&prog);
+    while blob.len() < 0x80 + 0x30 {
+        blob.push(0xEA);
+    }
+    blob.push(0xEA);
+    blob.push(0x60); // play: NOP RTS
+    blob
+}
+
+#[test]
+fn noise_channel_renders_audible_dc_free_pcm() {
+    let bytes = synth_noise_nsf();
+    let header = parse_nsf(&bytes).unwrap();
+    let mut player = NsfPlayer::new(header, 44_100);
+    player.start_song(1);
+    // Skip the filter warm-up transient, then measure a steady window.
+    let mut warm = vec![0i16; 8192];
+    player.render(&mut warm);
+    let mut pcm = vec![0i16; 16384];
+    let n = player.render(&mut pcm);
+    assert_eq!(n, pcm.len(), "player halted prematurely");
+
+    let peak = pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap();
+    assert!(peak > 500, "noise too quiet: peak {peak}");
+
+    // After the high-pass filters the DC bias should be gone: the signed
+    // mean must be small relative to the peak amplitude.
+    let mean: f64 = pcm.iter().map(|&s| s as f64).sum::<f64>() / pcm.len() as f64;
+    assert!(
+        mean.abs() < peak as f64 * 0.1,
+        "DC bias not removed: mean {mean}, peak {peak}"
+    );
+}
+
 /// Build a NSF2 file that uses the IRQ-timer device to drive APU
 /// register pokes from an IRQ service routine. INIT writes the IRQ
 /// vector, primes the timer at a fast period, then CLI-and-RTS.
