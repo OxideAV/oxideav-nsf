@@ -332,11 +332,29 @@ impl TriangleChannel {
         self.length.clock();
     }
 
-    fn output(&self) -> u8 {
-        if !self.enabled || self.timer_period < 2 {
+    /// Sequencer output expressed in half-steps (units of ½ level) so the
+    /// ultrasonic "7.5" averaged value the spec describes can be returned
+    /// without rounding bias. A normal step `s` is `2 * TRIANGLE_TABLE[s]`.
+    fn output_halfsteps(&self) -> u8 {
+        if !self.enabled {
             return 0;
         }
-        TRIANGLE_TABLE[self.seq_step as usize]
+        // The triangle has no volume gate: its level is purely the
+        // sequencer's current step. When the length counter or linear
+        // counter is zero the sequencer stops advancing (see
+        // `tick_timer`) and the channel *holds* its current step rather
+        // than snapping to silence — the hardware's "halt it in whatever
+        // its current output position is" behaviour
+        // (docs/audio/nsf/apu-triangle-wiki.html §"silenced by several
+        // methods"). When the period is ultrasonic (< 2) the sequencer
+        // sweeps faster than the output rate can resolve and the lowpass
+        // average is "halfway between 7 and 8" per the same section, so
+        // we report the documented 7.5 (= 15 half-steps) instead of the
+        // held step.
+        if self.timer_period < 2 {
+            return 15; // 7.5 in level units
+        }
+        2 * TRIANGLE_TABLE[self.seq_step as usize]
     }
 }
 
@@ -1029,7 +1047,9 @@ impl Apu2A03 {
         } else {
             95.88 / (8128.0 / (p1 + p2) + 100.0)
         };
-        let t = self.triangle.output() as f32 / 8227.0;
+        // Triangle in half-steps (0..=30) over a doubled divisor keeps
+        // the ultrasonic "7.5" averaged level precise in the mixer.
+        let t = self.triangle.output_halfsteps() as f32 / (8227.0 * 2.0);
         let n = self.noise.output() as f32 / 12241.0;
         let d = self.dmc.dac as f32 / 22638.0;
         let tnd_sum = t + n + d;
@@ -1172,6 +1192,55 @@ mod tests {
             "pulse duty step must be invariant to CPU cycle chunking"
         );
         assert_eq!(bulk.pulse1.timer, drip.pulse1.timer);
+    }
+
+    #[test]
+    fn triangle_holds_position_when_counters_expire() {
+        // docs/audio/nsf/apu-triangle-wiki.html: when length/linear
+        // counters reach zero the sequencer stops advancing and the
+        // channel holds its current output position rather than snapping
+        // to silence. Clock the triangle to a known step, then let the
+        // counters expire and confirm the held step persists.
+        let mut tri = TriangleChannel {
+            enabled: true,
+            ..TriangleChannel::default()
+        };
+        tri.write_linear(0x05); // short linear, control flag clear
+        tri.write_period_lo(0x10);
+        tri.write_period_hi(0x00); // period 16, sets length via enabled? no
+        tri.linear_counter = 4;
+        tri.length.counter = 4;
+        tri.linear_reload = false;
+        // Advance the sequencer a few steps.
+        tri.tick_timer(16 * 5);
+        let held = tri.output_halfsteps();
+        // Drain the linear + length counters to zero.
+        tri.linear_counter = 0;
+        tri.length.counter = 0;
+        // Further ticks must not advance the sequencer.
+        tri.tick_timer(16 * 10);
+        assert_eq!(
+            tri.output_halfsteps(),
+            held,
+            "triangle must hold its last step"
+        );
+    }
+
+    #[test]
+    fn triangle_ultrasonic_reports_midpoint_not_silence() {
+        // A period < 2 sweeps faster than the output resolves; the spec
+        // gives the averaged level as 7.5. output_halfsteps must report
+        // 15 (= 7.5) rather than 0 (the old hard-silence behaviour).
+        let mut tri = TriangleChannel {
+            enabled: true,
+            ..TriangleChannel::default()
+        };
+        tri.write_period_lo(0x01);
+        tri.write_period_hi(0x00); // period = 1 → ultrasonic
+        assert_eq!(tri.output_halfsteps(), 15);
+        // Disabled still silences.
+        tri.enabled = false;
+        assert_eq!(tri.output_halfsteps(), 0);
     }
 
     #[test]

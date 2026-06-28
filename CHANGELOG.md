@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the CPU batches its cycles (new
   `pulse_prescaler_carry_is_chunk_invariant` test).
 
+- **Triangle silencing now holds its output position instead of snapping
+  to zero.** Previously an ultrasonic or counter-expired triangle returned
+  a hard 0, injecting a pop where the hardware simply freezes the
+  sequencer at its current step. The channel now holds its last sequencer
+  level when the length/linear counters expire, and for the ultrasonic
+  (period < 2) case reports the spec's lowpass-averaged "7.5" level
+  rather than silence — the mixer carries the triangle in half-steps over
+  a doubled divisor so that 7.5 stays exact. New
+  `triangle_holds_position_when_counters_expire` and
+  `triangle_ultrasonic_reports_midpoint_not_silence` tests.
+
 - **FDS RAM image is now sized whenever the FDS chip is enabled**, not
   only on the bankswitched load path. An FDS-flagged header that did not
   bankswitch (`bankswitch_init` all-zero) left `fds_ram` a zero-length
