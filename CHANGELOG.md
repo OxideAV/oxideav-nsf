@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pulse channels no longer self-mute on low (bass) notes when no sweep
+  is configured.** The sweep adder-overflow mute was applied
+  unconditionally, but with the default zero shift count the adder
+  computes `target = period + (period >> 0) = 2 × period`, so any pulse
+  with a period above `0x3FF` (a perfectly audible low note per the
+  pulse frequency formula) was silenced even though its sweep was never
+  set up. The adder-overflow mute now only applies when the shift count
+  is non-zero, while a genuine sweep overflow (non-zero shift, target >
+  `0x7FF`) still mutes as before. New
+  `pulse_low_note_plays_without_sweep_configured` and
+  `pulse_sweep_overflow_still_mutes` tests.
+
 - **Noise channel now clocks its shift register at the correct rate.**
   The `$400E` period table is expressed in CPU cycles ("The period
   determines how many CPU cycles happen between shift register clocks"),

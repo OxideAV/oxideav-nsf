@@ -240,10 +240,30 @@ impl PulseChannel {
         }
     }
 
+    /// The sweep unit silences the channel when its current timer period
+    /// is below 8 or the sweep adder's target overflows the 11-bit range
+    /// (docs/audio/nsf/apu-pulse-wiki.html §"Pulse channel output to
+    /// mixer": "the timer has a value less than eight" and "overflow
+    /// from the sweep unit's adder is silencing the channel").
+    ///
+    /// The adder-overflow half only applies when the sweep shift count
+    /// is non-zero: with a zero shift the adder produces no change
+    /// amount, so it can never push a legitimately-low note's period
+    /// out of range. (Without this guard a pulse that never configures a
+    /// sweep — leaving shift at 0 — would mute every period above 0x3FF
+    /// in add mode, silencing audible bass notes the §"Sequencer
+    /// behavior" frequency range says should play.)
+    fn sweep_mutes(&self) -> bool {
+        self.timer_period < 8 || (self.sweep_shift > 0 && self.target_period() > 0x07FF)
+    }
+
     fn clock_sweep(&mut self) {
         let target = self.target_period();
-        let mute = self.timer_period < 8 || target > 0x07FF;
-        if self.sweep_divider == 0 && self.sweep_enabled && self.sweep_shift > 0 && !mute {
+        if self.sweep_divider == 0
+            && self.sweep_enabled
+            && self.sweep_shift > 0
+            && !self.sweep_mutes()
+        {
             self.timer_period = target;
         }
         if self.sweep_divider == 0 || self.sweep_reload {
@@ -255,11 +275,7 @@ impl PulseChannel {
     }
 
     fn output(&self) -> u8 {
-        if !self.enabled
-            || !self.length.active()
-            || self.timer_period < 8
-            || self.target_period() > 0x07FF
-        {
+        if !self.enabled || !self.length.active() || self.sweep_mutes() {
             return 0;
         }
         let step = DUTY_TABLE[self.duty as usize][self.duty_step as usize];
@@ -1129,6 +1145,46 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "pulse channel never emitted output");
+    }
+
+    #[test]
+    fn pulse_low_note_plays_without_sweep_configured() {
+        // A pulse with a large period (low bass note) and no sweep set
+        // up (shift 0) must NOT be silenced by the sweep adder. Period
+        // 0x500 is well inside the audible range per the §"Sequencer
+        // behavior" frequency formula.
+        let mut p = PulseChannel::new(false);
+        p.enabled = true;
+        p.write_main(0xBF); // duty 50%, halt, constant vol 15
+        p.write_period_lo(0x00);
+        p.write_period_hi(0x05); // timer_period = 0x500, length loaded
+        p.length.counter = 10;
+        // sweep never configured → shift 0.
+        assert!(!p.sweep_mutes(), "low note wrongly muted by sweep adder");
+        // Drive the duty into a high slot and confirm non-zero output.
+        let mut saw = false;
+        for _ in 0..0x4000 {
+            p.tick_timer(1);
+            if p.output() > 0 {
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "low-period pulse produced no output");
+    }
+
+    #[test]
+    fn pulse_sweep_overflow_still_mutes() {
+        // With a non-zero shift, a target that overflows 0x7FF must
+        // still silence the channel (the genuine sweep-mute case).
+        let mut p = PulseChannel::new(false);
+        p.enabled = true;
+        p.length.counter = 10;
+        p.write_period_lo(0x00);
+        p.write_period_hi(0x07); // timer_period = 0x700
+        p.write_sweep(0x01); // shift 1, add mode → target = 0x700 + 0x380 > 0x7FF
+        assert!(p.sweep_mutes(), "sweep overflow should mute");
+        assert_eq!(p.output(), 0);
     }
 
     #[test]
