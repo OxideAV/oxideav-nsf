@@ -1015,7 +1015,29 @@ impl Apu2A03 {
 
     /// Advance every channel timer + the frame counter by `cycles`
     /// CPU clocks.
+    ///
+    /// The batch is split at every scheduled frame-counter event so a
+    /// quarter-/half-frame clock lands exactly *between* the channel
+    /// timer cycles that surround its documented CPU offset, no matter
+    /// how coarsely the CPU batches its cycles. Without the split, a
+    /// whole instruction's cycles would tick the channel timers first
+    /// and only then fire the frame event — observably wrong wherever
+    /// the two interact (a sweep's period rewrite lands relative to the
+    /// pulse timer's reload; a linear-counter expiry freezes the
+    /// triangle sequencer mid-batch).
     pub fn tick_cpu_cycles(&mut self, cycles: u32) {
+        let mut remaining = cycles;
+        while remaining > 0 {
+            let n = self.cycles_until_next_frame_event().min(remaining);
+            self.advance_channel_timers(n);
+            self.frame_acc += n;
+            self.process_due_frame_events();
+            remaining -= n;
+        }
+    }
+
+    /// Tick the per-channel timers (no frame-counter interaction).
+    fn advance_channel_timers(&mut self, cycles: u32) {
         // Pulse channels use a /2 prescaler off the CPU clock (their
         // 11-bit timer counts APU cycles). Triangle ticks every CPU
         // clock. The noise channel's `$400E` period table is already
@@ -1037,21 +1059,30 @@ impl Apu2A03 {
 
         // Expansion chips share the CPU clock.
         self.expansion.tick(cycles);
+    }
 
-        // Frame counter: advance through the region- and mode-specific
-        // schedule of quarter-/half-frame + IRQ-set events. The event
-        // positions come straight from
-        // docs/audio/nsf/apu-frame-counter-wiki.html §"Mode 0"/"Mode 1":
-        // the quarter/half signals land on the PUT half of the listed
-        // APU cycle (CPU offset = 2×APU + 1, the doc's "additional delay
-        // of one CPU cycle for the quarter and half frame signals"), the
-        // 4-step frame-interrupt flag is set on THREE consecutive CPU
-        // cycles (the step-4 GET, its PUT, and the step-0 GET of the
-        // wrap), and the sequence period is exactly the documented 29830
-        // (NTSC) / 33254 (PAL) CPU cycles. `frame_acc` counts CPU cycles
-        // since the last sequence reset; each scheduled offset fires
-        // once (`frame_step` indexes the next unfired event).
-        self.frame_acc += cycles;
+    /// CPU cycles until the next scheduled frame-counter event (at
+    /// least 1, so the tick loop always makes progress).
+    fn cycles_until_next_frame_event(&self) -> u32 {
+        let schedule = self.frame_events();
+        let idx = (self.frame_step as usize).min(schedule.len() - 1);
+        schedule[idx].offset.saturating_sub(self.frame_acc).max(1)
+    }
+
+    /// Fire every frame-sequence event whose offset has been reached.
+    ///
+    /// The event positions come straight from
+    /// docs/audio/nsf/apu-frame-counter-wiki.html §"Mode 0"/"Mode 1":
+    /// the quarter/half signals land on the PUT half of the listed
+    /// APU cycle (CPU offset = 2×APU + 1, the doc's "additional delay
+    /// of one CPU cycle for the quarter and half frame signals"), the
+    /// 4-step frame-interrupt flag is set on THREE consecutive CPU
+    /// cycles (the step-4 GET, its PUT, and the step-0 GET of the
+    /// wrap), and the sequence period is exactly the documented 29830
+    /// (NTSC) / 33254 (PAL) CPU cycles. `frame_acc` counts CPU cycles
+    /// since the last sequence reset; each scheduled offset fires
+    /// once (`frame_step` indexes the next unfired event).
+    fn process_due_frame_events(&mut self) {
         loop {
             let schedule = self.frame_events();
             if (self.frame_step as usize) >= schedule.len() {
@@ -1365,6 +1396,45 @@ mod tests {
             "pulse duty step must be invariant to CPU cycle chunking"
         );
         assert_eq!(bulk.pulse1.timer, drip.pulse1.timer);
+    }
+
+    #[test]
+    fn frame_clocked_units_are_chunk_invariant() {
+        // The whole APU must evolve identically whether the CPU feeds
+        // its cycles one at a time or in giant blocks: the tick loop
+        // splits each batch at every scheduled frame-counter event, so
+        // a sweep's period rewrite / a linear-counter expiry lands
+        // exactly between the channel-timer cycles that surround its
+        // documented offset. Program a sweeping pulse and a triangle
+        // with a short linear counter, run two APUs over the same
+        // 100 000 CPU cycles (one bulk call vs single-cycle calls), and
+        // require identical channel state.
+        let setup = |apu: &mut Apu2A03| {
+            apu.write_frame_counter(0x00);
+            apu.write_status(0x05); // pulse1 + triangle
+            apu.write_register(0x4000, 0x3F); // halt, const vol 15
+            apu.write_register(0x4001, 0x82); // sweep on, period 0, shift 2
+            apu.write_register(0x4002, 0x00);
+            apu.write_register(0x4003, 0x02); // pulse period 0x200
+            apu.write_register(0x4008, 0x05); // linear reload 5, control clear
+            apu.write_register(0x400A, 0x21);
+            apu.write_register(0x400B, 0x08); // tri period 0x21, arm reload
+        };
+        let mut bulk = Apu2A03::new();
+        setup(&mut bulk);
+        bulk.tick_cpu_cycles(100_000);
+        let mut drip = Apu2A03::new();
+        setup(&mut drip);
+        for _ in 0..100_000 {
+            drip.tick_cpu_cycles(1);
+        }
+        assert_eq!(bulk.pulse1.timer_period, drip.pulse1.timer_period);
+        assert_eq!(bulk.pulse1.timer, drip.pulse1.timer);
+        assert_eq!(bulk.pulse1.duty_step, drip.pulse1.duty_step);
+        assert_eq!(bulk.triangle.seq_step, drip.triangle.seq_step);
+        assert_eq!(bulk.triangle.linear_counter, drip.triangle.linear_counter);
+        assert_eq!(bulk.frame_acc, drip.frame_acc);
+        assert_eq!(bulk.frame_step, drip.frame_step);
     }
 
     #[test]

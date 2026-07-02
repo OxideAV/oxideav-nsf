@@ -47,6 +47,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `five_step_clocks_nothing_at_fourth_step_and_both_at_fifth` tests;
   the IRQ-schedule test now pins the triple set-point behaviour.
 
+- **Frame-counter clocks now interleave exactly with the channel
+  timers, independent of CPU cycle batching.** `tick_cpu_cycles` splits
+  every batch at the next scheduled frame-sequence event, so a
+  quarter-/half-frame clock fires exactly between the channel-timer
+  cycles that surround its documented CPU offset. Previously a whole
+  instruction's cycles ticked the channel timers first and the frame
+  events fired afterwards, which was observably wrong wherever the two
+  interact — a sweep's period rewrite landed relative to the wrong
+  pulse-timer reload, and a linear-counter expiry froze the triangle
+  sequencer a few cycles late, so the audible stream depended on how
+  the CPU chunked its cycles. This closes the README's
+  "envelope tick timers are stepped in CPU-cycle batches" caveat for
+  the frame-clocked units. New `frame_clocked_units_are_chunk_invariant`
+  test runs a sweeping pulse + short-linear-counter triangle over
+  100 000 cycles bulk-vs-single-cycle and requires identical state.
+
 - **DMC output unit now powers up silent** per
   `docs/audio/nsf/apu-dmc-wiki.html` §"Output unit": the sample buffer
   is empty at power-up, the silence flag is set whenever an output
