@@ -775,6 +775,22 @@ pub struct Apu2A03 {
     /// PAL flag — toggles the DMC rate table.
     pal: bool,
 
+    /// Total CPU cycles ever ticked — the low bit is the CPU/APU phase
+    /// (an APU cycle spans two CPU cycles; even = first half, odd =
+    /// second half), which decides the `$4017` write-effect delay.
+    total_cycles: u64,
+
+    /// Pending `$4017` side-effect countdown, in CPU cycles. Per
+    /// `docs/audio/nsf/apu-frame-counter-wiki.html` §"Side effects" the
+    /// timer reset (and, in 5-step mode, the immediate quarter+half
+    /// clock) does not happen on the write cycle itself: "After 3 or 4
+    /// CPU clock cycles*, the timer is reset. […] * If the write
+    /// occurs during an APU cycle, the effects occur 3 CPU cycles
+    /// after the $4017 write cycle, and if the write occurs between
+    /// APU cycles, the effects occurs 4 CPU cycles after the write
+    /// cycle." Either way the effects land on the same CPU/APU phase.
+    frame_reset_delay: Option<u32>,
+
     /// Carry bit for the pulse channels' /2 (APU-cycle) prescaler. The
     /// CPU drives the APU one instruction at a time with cycle counts
     /// that are frequently odd, so dividing `cycles / 2` per call would
@@ -819,6 +835,8 @@ impl Apu2A03 {
             frame_irq_flag: false,
             frame_acc: 0,
             frame_step: 0,
+            total_cycles: 0,
+            frame_reset_delay: None,
             pal: false,
             pulse_prescaler_carry: 0,
             device_gain: Self::default_device_gains(),
@@ -996,21 +1014,26 @@ impl Apu2A03 {
     }
 
     /// `$4017` write — frame-counter mode + IRQ inhibit.
+    ///
+    /// The mode + inhibit register bits apply immediately, but the
+    /// sequence-timer reset — and, when the mode flag is set, the
+    /// accompanying quarter- + half-frame clock — is deferred by 3 or
+    /// 4 CPU cycles depending on the write's CPU/APU phase, per the
+    /// §"Side effects" block of
+    /// `docs/audio/nsf/apu-frame-counter-wiki.html` (see
+    /// [`Apu2A03::frame_reset_delay`]). A write on the second (odd)
+    /// half of an APU cycle takes effect 3 CPU cycles later; a write
+    /// on the first (even) half takes 4 — both land on the same APU
+    /// phase. Until the reset lands, the old sequence keeps running.
     pub fn write_frame_counter(&mut self, value: u8) {
         self.five_step = value & 0x80 != 0;
         self.frame_irq_inhibit = value & 0x40 != 0;
-        self.frame_acc = 0;
-        self.frame_step = 0;
         if self.frame_irq_inhibit {
             // Spec §$4017: "If set, the frame interrupt flag is
             // cleared, otherwise it is unaffected."
             self.frame_irq_flag = false;
         }
-        if self.five_step {
-            // 5-step: an immediate envelope + length tick on write.
-            self.tick_quarter_frame();
-            self.tick_half_frame();
-        }
+        self.frame_reset_delay = Some(if self.total_cycles & 1 == 1 { 3 } else { 4 });
     }
 
     /// Advance every channel timer + the frame counter by `cycles`
@@ -1028,9 +1051,33 @@ impl Apu2A03 {
     pub fn tick_cpu_cycles(&mut self, cycles: u32) {
         let mut remaining = cycles;
         while remaining > 0 {
-            let n = self.cycles_until_next_frame_event().min(remaining);
+            let mut n = self.cycles_until_next_frame_event().min(remaining);
+            if let Some(delay) = self.frame_reset_delay {
+                n = n.min(delay.max(1));
+            }
             self.advance_channel_timers(n);
+            self.total_cycles += n as u64;
             self.frame_acc += n;
+            if let Some(delay) = self.frame_reset_delay {
+                let left = delay.saturating_sub(n);
+                if left == 0 {
+                    // Deferred $4017 side effects land now: the
+                    // sequence timer resets, and in 5-step mode both
+                    // the quarter- and half-frame units are clocked
+                    // ("If the mode flag is set, then both 'quarter
+                    // frame' and 'half frame' signals are also
+                    // generated").
+                    self.frame_reset_delay = None;
+                    self.frame_acc = 0;
+                    self.frame_step = 0;
+                    if self.five_step {
+                        self.tick_quarter_frame();
+                        self.tick_half_frame();
+                    }
+                } else {
+                    self.frame_reset_delay = Some(left);
+                }
+            }
             self.process_due_frame_events();
             remaining -= n;
         }
@@ -1650,10 +1697,13 @@ mod tests {
     #[test]
     fn frame_counter_irq_fires_on_documented_schedule() {
         // docs/audio/nsf/apu-frame-counter-wiki.html §"Mode 0": in
-        // 4-step NTSC mode the frame interrupt flag is set at the final
-        // step (APU 14914 → CPU 29828) and the whole sequence period is
-        // 29830 CPU cycles. Feed cycles one at a time so the first
-        // assertion lands at the documented offset.
+        // 4-step NTSC mode the frame interrupt flag is first set at the
+        // final step (APU 14914 GET → CPU 29828 from the sequence
+        // start) and the whole sequence period is 29830 CPU cycles.
+        // The $4017 write itself takes effect 4 CPU cycles later (an
+        // even-phase write, §"Side effects"), so from the write the
+        // first assertion lands at 4 + 29828. Feed cycles one at a
+        // time so the assertion offset is exact.
         let mut apu = Apu2A03::new();
         apu.write_frame_counter(0x00); // 4-step, inhibit clear
         let mut fired_at = None;
@@ -1664,7 +1714,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(fired_at, Some(29_828), "4-step IRQ flag at CPU 29828");
+        assert_eq!(
+            fired_at,
+            Some(4 + 29_828),
+            "4-step IRQ flag at CPU 29828 after the delayed $4017 reset"
+        );
 
         // §"Mode 0": the flag is set at THREE consecutive points — the
         // step-4 GET (29828), its PUT (29829), and the wrap GET
@@ -1672,10 +1726,10 @@ mod tests {
         // therefore see the flag re-assert one cycle later, and again
         // one cycle after that.
         apu.read_status();
-        apu.tick_cpu_cycles(1); // CPU 29829
+        apu.tick_cpu_cycles(1); // sequence CPU 29829
         assert!(apu.frame_irq_flag, "flag re-set at step-4 PUT (29829)");
         apu.read_status();
-        apu.tick_cpu_cycles(1); // CPU 29830 (= wrap)
+        apu.tick_cpu_cycles(1); // sequence CPU 29830 (= wrap)
         assert!(apu.frame_irq_flag, "flag re-set at wrap GET (29830)");
 
         // After the final set point, the next assertion is a full
@@ -1697,63 +1751,121 @@ mod tests {
         // §"Mode 0" + the intro note "with an additional delay of one
         // CPU cycle for the quarter and half frame signals": the first
         // quarter-frame clock of the 4-step NTSC sequence lands at APU
-        // 3728, PUT half → CPU cycle 2×3728 + 1 = 7457. Observe it via
-        // the envelope decay level: after a $4003 write arms the start
-        // flag, the first quarter-frame clock reloads decay to 15.
+        // 3728, PUT half → CPU cycle 2×3728 + 1 = 7457 from the
+        // sequence start (which is 4 cycles after the even-phase $4017
+        // write). Observe it via the envelope decay level: after a
+        // $4003 write arms the start flag, the first quarter-frame
+        // clock reloads decay to 15.
         let mut apu = Apu2A03::new();
         apu.write_frame_counter(0x00);
         apu.write_status(0x01);
         apu.write_register(0x4000, 0x00); // envelope mode, period 0
         apu.write_register(0x4003, 0x08); // arms envelope start
-        apu.tick_cpu_cycles(7_456);
+        apu.tick_cpu_cycles(4 + 7_456);
         assert_eq!(apu.pulse1.envelope.decay, 0, "no quarter clock yet");
-        apu.tick_cpu_cycles(1); // CPU 7457 = PUT of APU 3728
+        apu.tick_cpu_cycles(1); // sequence CPU 7457 = PUT of APU 3728
         assert_eq!(apu.pulse1.envelope.decay, 15, "quarter clock at 7457");
+    }
+
+    #[test]
+    fn frame_counter_4017_reset_delay_depends_on_write_phase() {
+        // §"Side effects": "After 3 or 4 CPU clock cycles*, the timer
+        // is reset. If the mode flag is set, then both 'quarter frame'
+        // and 'half frame' signals are also generated." — 3 cycles for
+        // a write on the second (odd) half of an APU cycle, 4 for a
+        // write on the first (even) half. Observe the deferred 5-step
+        // quarter clock through the envelope start flag.
+        //
+        // Even-phase write: effects after 4 CPU cycles.
+        let mut apu = Apu2A03::new();
+        apu.write_status(0x01);
+        apu.write_register(0x4000, 0x00);
+        apu.write_register(0x4003, 0x08); // arm envelope start
+        apu.write_frame_counter(0x80); // total_cycles = 0 (even)
+        apu.tick_cpu_cycles(3);
+        assert_eq!(apu.pulse1.envelope.decay, 0, "no clock 3 cycles in");
+        apu.tick_cpu_cycles(1);
+        assert_eq!(apu.pulse1.envelope.decay, 15, "clock on the 4th cycle");
+
+        // Odd-phase write: effects after 3 CPU cycles.
+        let mut apu = Apu2A03::new();
+        apu.write_status(0x01);
+        apu.write_register(0x4000, 0x00);
+        apu.write_register(0x4003, 0x08);
+        apu.tick_cpu_cycles(1); // total_cycles = 1 (odd)
+        apu.write_frame_counter(0x80);
+        apu.tick_cpu_cycles(2);
+        assert_eq!(apu.pulse1.envelope.decay, 0, "no clock 2 cycles in");
+        apu.tick_cpu_cycles(1);
+        assert_eq!(apu.pulse1.envelope.decay, 15, "clock on the 3rd cycle");
+    }
+
+    #[test]
+    fn frame_counter_4017_bit7_clear_does_not_clock_units() {
+        // §"$4017" (registers page): "with bit 7 clear, only the
+        // sequence is reset without clocking any of its units."
+        let mut apu = Apu2A03::new();
+        apu.write_status(0x01);
+        apu.write_register(0x4000, 0x00);
+        apu.write_register(0x4003, 0x08); // arm envelope start, length 254
+        let len = apu.pulse1.length.counter;
+        apu.write_frame_counter(0x00);
+        apu.tick_cpu_cycles(8); // reset landed, no clocks
+        assert_eq!(apu.pulse1.envelope.decay, 0, "no quarter clock");
+        assert_eq!(apu.pulse1.length.counter, len, "no half clock");
     }
 
     #[test]
     fn five_step_clocks_nothing_at_fourth_step_and_both_at_fifth() {
         // §"Mode 1" table: step 4 (APU 14914 → CPU 29829) clocks
         // neither unit; step 5 (APU 18640 → CPU 37281) clocks BOTH the
-        // quarter- and half-frame units. Track the envelope divider via
-        // decay steps and the length counter.
+        // quarter- and half-frame units. Track the envelope decay level
+        // and the length counter. All offsets below are relative to the
+        // sequence start, which lands 4 CPU cycles after the
+        // (even-phase) $4017 write together with the write's own
+        // quarter+half clock.
         let mut apu = Apu2A03::new();
         apu.write_status(0x01);
         apu.write_register(0x4000, 0x00); // envelope mode, halt clear
         apu.write_register(0x4003, 0x08); // length idx 1 → 254, env start
-        apu.write_frame_counter(0x80); // 5-step (immediate Q+H clock)
-        let len_after_write = apu.pulse1.length.counter;
-        let decay_after_write = apu.pulse1.envelope.decay;
-        // Run to just past step 4 (CPU 29829): quarter clocks fired at
-        // 7457/14913/22371 only — step 4 contributes nothing.
+        apu.write_frame_counter(0x80); // 5-step
+        apu.tick_cpu_cycles(4); // deferred reset + Q+H clock land
+        let len0 = apu.pulse1.length.counter;
+        let decay0 = apu.pulse1.envelope.decay;
+        assert_eq!(decay0, 15, "write's own quarter clock consumed start");
+        // Run to just past step 4 (sequence CPU 29829): quarter clocks
+        // fired at 7457/14913/22371 only — step 4 contributes nothing.
         apu.tick_cpu_cycles(29_900);
         assert_eq!(
             apu.pulse1.envelope.decay,
-            decay_after_write.saturating_sub(3),
+            decay0 - 3,
             "exactly 3 quarter clocks through CPU 29900 (step 4 is blank)"
         );
         assert_eq!(
             apu.pulse1.length.counter,
-            len_after_write - 1,
+            len0 - 1,
             "one half clock (step 2) through CPU 29900"
         );
-        // Step 5 (CPU 37281) clocks both.
+        // Step 5 (sequence CPU 37281) clocks both.
         apu.tick_cpu_cycles(37_281 - 29_900);
         assert_eq!(
             apu.pulse1.envelope.decay,
-            decay_after_write.saturating_sub(4),
+            decay0 - 4,
             "step 5 issues the 4th quarter clock"
         );
         assert_eq!(
             apu.pulse1.length.counter,
-            len_after_write - 2,
+            len0 - 2,
             "step 5 issues the 2nd half clock"
         );
     }
 
     #[test]
     fn frame_counter_pal_period_is_documented() {
-        // PAL 4-step period is 33254 CPU cycles (APU 16627 × 2).
+        // PAL 4-step period is 33254 CPU cycles (APU 16627 × 2); the
+        // first IRQ set point is the step-4 GET at CPU 33252 from the
+        // sequence start, which begins 4 cycles after the (even-phase)
+        // $4017 write.
         let mut apu = Apu2A03::new();
         apu.set_cpu_hz(1_662_607); // PAL clock
         apu.write_frame_counter(0x00);
@@ -1765,7 +1877,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(fired_at, Some(33_252), "PAL 4-step IRQ flag at CPU 33252");
+        assert_eq!(
+            fired_at,
+            Some(4 + 33_252),
+            "PAL 4-step IRQ flag at CPU 33252 after the delayed reset"
+        );
     }
 
     #[test]

@@ -63,6 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test runs a sweeping pulse + short-linear-counter triangle over
   100 000 cycles bulk-vs-single-cycle and requires identical state.
 
+- **`$4017` writes now take effect on the documented 3-or-4-CPU-cycle
+  delay** (`docs/audio/nsf/apu-frame-counter-wiki.html` §"Side
+  effects": "After 3 or 4 CPU clock cycles*, the timer is reset. If
+  the mode flag is set, then both 'quarter frame' and 'half frame'
+  signals are also generated" — 3 cycles for a write on the second
+  (odd) half of an APU cycle, 4 for a write on the first (even) half,
+  so the effects always land on the same CPU/APU phase). The mode +
+  inhibit register bits still apply immediately, but the sequence
+  reset and the 5-step write's quarter+half clock were previously
+  instantaneous; a tune that syncs the frame counter by writing
+  `$C0`/`$FF` once per frame now sees the hardware's phase-dependent
+  reset latency. The old sequence keeps running until the reset
+  lands. New `frame_counter_4017_reset_delay_depends_on_write_phase`
+  and `frame_counter_4017_bit7_clear_does_not_clock_units` tests; the
+  timing tests now measure from the delayed sequence start.
+
 - **DMC output unit now powers up silent** per
   `docs/audio/nsf/apu-dmc-wiki.html` §"Output unit": the sample buffer
   is empty at power-up, the silence flag is set whenever an output
