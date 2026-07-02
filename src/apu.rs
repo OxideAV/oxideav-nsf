@@ -514,8 +514,11 @@ struct DmcChannel {
     pending_fetch: bool,
     pending_fetch_addr: u16,
 
-    /// Reads to `$4015` should clear the IRQ flag — round 2 records the
-    /// flag for `$4015` reporting only.
+    /// DMC interrupt flag. Set when the bytes-remaining counter hits
+    /// zero with the `$4010` IRQ-enable bit set; cleared by a `$4015`
+    /// *write* or by clearing the `$4010` IRQ-enable bit — NOT by a
+    /// `$4015` read (`docs/audio/nsf/apu-nesdev-wiki.html` §"Status
+    /// ($4015)").
     irq_flag: bool,
 }
 
@@ -875,7 +878,14 @@ impl Apu2A03 {
     }
 
     /// `$4015` write — channel enables.
+    ///
+    /// Per `docs/audio/nsf/apu-nesdev-wiki.html` §"Status ($4015)":
+    /// "Writing to this register clears the DMC interrupt flag." (The
+    /// frame interrupt flag is NOT touched by a `$4015` write — it is
+    /// cleared only by a `$4015` read or by setting the `$4017`
+    /// interrupt-inhibit flag.)
     pub fn write_status(&mut self, value: u8) {
+        self.dmc.irq_flag = false;
         self.pulse1.enabled = value & 0x01 != 0;
         self.pulse2.enabled = value & 0x02 != 0;
         self.triangle.enabled = value & 0x04 != 0;
@@ -915,10 +925,11 @@ impl Apu2A03 {
         if self.dmc.irq_flag {
             s |= 0x80;
         }
-        // Reads to $4015 acknowledge / clear the frame-counter and
-        // DMC IRQ flags per nesdev wiki §APU Status.
+        // Per docs/audio/nsf/apu-nesdev-wiki.html §"$4015 read":
+        // "Reading this register clears the frame interrupt flag (but
+        // not the DMC interrupt flag)." The DMC flag is cleared only by
+        // a $4015 *write* or by clearing the $4010 IRQ-enable bit.
         self.frame_irq_flag = false;
-        self.dmc.irq_flag = false;
         s
     }
 
@@ -1423,9 +1434,42 @@ mod tests {
         assert!(apu.dmc.irq_flag, "DMC IRQ flag should be set");
         let s = apu.read_status();
         assert_eq!(s & 0x80, 0x80);
-        // Second read clears.
+        // §"$4015 read": "Reading this register clears the frame
+        // interrupt flag (but not the DMC interrupt flag)." A second
+        // read must still report the DMC flag.
         let s2 = apu.read_status();
-        assert_eq!(s2 & 0x80, 0);
+        assert_eq!(s2 & 0x80, 0x80, "$4015 read must NOT clear DMC IRQ");
+        // §"$4015 write": "Writing to this register clears the DMC
+        // interrupt flag."
+        apu.write_status(0x10);
+        assert!(!apu.dmc.irq_flag, "$4015 write must clear DMC IRQ");
+        let s3 = apu.read_status();
+        assert_eq!(s3 & 0x80, 0);
+    }
+
+    #[test]
+    fn dmc_irq_flag_cleared_by_4010_irq_disable() {
+        // §"$4010": "IRQ enabled flag. If clear, the interrupt flag is
+        // cleared."
+        let mut apu = Apu2A03::new();
+        apu.dmc.irq_flag = true;
+        apu.write_register(0x4010, 0x80); // IRQ enable stays set
+        assert!(apu.dmc.irq_flag, "IRQ-enable set must preserve the flag");
+        apu.write_register(0x4010, 0x00); // IRQ enable cleared
+        assert!(!apu.dmc.irq_flag, "clearing IRQ enable must clear the flag");
+    }
+
+    #[test]
+    fn status_write_does_not_touch_frame_irq_flag() {
+        // The $4015-write clear applies to the DMC interrupt flag only;
+        // the frame interrupt flag is cleared by a $4015 *read* or the
+        // $4017 inhibit bit, never by a $4015 write.
+        let mut apu = Apu2A03::new();
+        apu.frame_irq_flag = true;
+        apu.write_status(0x1F);
+        assert!(apu.frame_irq_flag, "$4015 write must not clear frame IRQ");
+        apu.read_status();
+        assert!(!apu.frame_irq_flag, "$4015 read clears frame IRQ");
     }
 
     #[test]
@@ -1438,7 +1482,8 @@ mod tests {
         apu.tick_cpu_cycles(35_000);
         assert!(apu.irq_line(), "frame IRQ should assert the line");
 
-        // $4015 read acks frame + DMC IRQs.
+        // $4015 read acks the frame IRQ (the DMC flag is not involved
+        // here — a read never clears it).
         apu.read_status();
         assert!(!apu.irq_line());
 

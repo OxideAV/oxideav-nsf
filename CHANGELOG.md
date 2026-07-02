@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`$4015` write/read IRQ-flag semantics now match the documented
+  register contract** (`docs/audio/nsf/apu-nesdev-wiki.html` §"Status
+  ($4015)"). A `$4015` *write* now clears the DMC interrupt flag
+  ("Writing to this register clears the DMC interrupt flag") — it
+  previously left the flag latched, so a tune that acknowledged a DMC
+  IRQ the documented way kept re-entering its IRQ handler. A `$4015`
+  *read* no longer clears the DMC interrupt flag ("Reading this
+  register clears the frame interrupt flag (but not the DMC interrupt
+  flag)") — it previously acknowledged both, so polling `$4015` bit 7
+  for end-of-sample destroyed the very flag the read was reporting
+  before the program could dispatch on it. The frame interrupt flag is
+  untouched by writes, cleared by reads, exactly as before. Tests: the
+  end-of-sample IRQ test now pins read-preserves / write-clears, plus
+  new `dmc_irq_flag_cleared_by_4010_irq_disable` and
+  `status_write_does_not_touch_frame_irq_flag`.
+
 - **Pulse channels no longer self-mute on low (bass) notes when no sweep
   is configured.** The sweep adder-overflow mute was applied
   unconditionally, but with the default zero shift count the adder
