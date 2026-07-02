@@ -388,8 +388,12 @@ impl NsfPlayer {
                 };
                 let chunk = need.max(1);
                 self.bus.tick_cycles(chunk);
-                self.cycles_since_play = self.cycles_since_play.saturating_add(chunk);
-                spent = spent.saturating_add(chunk);
+                // DMC sample DMA steals CPU cycles even while we idle
+                // at the sentinel — fold the stall into the elapsed
+                // time so the PLAY cadence stays true to the APU state.
+                let elapsed = chunk.saturating_add(self.bus.take_dmc_stall());
+                self.cycles_since_play = self.cycles_since_play.saturating_add(elapsed);
+                spent = spent.saturating_add(elapsed);
                 continue;
             }
 

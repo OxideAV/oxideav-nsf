@@ -77,7 +77,11 @@ impl Cpu6502 {
     }
 
     /// Fetch + decode + execute one instruction. Returns the cycles
-    /// consumed.
+    /// consumed — including any CPU cycles stolen by DMC sample-byte
+    /// DMA during the instruction (the §"Memory reader" stall from
+    /// `docs/audio/nsf/apu-dmc-wiki.html`; "The processor will
+    /// continue on from where it was stalled"), so callers scheduling
+    /// off the return value see the DMA-stretched wall-clock time.
     pub fn step(&mut self, bus: &mut NesBus) -> u32 {
         if self.halted {
             return 1;
@@ -88,7 +92,7 @@ impl Cpu6502 {
         if bus.take_nmi() {
             let cy = self.service_interrupt(bus, 0xFFFA);
             bus.tick_cycles(cy);
-            return cy;
+            return cy + bus.take_dmc_stall();
         }
         // IRQ is level-triggered: serviced whenever the I flag is
         // clear and the bus is asserting the IRQ line (NSF2 timer
@@ -97,12 +101,12 @@ impl Cpu6502 {
         if (self.p & FLAG_I) == 0 && bus.irq_line() {
             let cy = self.service_interrupt(bus, 0xFFFE);
             bus.tick_cycles(cy);
-            return cy;
+            return cy + bus.take_dmc_stall();
         }
         let opcode = self.fetch_byte(bus);
         let cycles = self.dispatch(bus, opcode);
         bus.tick_cycles(cycles);
-        cycles
+        cycles + bus.take_dmc_stall()
     }
 
     /// Push PC + processor flags (B=0, U=1), set I, then jump through
@@ -2024,6 +2028,33 @@ mod tests {
         let pushed = bus.ram[0x0100 + cpu.sp as usize + 1];
         assert_eq!(pushed & FLAG_B, 0);
         assert_eq!(pushed & FLAG_U, FLAG_U);
+    }
+
+    #[test]
+    fn step_includes_dmc_dma_stall_cycles() {
+        // A DMC sample-byte fetch during an instruction stalls the CPU
+        // (§"Memory reader"); step() must report the stretched cycle
+        // count so callers scheduling off the return value stay in
+        // sync with the APU.
+        let mut bus = NesBus::new();
+        bus.write(0x4010, 0x4F); // loop, fastest rate
+        bus.write(0x4012, 0x00);
+        bus.write(0x4013, 0x00); // 1-byte sample
+        bus.write(0x4015, 0x10); // enable → fetch arms on next tick
+        let mut cpu = Cpu6502::new();
+        bus.ram[0x0200] = 0xEA; // NOP
+        cpu.pc = 0x0200;
+        cpu.p = FLAG_U | FLAG_I;
+        let cy = cpu.step(&mut bus);
+        assert_eq!(
+            cy,
+            2 + crate::apu::DMC_DMA_STALL_CYCLES,
+            "NOP (2 cycles) + the first DMC fetch stall"
+        );
+        // With the buffer full, the next instruction runs unstalled.
+        bus.ram[0x0201] = 0xEA;
+        let cy2 = cpu.step(&mut bus);
+        assert_eq!(cy2, 2, "no fetch pending → no stall");
     }
 
     #[test]

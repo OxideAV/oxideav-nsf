@@ -205,6 +205,10 @@ pub struct NesBus {
     /// non-returning INIT / NMI-driven PLAY path). Drained by the CPU
     /// on the next `step`.
     pub nmi_pending: bool,
+
+    /// CPU cycles stolen by DMC sample-byte DMA since the last
+    /// [`NesBus::take_dmc_stall`] — the §"Memory reader" CPU stall.
+    pending_dmc_stall: u32,
 }
 
 impl Default for NesBus {
@@ -230,6 +234,7 @@ impl NesBus {
             vector_overlay_active: false,
             vector_overlay: [0u8; 6],
             nmi_pending: false,
+            pending_dmc_stall: 0,
         }
     }
 
@@ -531,6 +536,14 @@ impl NesBus {
     /// Inform the bus that `cycles` CPU clocks elapsed; forwards them
     /// to the APU so the frame counter advances. The DMC fetcher pulls
     /// bytes back through this same bus on demand.
+    ///
+    /// Every DMC sample-byte fetch also *stalls the CPU* per
+    /// `docs/audio/nsf/apu-dmc-wiki.html` §"Memory reader" ("The CPU
+    /// is stalled for 1-4 CPU cycles to read a sample byte"): the
+    /// stolen cycles are real wall-clock time, so the APU + NSF2 timer
+    /// keep running through them here, and the total is accumulated
+    /// for [`NesBus::take_dmc_stall`] so the CPU/player can extend the
+    /// current instruction's cycle count accordingly.
     pub fn tick_cycles(&mut self, cycles: u32) {
         self.cycles = self.cycles.wrapping_add(cycles as u64);
         // Run the APU; whenever the DMC needs a sample byte, fetch it
@@ -542,13 +555,28 @@ impl NesBus {
             let n = remaining.min(CHUNK);
             self.apu.tick_cpu_cycles(n);
             self.nsf2_timer.tick(n);
-            // Drain pending DMC fetches.
+            // Drain pending DMC fetches; each one halts the CPU for
+            // DMC_DMA_STALL_CYCLES while the rest of the machine runs
+            // on.
             while let Some(addr) = self.apu.dmc_pending_fetch() {
                 let byte = self.read(addr);
                 self.apu.dmc_supply_byte(byte);
+                let stall = crate::apu::DMC_DMA_STALL_CYCLES;
+                self.pending_dmc_stall = self.pending_dmc_stall.saturating_add(stall);
+                self.cycles = self.cycles.wrapping_add(stall as u64);
+                self.apu.tick_cpu_cycles(stall);
+                self.nsf2_timer.tick(stall);
             }
             remaining -= n;
         }
+    }
+
+    /// Drain the CPU cycles stolen by DMC sample-byte DMA since the
+    /// last call. [`crate::cpu::Cpu6502::step`] folds them into the
+    /// executing instruction's cycle count so the caller's scheduling
+    /// (PLAY cadence, samples-per-cycle budget) sees the stall.
+    pub fn take_dmc_stall(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_dmc_stall)
     }
 }
 
@@ -818,6 +846,35 @@ mod tests {
         assert_eq!(
             bus.apu.expansion.mmc5.pcm, 0x00,
             "$C000 read must NOT trigger write-by-read"
+        );
+    }
+
+    #[test]
+    fn dmc_dma_fetch_stalls_are_accounted() {
+        // §"Memory reader" of the DMC doc: every sample-byte fetch
+        // stalls the CPU. The bus accrues DMC_DMA_STALL_CYCLES per
+        // fetch, keeps the APU running through the stall, and drains
+        // the total via take_dmc_stall().
+        let mut bus = NesBus::new();
+        bus.write(0x4010, 0x4F); // loop flag, fastest rate (54 cy/bit)
+        bus.write(0x4012, 0x00); // sample address $C000
+        bus.write(0x4013, 0x00); // 1-byte sample
+        bus.write(0x4015, 0x10); // enable DMC → arms the first fetch
+        assert_eq!(bus.take_dmc_stall(), 0, "no fetch before ticking");
+        bus.tick_cycles(1);
+        assert_eq!(
+            bus.take_dmc_stall(),
+            crate::apu::DMC_DMA_STALL_CYCLES,
+            "first byte fetch must stall the CPU"
+        );
+        assert_eq!(bus.take_dmc_stall(), 0, "stall drains on take");
+        // A looping 1-byte sample re-fetches once per 8-bit output
+        // cycle (8 × 54 CPU cycles at rate $F). Four cycles' worth of
+        // ticking must accrue at least three more fetch stalls.
+        bus.tick_cycles(54 * 8 * 4);
+        assert!(
+            bus.take_dmc_stall() >= 3 * crate::apu::DMC_DMA_STALL_CYCLES,
+            "looping sample must keep accruing fetch stalls"
         );
     }
 

@@ -157,6 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DMC DMA CPU-stall accounting** — closes the README's named
+  "DMC CPU-stall accounting" gap. Per
+  `docs/audio/nsf/apu-dmc-wiki.html` §"Memory reader", every
+  sample-byte fetch stalls the CPU ("The CPU is stalled for 1-4 CPU
+  cycles to read a sample byte […] The processor will continue on from
+  where it was stalled"). The bus now accrues
+  `apu::DMC_DMA_STALL_CYCLES` (4 — the top of the documented range)
+  per fetch while keeping the APU + NSF2 timer running through the
+  stolen cycles; `Cpu6502::step` folds the stall into its returned
+  cycle count and the player's idle path folds it into the elapsed
+  time, so the PLAY cadence and samples-per-cycle budget both see the
+  DMA-stretched wall clock. A DPCM-heavy tune's PLAY rate no longer
+  runs fast relative to its sample playback. DOCS-GAP: the wiki's DMA
+  article (with the 1/2/3-cycle per-alignment special cases) is not
+  staged, so all fetches account the full 4-cycle halt. New
+  `dmc_dma_fetch_stalls_are_accounted` (bus) and
+  `step_includes_dmc_dma_stall_cycles` (CPU) tests.
+
 - **Post-DAC analog filter chain on the player output.** The mixer doc
   describes the NES hardware following the channel DACs with two
   first-order high-pass filters (90 Hz, 440 Hz) and a first-order

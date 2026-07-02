@@ -466,6 +466,17 @@ impl NoiseChannel {
     }
 }
 
+/// CPU cycles the DMC's memory reader steals from the CPU per sample
+/// byte fetched. `docs/audio/nsf/apu-dmc-wiki.html` §"Memory reader":
+/// "The CPU is stalled for 1-4 CPU cycles to read a sample byte. The
+/// exact cycle count depends on many factors and is described in
+/// detail in the DMA article." We account the full 4-cycle halt for
+/// every fetch — the top of the documented range. DOCS-GAP: the DMA
+/// article with the per-alignment 1/2/3-cycle special cases is not
+/// staged under `docs/audio/nsf/`, so the shorter cases cannot be
+/// modelled yet; the constant keeps the refinement a one-line edit.
+pub const DMC_DMA_STALL_CYCLES: u32 = 4;
+
 /// DMC rate table (NTSC). Each entry is the number of CPU cycles per
 /// output bit. Index from `$4010` low nibble.
 const DMC_RATE_NTSC: [u16; 16] = [
