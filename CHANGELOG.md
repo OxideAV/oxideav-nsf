@@ -25,6 +25,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `dmc_irq_flag_cleared_by_4010_irq_disable` and
   `status_write_does_not_touch_frame_irq_flag`.
 
+- **Frame counter now fires its events at the exact documented CPU
+  half-cycles** (`docs/audio/nsf/apu-frame-counter-wiki.html` §"Mode
+  0"/"Mode 1"). Three corrections in one restructure to a per-event
+  schedule table:
+  * Quarter-/half-frame signals land on the **PUT half** of their APU
+    cycle — the doc's "additional delay of one CPU cycle for the
+    quarter and half frame signals" — i.e. CPU offset `2×APU + 1`
+    (7457/14913/22371/29829 NTSC 4-step), not the even GET cycle.
+  * The 4-step **frame interrupt flag is set at three consecutive CPU
+    cycles** (step-4 GET 29828, its PUT 29829, and the wrap GET
+    29830; PAL 33252/33253/33254), so a program that acknowledges via
+    `$4015` at the first set point sees the documented immediate
+    re-assertion. Previously the flag was a single-shot at 29828.
+  * **5-step mode's 4th step clocks nothing and its 5th step clocks
+    BOTH units** per the Mode 1 table (quarter at steps 1/2/3/5, half
+    at 2/5). The old code issued a spurious quarter clock at step 4
+    and only a half clock at step 5, so every envelope in 5-step mode
+    decayed on a wrong cadence.
+  New `frame_counter_quarter_signal_lands_on_put_cycle` and
+  `five_step_clocks_nothing_at_fourth_step_and_both_at_fifth` tests;
+  the IRQ-schedule test now pins the triple set-point behaviour.
+
 - **DMC output unit now powers up silent** per
   `docs/audio/nsf/apu-dmc-wiki.html` §"Output unit": the sample buffer
   is empty at power-up, the silence flag is set whenever an output

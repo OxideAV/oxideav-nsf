@@ -733,6 +733,18 @@ fn mixe_millibel_to_linear(mb: i16) -> f32 {
     10.0f32.powf(mb as f32 / 2000.0)
 }
 
+/// One scheduled frame-sequence event: at `offset` CPU cycles from the
+/// sequence start, optionally clock the quarter-frame units (envelopes
+/// plus triangle linear counter), the half-frame units (length counters
+/// plus sweeps), and/or set the frame interrupt flag.
+#[derive(Clone, Copy)]
+struct FrameEvent {
+    offset: u32,
+    quarter: bool,
+    half: bool,
+    irq: bool,
+}
+
 /// 2A03 APU — five channels + frame counter + status / mixer + the
 /// expansion-chip aggregate.
 pub struct Apu2A03 {
@@ -1027,99 +1039,114 @@ impl Apu2A03 {
         self.expansion.tick(cycles);
 
         // Frame counter: advance through the region- and mode-specific
-        // schedule of quarter-/half-frame events. The event positions
-        // come straight from docs/audio/nsf/apu-frame-counter-wiki.html
-        // §"Mode 0"/"Mode 1" (APU-cycle columns doubled to CPU cycles),
-        // so the 4-step interrupt period is exactly the documented 29830
-        // (NTSC) / 33254 (PAL) CPU cycles rather than a uniform 4×7457
-        // approximation. `frame_acc` counts CPU cycles since the last
-        // sequence reset; each scheduled offset fires its step once.
+        // schedule of quarter-/half-frame + IRQ-set events. The event
+        // positions come straight from
+        // docs/audio/nsf/apu-frame-counter-wiki.html §"Mode 0"/"Mode 1":
+        // the quarter/half signals land on the PUT half of the listed
+        // APU cycle (CPU offset = 2×APU + 1, the doc's "additional delay
+        // of one CPU cycle for the quarter and half frame signals"), the
+        // 4-step frame-interrupt flag is set on THREE consecutive CPU
+        // cycles (the step-4 GET, its PUT, and the step-0 GET of the
+        // wrap), and the sequence period is exactly the documented 29830
+        // (NTSC) / 33254 (PAL) CPU cycles. `frame_acc` counts CPU cycles
+        // since the last sequence reset; each scheduled offset fires
+        // once (`frame_step` indexes the next unfired event).
         self.frame_acc += cycles;
         loop {
-            let schedule = self.frame_schedule();
-            let n_steps = schedule.len() - 1;
-            let period = schedule[n_steps];
-            if (self.frame_step as usize) < n_steps {
-                // Fire the next scheduled step once we reach its offset.
-                let next_offset = schedule[self.frame_step as usize];
-                if self.frame_acc >= next_offset {
-                    self.advance_frame_counter();
-                } else {
-                    break;
-                }
+            let schedule = self.frame_events();
+            if (self.frame_step as usize) >= schedule.len() {
+                // Defensive: a region flip mid-sequence can leave the
+                // step index past the end of the new table.
+                self.frame_step = 0;
+                self.frame_acc = 0;
+            }
+            let ev = schedule[self.frame_step as usize];
+            if self.frame_acc < ev.offset {
+                break;
+            }
+            if ev.quarter {
+                self.tick_quarter_frame();
+            }
+            if ev.half {
+                self.tick_half_frame();
+            }
+            if ev.irq && !self.frame_irq_inhibit {
+                // Only the 4-step sequence carries IRQ events; the
+                // tables encode none for 5-step ("In this mode, the
+                // frame interrupt flag is never set").
+                self.frame_irq_flag = true;
+            }
+            if (self.frame_step as usize) == schedule.len() - 1 {
+                // Last event doubles as the period boundary: "Once the
+                // last step has executed, the count resets to 0 on the
+                // next APU cycle."
+                self.frame_acc -= ev.offset;
+                self.frame_step = 0;
             } else {
-                // All steps fired; wait for the period boundary, then
-                // reset the sequence (drop one period, rewind to step 0).
-                if self.frame_acc >= period {
-                    self.frame_acc -= period;
-                    self.frame_step = 0;
-                } else {
-                    break;
-                }
+                self.frame_step += 1;
             }
         }
     }
 
-    /// CPU-cycle offsets, within one frame-sequence period, at which
-    /// each step fires — the last entry is the period length itself.
-    /// Derived by doubling the documented APU-cycle positions in
-    /// `docs/audio/nsf/apu-frame-counter-wiki.html`.
-    fn frame_schedule(&self) -> &'static [u32] {
+    /// Per-mode/region frame-sequence event tables, in CPU cycles from
+    /// the sequence start, transcribed from the Mode 0 / Mode 1 tables
+    /// of `docs/audio/nsf/apu-frame-counter-wiki.html`. Quarter/half
+    /// signals fire on the PUT half of their APU cycle (CPU = 2×APU+1);
+    /// the 4-step interrupt flag is set at the step-4 GET (2×APU), the
+    /// step-4 PUT, and the wrap GET (= the period). The final entry's
+    /// offset is the sequence period. Mode 1 (5-step) clocks nothing at
+    /// its 4th step (the table row is blank) and never sets the flag.
+    fn frame_events(&self) -> &'static [FrameEvent] {
+        const fn ev(offset: u32, quarter: bool, half: bool, irq: bool) -> FrameEvent {
+            FrameEvent {
+                offset,
+                quarter,
+                half,
+                irq,
+            }
+        }
+        // 4-step NTSC: APU 3728/7456/11185/14914, wrap 14915.
+        const NTSC_4: &[FrameEvent] = &[
+            ev(7457, true, false, false),
+            ev(14913, true, true, false),
+            ev(22371, true, false, false),
+            ev(29828, false, false, true),
+            ev(29829, true, true, true),
+            ev(29830, false, false, true),
+        ];
+        // 4-step PAL: APU 4156/8313/12469/16626, wrap 16627.
+        const PAL_4: &[FrameEvent] = &[
+            ev(8313, true, false, false),
+            ev(16627, true, true, false),
+            ev(24939, true, false, false),
+            ev(33252, false, false, true),
+            ev(33253, true, true, true),
+            ev(33254, false, false, true),
+        ];
+        // 5-step NTSC: APU 3728/7456/11185/14914 (blank)/18640, wrap
+        // 18641. Step 4 (APU 14914) clocks neither unit, so it is not
+        // listed.
+        const NTSC_5: &[FrameEvent] = &[
+            ev(7457, true, false, false),
+            ev(14913, true, true, false),
+            ev(22371, true, false, false),
+            ev(37281, true, true, false),
+            ev(37282, false, false, false),
+        ];
+        // 5-step PAL: APU 4156/8313/12469/16626 (blank)/20782, wrap
+        // 20783.
+        const PAL_5: &[FrameEvent] = &[
+            ev(8313, true, false, false),
+            ev(16627, true, true, false),
+            ev(24939, true, false, false),
+            ev(41565, true, true, false),
+            ev(41566, false, false, false),
+        ];
         match (self.five_step, self.pal) {
-            // 4-step: steps 0..=3 at 3728/7456/11185/14914 APU; reset at
-            // 14915 APU → period 29830 CPU.
-            (false, false) => &[7456, 14912, 22370, 29828, 29830],
-            (false, true) => &[8312, 16626, 24938, 33252, 33254],
-            // 5-step: steps 0..=4 at 3728/7456/11185/14914/18640 APU;
-            // reset at 18641 APU → period 37282 CPU.
-            (true, false) => &[7456, 14912, 22370, 29828, 37280, 37282],
-            (true, true) => &[8312, 16626, 24938, 33252, 41564, 41566],
-        }
-    }
-
-    fn advance_frame_counter(&mut self) {
-        // 4-step: events at steps 0, 1, 2, 3; quarter on every step,
-        // half on steps 1 and 3.
-        // 5-step: events at steps 0, 1, 2, 3, 4; quarter on 0/1/2/3,
-        // half on 1 and 4. Step 4 has no envelope tick.
-        if self.five_step {
-            match self.frame_step {
-                0 | 2 => {
-                    self.tick_quarter_frame();
-                }
-                1 => {
-                    self.tick_quarter_frame();
-                    self.tick_half_frame();
-                }
-                3 => {
-                    self.tick_quarter_frame();
-                }
-                4 => {
-                    self.tick_half_frame();
-                }
-                _ => {}
-            }
-            self.frame_step += 1;
-        } else {
-            match self.frame_step {
-                0 | 2 => {
-                    self.tick_quarter_frame();
-                }
-                1 | 3 => {
-                    self.tick_quarter_frame();
-                    self.tick_half_frame();
-                    if self.frame_step == 3 && !self.frame_irq_inhibit {
-                        // 4-step mode latches the frame interrupt
-                        // flag at the end of step 3 (the same
-                        // event that issues the second half-frame
-                        // tick). Spec: only 4-step mode raises the
-                        // flag; 5-step never does.
-                        self.frame_irq_flag = true;
-                    }
-                }
-                _ => {}
-            }
-            self.frame_step += 1;
+            (false, false) => NTSC_4,
+            (false, true) => PAL_4,
+            (true, false) => NTSC_5,
+            (true, true) => PAL_5,
         }
     }
 
@@ -1569,8 +1596,20 @@ mod tests {
         }
         assert_eq!(fired_at, Some(29_828), "4-step IRQ flag at CPU 29828");
 
-        // Acknowledge, then confirm the next assertion is exactly one
-        // documented period (29830 CPU cycles) later.
+        // §"Mode 0": the flag is set at THREE consecutive points — the
+        // step-4 GET (29828), its PUT (29829), and the wrap GET
+        // (29830). Acknowledging right after the first set point must
+        // therefore see the flag re-assert one cycle later, and again
+        // one cycle after that.
+        apu.read_status();
+        apu.tick_cpu_cycles(1); // CPU 29829
+        assert!(apu.frame_irq_flag, "flag re-set at step-4 PUT (29829)");
+        apu.read_status();
+        apu.tick_cpu_cycles(1); // CPU 29830 (= wrap)
+        assert!(apu.frame_irq_flag, "flag re-set at wrap GET (29830)");
+
+        // After the final set point, the next assertion is a full
+        // sequence later: 29828 cycles from the wrap.
         apu.read_status();
         let mut next_at = None;
         for c in 1..=40_000u32 {
@@ -1580,7 +1619,66 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(next_at, Some(29_830), "4-step IRQ period = 29830 CPU");
+        assert_eq!(next_at, Some(29_828), "next set point 29828 after wrap");
+    }
+
+    #[test]
+    fn frame_counter_quarter_signal_lands_on_put_cycle() {
+        // §"Mode 0" + the intro note "with an additional delay of one
+        // CPU cycle for the quarter and half frame signals": the first
+        // quarter-frame clock of the 4-step NTSC sequence lands at APU
+        // 3728, PUT half → CPU cycle 2×3728 + 1 = 7457. Observe it via
+        // the envelope decay level: after a $4003 write arms the start
+        // flag, the first quarter-frame clock reloads decay to 15.
+        let mut apu = Apu2A03::new();
+        apu.write_frame_counter(0x00);
+        apu.write_status(0x01);
+        apu.write_register(0x4000, 0x00); // envelope mode, period 0
+        apu.write_register(0x4003, 0x08); // arms envelope start
+        apu.tick_cpu_cycles(7_456);
+        assert_eq!(apu.pulse1.envelope.decay, 0, "no quarter clock yet");
+        apu.tick_cpu_cycles(1); // CPU 7457 = PUT of APU 3728
+        assert_eq!(apu.pulse1.envelope.decay, 15, "quarter clock at 7457");
+    }
+
+    #[test]
+    fn five_step_clocks_nothing_at_fourth_step_and_both_at_fifth() {
+        // §"Mode 1" table: step 4 (APU 14914 → CPU 29829) clocks
+        // neither unit; step 5 (APU 18640 → CPU 37281) clocks BOTH the
+        // quarter- and half-frame units. Track the envelope divider via
+        // decay steps and the length counter.
+        let mut apu = Apu2A03::new();
+        apu.write_status(0x01);
+        apu.write_register(0x4000, 0x00); // envelope mode, halt clear
+        apu.write_register(0x4003, 0x08); // length idx 1 → 254, env start
+        apu.write_frame_counter(0x80); // 5-step (immediate Q+H clock)
+        let len_after_write = apu.pulse1.length.counter;
+        let decay_after_write = apu.pulse1.envelope.decay;
+        // Run to just past step 4 (CPU 29829): quarter clocks fired at
+        // 7457/14913/22371 only — step 4 contributes nothing.
+        apu.tick_cpu_cycles(29_900);
+        assert_eq!(
+            apu.pulse1.envelope.decay,
+            decay_after_write.saturating_sub(3),
+            "exactly 3 quarter clocks through CPU 29900 (step 4 is blank)"
+        );
+        assert_eq!(
+            apu.pulse1.length.counter,
+            len_after_write - 1,
+            "one half clock (step 2) through CPU 29900"
+        );
+        // Step 5 (CPU 37281) clocks both.
+        apu.tick_cpu_cycles(37_281 - 29_900);
+        assert_eq!(
+            apu.pulse1.envelope.decay,
+            decay_after_write.saturating_sub(4),
+            "step 5 issues the 4th quarter clock"
+        );
+        assert_eq!(
+            apu.pulse1.length.counter,
+            len_after_write - 2,
+            "step 5 issues the 2nd half clock"
+        );
     }
 
     #[test]
