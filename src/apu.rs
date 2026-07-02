@@ -481,10 +481,7 @@ const DMC_RATE_PAL: [u16; 16] = [
 ///
 /// nesdev.org/wiki/APU_DMC: a 1-bit delta sample stream that drives a
 /// 7-bit DAC. Sample bytes are fetched from main memory through the
-/// CPU bus by stalling the CPU for 4 cycles per fetch (round 2 omits
-/// the stall — it would change the player schedule but not the sample
-/// values for our music-only use case).
-#[derive(Default)]
+/// CPU bus, stalling the CPU per fetch (see `DMC_DMA_STALL_CYCLES`).
 struct DmcChannel {
     enabled: bool,
     irq_enable: bool,
@@ -522,7 +519,49 @@ struct DmcChannel {
     irq_flag: bool,
 }
 
+impl Default for DmcChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DmcChannel {
+    /// Power-up state. The output unit starts *silent*: the sample
+    /// buffer is empty at power-up and
+    /// `docs/audio/nsf/apu-dmc-wiki.html` §"Output unit" says "If the
+    /// sample buffer is empty, then the silence flag is set" at the
+    /// start of every output cycle, and "The DPCM unit can only
+    /// transition from silent to playing at the end of an output
+    /// cycle." A clear silence flag at power-up would let the very
+    /// first timer clock apply a delta step from the (empty) shift
+    /// register to the output level — audibly corrupting a `$4011`
+    /// direct-load PCM level before any sample ever plays. The
+    /// bits-remaining counter starts at 8 (a fresh output cycle);
+    /// "the output level is loaded with 0 on power-up" per §Overview.
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            irq_enable: false,
+            loop_flag: false,
+            rate_index: 0,
+            dac: 0,
+            sample_addr_seed: 0,
+            sample_len_seed: 0,
+            current_addr: 0,
+            bytes_remaining: 0,
+            sample_buffer: 0,
+            sample_buffer_filled: false,
+            output_shift: 0,
+            output_bits: 8,
+            output_silence: true,
+            timer: 0,
+            timer_period: 0,
+            pending_fetch: false,
+            pending_fetch_addr: 0,
+            irq_flag: false,
+        }
+    }
+
     fn rate_for(rate_index: u8, pal: bool) -> u16 {
         let idx = (rate_index & 0x0F) as usize;
         if pal {
@@ -1445,6 +1484,24 @@ mod tests {
         assert!(!apu.dmc.irq_flag, "$4015 write must clear DMC IRQ");
         let s3 = apu.read_status();
         assert_eq!(s3 & 0x80, 0);
+    }
+
+    #[test]
+    fn dmc_output_unit_powers_up_silent() {
+        // §"Output unit": the sample buffer is empty at power-up, so
+        // the silence flag starts set and a $4011 direct-load level
+        // must hold rock-steady while no sample is playing — no delta
+        // step may be applied from the never-loaded shift register.
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x4010, 0x0F); // fastest rate
+        apu.write_register(0x4011, 0x40); // direct-load level 64
+        for _ in 0..10_000 {
+            apu.tick_cpu_cycles(1);
+        }
+        assert_eq!(
+            apu.dmc.dac, 0x40,
+            "$4011 level must not drift while the DMC is silent"
+        );
     }
 
     #[test]

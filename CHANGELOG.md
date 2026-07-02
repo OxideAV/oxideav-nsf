@@ -25,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `dmc_irq_flag_cleared_by_4010_irq_disable` and
   `status_write_does_not_touch_frame_irq_flag`.
 
+- **DMC output unit now powers up silent** per
+  `docs/audio/nsf/apu-dmc-wiki.html` §"Output unit": the sample buffer
+  is empty at power-up, the silence flag is set whenever an output
+  cycle starts with an empty buffer, and "The DPCM unit can only
+  transition from silent to playing at the end of an output cycle."
+  The channel previously started with the silence flag clear and the
+  bits-remaining counter at 0, so the very first timer clock applied a
+  bogus −2 delta (from the never-loaded shift register) to the output
+  level — audibly corrupting a `$4011` direct-load PCM level before
+  any sample played. Power-up is now silence-set with a fresh 8-bit
+  output cycle; new `dmc_output_unit_powers_up_silent` test pins a
+  `$4011` level as rock-steady across 10 000 idle CPU cycles.
+
 - **Pulse channels no longer self-mute on low (bass) notes when no sweep
   is configured.** The sweep adder-overflow mute was applied
   unconditionally, but with the default zero shift count the adder
