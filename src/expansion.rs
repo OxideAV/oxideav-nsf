@@ -2150,12 +2150,23 @@ impl Fds {
             0x4083 => {
                 self.freq = (self.freq & 0x00FF) | (((value & 0x0F) as u16) << 8);
                 // Bit 6 halts both envelopes and resets their timers;
-                // bit 7 runs both envelopes 4x faster.
+                // bit 7 runs both envelopes 4x faster (and halts the
+                // mod-table accumulator + the wave unit).
                 self.env_halt = value & 0x40 != 0;
                 self.env_fast = value & 0x80 != 0;
                 if self.env_halt {
                     self.vol_env_timer = self.vol_env_period();
                     self.mod_env_timer = self.mod_env_period();
+                }
+                if self.env_fast {
+                    // §Wavetables: "Disabling the wave unit via the
+                    // high bit of $4083 immediately resets its
+                    // accumulator, delaying the next tick after they
+                    // are enabled again until the next overflow.
+                    // Consequently, this also resets the wave position
+                    // to 0 (i.e. the $4040 value)."
+                    self.wave_acc = 0;
+                    self.wave_pos = 0;
                 }
             }
             0x4084 => {
@@ -2396,19 +2407,21 @@ impl Fds {
         // Wave output unit: add the 20-bit modulated pitch into the
         // 24-bit accumulator (6 address bits 18-23 over 18 fractional
         // bits per the §"Wavetables" diagram); the wave position is the
-        // top 6 bits.
-        if self.freq != 0 {
+        // top 6 bits. The `$4083` bit-7 halt disables this unit too
+        // (§Wavetables: "Disabling the wave unit via the high bit of
+        // $4083…" — the accumulator was already reset by the write).
+        if self.freq != 0 && !self.env_fast {
             self.wave_acc = (self.wave_acc.wrapping_add(self.wave_pitch())) & 0xFF_FFFF;
             self.wave_pos = ((self.wave_acc >> 18) & 0x3F) as u8;
         }
     }
 
-    /// Step the volume + mod envelope ramp generators by `cycles` CPU
-    /// clocks. Each envelope counts its own `c = 8·(e+1)·(m+1)` timer; on
-    /// underflow it ramps the gain ±1 (clamped 0..=32 on the active edge)
-    /// per §"Unit tick → Envelopes". Disabled (master speed 0), halted
-    /// (`$4083` bit 6), or mode-bit-set envelopes do not ramp.
-    fn env_tick(&mut self, cycles: u32) {
+    /// Step the volume + mod envelope ramp generators by ONE CPU
+    /// clock. Each envelope counts its own `c = 8·(e+1)·(m+1)` timer;
+    /// on expiry it ramps the gain ±1 (clamped 0..=32 on the active
+    /// edge) per §"Unit tick → Envelopes". Disabled (master speed 0),
+    /// halted (`$4083` bit 6), or mode-bit-set envelopes do not ramp.
+    fn env_tick_one(&mut self) {
         if self.env_halt || self.master_env_speed == 0 {
             return;
         }
@@ -2416,18 +2429,13 @@ impl Fds {
         if !self.vol_env_disabled {
             let period = self.vol_env_period();
             if period != 0 {
-                let mut rem = cycles;
-                while rem > 0 {
-                    if self.vol_env_timer == 0 {
-                        self.vol_env_timer = period;
-                    }
-                    let step = rem.min(self.vol_env_timer);
-                    self.vol_env_timer -= step;
-                    rem -= step;
-                    if self.vol_env_timer == 0 {
-                        self.step_volume_env();
-                        self.vol_env_timer = period;
-                    }
+                if self.vol_env_timer == 0 {
+                    self.vol_env_timer = period;
+                }
+                self.vol_env_timer -= 1;
+                if self.vol_env_timer == 0 {
+                    self.step_volume_env();
+                    self.vol_env_timer = period;
                 }
             }
         }
@@ -2435,18 +2443,13 @@ impl Fds {
         if !self.mod_env_disabled {
             let period = self.mod_env_period();
             if period != 0 {
-                let mut rem = cycles;
-                while rem > 0 {
-                    if self.mod_env_timer == 0 {
-                        self.mod_env_timer = period;
-                    }
-                    let step = rem.min(self.mod_env_timer);
-                    self.mod_env_timer -= step;
-                    rem -= step;
-                    if self.mod_env_timer == 0 {
-                        self.step_mod_env();
-                        self.mod_env_timer = period;
-                    }
+                if self.mod_env_timer == 0 {
+                    self.mod_env_timer = period;
+                }
+                self.mod_env_timer -= 1;
+                if self.mod_env_timer == 0 {
+                    self.step_mod_env();
+                    self.mod_env_timer = period;
                 }
             }
         }
@@ -2496,17 +2499,23 @@ impl Fds {
         if !self.sound_enabled {
             return;
         }
-        // Envelope ramp generators run on their own CPU-cycle timers.
-        self.env_tick(cycles);
-        // Both wave + mod units tick every 16 CPU cycles; accumulate the
-        // remainder so non-multiple-of-16 batches stay phase-correct.
-        self.cycle_acc += cycles;
-        while self.cycle_acc >= 16 {
-            self.cycle_acc -= 16;
-            self.unit_tick();
-            // The wave position advanced; commit any staged volume gain
-            // now that we may be at wave position 0.
-            self.commit_pending_volume();
+        // Walk the batch one CPU cycle at a time so the envelope ramp
+        // timers and the 16-cycle wave/mod unit tick interleave in
+        // true cycle order — a mod-envelope step that lands mid-batch
+        // changes the mod gain (and therefore the §"Modulation unit"
+        // pitch formula) for the unit ticks that follow it in the
+        // same batch, instead of the whole batch's envelope work
+        // running up front.
+        for _ in 0..cycles {
+            self.env_tick_one();
+            self.cycle_acc += 1;
+            if self.cycle_acc >= 16 {
+                self.cycle_acc -= 16;
+                self.unit_tick();
+                // The wave position advanced; commit any staged volume
+                // gain now that we may be at wave position 0.
+                self.commit_pending_volume();
+            }
         }
     }
 
@@ -4447,6 +4456,97 @@ mod tests {
         chip.write(0x4083, 0x00);
         chip.unit_tick();
         assert_ne!(chip.mod_acc, before);
+    }
+
+    // ---------------- Round 386: FDS wave halt + cycle interleave ----------------
+    //
+    // Spec source: `docs/audio/nsf/fds-audio-wiki.html`
+    //   §Wavetables — "Disabling the wave unit via the high bit of
+    //   $4083 immediately resets its accumulator, delaying the next
+    //   tick after they are enabled again until the next overflow.
+    //   Consequently, this also resets the wave position to 0 (i.e.
+    //   the $4040 value)."
+
+    #[test]
+    fn fds_4083_bit7_halts_wave_unit_and_resets_accumulator() {
+        let mut chip = Fds::new();
+        chip.write(0x4082, 0xFF); // pitch low
+        chip.write(0x4083, 0x0F); // pitch high = $F → freq = $FFF
+        chip.tick(16 * 40); // let the wave accumulate
+        assert_ne!(chip.wave_acc, 0);
+        assert_ne!(chip.wave_pos, 0);
+        // Set the halt bit: accumulator + position reset immediately.
+        chip.write(0x4083, 0x80 | 0x0F);
+        assert_eq!(chip.wave_acc, 0);
+        assert_eq!(chip.wave_pos, 0, "halted wave outputs the $4040 value");
+        // While held, the wave unit does not advance.
+        chip.tick(16 * 100);
+        assert_eq!(chip.wave_acc, 0);
+        assert_eq!(chip.wave_pos, 0);
+        // Re-enable at a low pitch: the next position change waits
+        // for the next overflow out of the 18 fractional bits. With
+        // freq $040 (neutral mod → wave_pitch = $040 * $40 = 4096 per
+        // unit tick) the first carry into bit 18 needs 65 unit ticks.
+        chip.write(0x4082, 0x40);
+        chip.write(0x4083, 0x00); // freq = $040, halt released
+        chip.tick(16 * 63);
+        assert_eq!(chip.wave_pos, 0, "position stays 0 until the overflow");
+        chip.tick(16 * 2);
+        assert_ne!(chip.wave_pos, 0);
+    }
+
+    #[test]
+    fn fds_state_is_invariant_to_batch_chunking() {
+        // Envelope steps must interleave with the 16-cycle unit ticks
+        // in true cycle order: the same total driven whole and in
+        // ragged chunks lands every accumulator in the same state.
+        // (The old batch shape ran a whole batch's envelope ramping
+        // before any of its unit ticks, so a mod-gain step drifted
+        // against the §"Modulation unit" pitch formula whenever the
+        // batch spanned an envelope expiry.)
+        let setup = |chip: &mut Fds| {
+            for i in 0..32u16 {
+                chip.write(0x4089, 0x80); // wave write enable
+                chip.write(0x4040 + i * 2, (i & 0x3F) as u8);
+                chip.write(0x4089, 0x00);
+            }
+            chip.write(0x4085, 0x08); // seed mod counter
+            chip.write(0x4088, 0x01); // mod table (while disabled)
+            chip.write(0x4088, 0x06);
+            chip.write(0x4086, 0xFF); // mod freq low
+            chip.write(0x4087, 0x03); // mod freq high, unit ENABLED
+            chip.write(0x4084, 0x08); // mod envelope on, decrease, e=8
+            chip.write(0x4080, 0x25); // volume envelope on, decrease, e=37
+            chip.write(0x408A, 0x10); // master env speed
+            chip.write(0x4082, 0x80); // pitch low
+            chip.write(0x4083, 0x02); // pitch high, no halt bits
+        };
+        let mut whole = Fds::new();
+        let mut ragged = Fds::new();
+        setup(&mut whole);
+        setup(&mut ragged);
+
+        const TOTAL: u32 = 50_021;
+        whole.tick(TOTAL);
+        let chunks = [1u32, 3, 5, 7, 16, 29];
+        let mut left = TOTAL;
+        let mut i = 0usize;
+        while left > 0 {
+            let n = chunks[i % chunks.len()].min(left);
+            ragged.tick(n);
+            left -= n;
+            i += 1;
+        }
+        assert_eq!(whole.wave_acc, ragged.wave_acc);
+        assert_eq!(whole.wave_pos, ragged.wave_pos);
+        assert_eq!(whole.mod_acc, ragged.mod_acc);
+        assert_eq!(whole.mod_pos, ragged.mod_pos);
+        assert_eq!(whole.mod_counter, ragged.mod_counter);
+        assert_eq!(whole.mod_gain, ragged.mod_gain);
+        assert_eq!(whole.volume, ragged.volume);
+        assert_eq!(whole.vol_env_timer, ragged.vol_env_timer);
+        assert_eq!(whole.mod_env_timer, ragged.mod_env_timer);
+        assert_eq!(whole.cycle_acc, ragged.cycle_acc);
     }
 
     #[test]

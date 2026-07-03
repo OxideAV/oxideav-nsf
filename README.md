@@ -144,7 +144,10 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     HH-sample / 3-step / SD-sample / 15-step rhythm-frame tap protocol —
     the noise source HH + SD synthesis consume.
   * **FDS** — wavetable + frequency-modulation unit, the volume + mod
-    envelope ramp generators (`c = 8·(e+1)·(m+1)` timer), the `$4023`
+    envelope ramp generators (`c = 8·(e+1)·(m+1)` timer) interleaved
+    cycle-exactly with the 16-cycle wave/mod unit ticks, the `$4083`
+    bit-7 wave-unit halt (accumulator + position reset to the `$4040`
+    value, next tick delayed to the next bit-18 overflow), the `$4023`
     master sound-enable / waveform-halt, and the `$4090..=$4097` read
     register window.
 

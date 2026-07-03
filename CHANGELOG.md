@@ -53,6 +53,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under ragged 1/3/5/7-cycle batching, and the disabled-channel
   timer.
 
+### Added
+
+- **FDS `$4083` bit-7 wave-unit halt** per
+  `docs/audio/nsf/fds-audio-wiki.html` §Wavetables: "Disabling the
+  wave unit via the high bit of $4083 immediately resets its
+  accumulator, delaying the next tick after they are enabled again
+  until the next overflow. Consequently, this also resets the wave
+  position to 0 (i.e. the $4040 value)." Setting the bit now zeroes
+  the wave accumulator + position on the spot (the channel holds the
+  `$4040` sample), the wave unit stays frozen while the bit is held
+  (alongside the already-implemented mod-accumulator halt and 4x
+  envelope speed-up from §"Frequency high ($4083)"), and release
+  waits for a genuine carry into bit 18 before the position moves.
+
+### Fixed
+
+- **FDS envelope ramps now interleave with the 16-cycle wave/mod
+  unit ticks in true cycle order.** The tick previously ran the
+  whole batch's envelope stepping before any of the batch's unit
+  ticks, so whenever a batch spanned a mod-envelope expiry the
+  changed mod gain was fed to the §"Modulation unit" pitch formula
+  for unit ticks that actually preceded it — audible as
+  chunking-dependent modulation drift. The batch is now walked one
+  CPU cycle at a time (envelope timers, then the 16-cycle unit
+  boundary), making the chip state invariant to CPU batch chunking;
+  a new ragged-batch test (1/3/5/7/16/29-cycle chunks vs one whole
+  batch, with both envelopes, the mod unit, and the wave unit all
+  live) pins every accumulator.
+
 - **Every `start_song` now performs the documented pre-INIT machine
   scrub** (`docs/audio/nsf/nsf-nesdev-wiki.html` §"Initializing a
   tune", mirrored by `docs/audio/nsf/nsfspec-kevtris-v1.61.txt`
