@@ -272,6 +272,14 @@ impl NsfPlayer {
             NsfRegion::Ntsc | NsfRegion::Dual => 0,
         };
 
+        // The documented pre-INIT scrub (§"Initializing a tune"):
+        // clear $0000-$07FF + $6000-$7FFF, zero the sound registers,
+        // $00-then-$0F to $4015, $40 to $4017, and re-seed the bank
+        // registers from the header. This makes every song start from
+        // the same machine state — switching tracks no longer leaks
+        // the previous song's RAM contents or APU register state.
+        self.bus.reset_for_tune(&self.header);
+
         // NSF2 vector-overlay paradigms need the wrapper installed
         // BEFORE the first INIT call so the program can poke its IRQ
         // vector at $FFFE during INIT. Plain NSF v1 / NSF2-without-

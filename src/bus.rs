@@ -343,6 +343,62 @@ impl NesBus {
         self.nsf2_timer.enabled = header.nsf2.irq_support();
     }
 
+    /// The documented per-tune initialization scrub, per
+    /// `docs/audio/nsf/nsf-nesdev-wiki.html` §"Initializing a tune"
+    /// (mirrored by `docs/audio/nsf/nsfspec-kevtris-v1.61.txt`
+    /// §"'Proper' way to init a tune"):
+    ///
+    /// * "Write $00 to all RAM at $0000-$07FF and $6000-$7FFF."
+    /// * "Initialize the sound registers by writing $00 to
+    ///   $4000-$4013, and $00 then $0F to $4015."
+    /// * "Initialize the frame counter to 4-step mode ($40 to $4017)."
+    /// * "If the tune is bank switched, load the bank values from
+    ///   $070-$077 into $5FF8-$5FFF."
+    ///
+    /// Called before every `INIT` invocation so switching songs starts
+    /// from the same state as the first one. A non-bankswitched tune
+    /// whose load address falls below `$8000` keeps its program bytes:
+    /// they are reloaded into `$6000-$7FFF` after the RAM clear (the
+    /// documented sequence clears RAM *before* the tune data is
+    /// placed). For FDS, the RAM image at `$8000..=$FFFF` is re-primed
+    /// from the bank pool / program so a previous song's
+    /// self-modifications are discarded, and the `$5FF6..=$5FF7`
+    /// extended bank registers are re-seeded alongside `$5FF8-$5FFF`.
+    pub fn reset_for_tune(&mut self, header: &NsfHeader) {
+        self.ram.fill(0);
+        self.cart_ram.fill(0);
+        for reg in 0x4000..=0x4013u16 {
+            self.write(reg, 0x00);
+        }
+        self.write(0x4015, 0x00);
+        self.write(0x4015, 0x0F);
+        self.write(0x4017, 0x40);
+        if self.bankswitched {
+            self.bank_select = header.bankswitch_init;
+            if self.fds_enabled {
+                // Re-prime the FDS RAM image from the (immutable) bank
+                // pool, exactly as the initial load did, then re-seed
+                // the FDS-extended `$5FF6..=$5FF7` window registers.
+                for (window, &sel) in self.bank_select.iter().enumerate() {
+                    if let Some(bank) = self.bank_pool.get(sel as usize) {
+                        let dst = window * BANK_SIZE;
+                        self.fds_ram[dst..dst + BANK_SIZE].copy_from_slice(bank);
+                    }
+                }
+                self.write(0x5FF6, header.bankswitch_init[6]);
+                self.write(0x5FF7, header.bankswitch_init[7]);
+            }
+        } else {
+            // Reload the program image: a load address below $8000
+            // places tune bytes in the $6000-$7FFF RAM we just cleared.
+            self.load_program(header.load_addr, &header.program);
+            if self.fds_enabled && self.fds_ram.len() == 0x8000 {
+                self.fds_ram.copy_from_slice(&self.prg[..0x8000]);
+            }
+        }
+        self.nmi_pending = false;
+    }
+
     /// Build the 4 KiB-bank pool out of the NSF program blob. Per the
     /// nesdev.org wiki: the load address determines the in-bank offset
     /// of the very first byte; bytes before that offset are zero-padded.
@@ -652,6 +708,79 @@ mod tests {
         // Plain ROM: writes silently dropped; read still returns ROM.
         bus.write(0x8000, 0xFF);
         assert_eq!(bus.read(0x8000), 0x55);
+    }
+
+    #[test]
+    fn reset_for_tune_scrubs_ram_and_reinits_registers() {
+        // §"Initializing a tune": RAM $0000-$07FF + $6000-$7FFF are
+        // cleared, $4015 gets $00 then $0F, $4017 gets $40.
+        let mut bus = NesBus::new();
+        let h = fake_header(0x8000, vec![0x60], [0u8; 8]);
+        bus.configure_from_header(&h);
+        // Dirty machine state as a previous song would leave it.
+        bus.write(0x0123, 0xAB);
+        bus.write(0x6123, 0xCD);
+        bus.write(0x4015, 0x00); // channels all disabled
+        bus.write(0x4017, 0x00); // 4-step, IRQ inhibit CLEAR
+        bus.reset_for_tune(&h);
+        assert_eq!(bus.read(0x0123), 0, "zero page/RAM cleared");
+        assert_eq!(bus.read(0x6123), 0, "cart RAM cleared");
+        // $4015 = $0F: a length-counter load must stick (loads only
+        // reach the counter while the channel is enabled).
+        bus.write(0x4003, 0x08);
+        assert_eq!(
+            bus.read(0x4015) & 0x01,
+            0x01,
+            "$4015=$0F must have re-enabled pulse 1"
+        );
+        // $4017 = $40 (IRQ inhibit set): a full 4-step pass must not
+        // latch the frame IRQ flag.
+        bus.tick_cycles(35_000);
+        assert_eq!(
+            bus.read(0x4015) & 0x40,
+            0,
+            "$4017=$40 must inhibit the frame IRQ"
+        );
+    }
+
+    #[test]
+    fn reset_for_tune_reloads_low_load_program_after_ram_clear() {
+        // A non-bankswitched tune loaded below $8000 lives in the
+        // $6000-$7FFF RAM the scrub clears; the documented sequence
+        // clears RAM before placing the tune data, so the program
+        // bytes must survive a reset (reloaded, not preserved).
+        let mut bus = NesBus::new();
+        let h = fake_header(0x6000, vec![0xAA, 0xBB], [0u8; 8]);
+        bus.configure_from_header(&h);
+        assert_eq!(bus.read(0x6000), 0xAA);
+        bus.write(0x6000, 0x77); // previous song self-modifies
+        bus.reset_for_tune(&h);
+        assert_eq!(bus.read(0x6000), 0xAA, "program byte reloaded");
+        assert_eq!(bus.read(0x6001), 0xBB);
+        assert_eq!(bus.read(0x6002), 0x00, "rest of cart RAM cleared");
+    }
+
+    #[test]
+    fn reset_for_tune_restores_header_bank_selection() {
+        // "If the tune is bank switched, load the bank values from
+        // $070-$077 into $5FF8-$5FFF."
+        let mut bus = NesBus::new();
+        // Two banks: bank 0 starts 0x11.., bank 1 starts 0x22...
+        let mut prog = vec![0x11; BANK_SIZE];
+        prog.extend(vec![0x22; BANK_SIZE]);
+        let mut banks = [0u8; 8];
+        banks[0] = 1; // $8000 window starts on bank 1
+        let h = fake_header(0x8000, prog, banks);
+        bus.configure_from_header(&h);
+        assert_eq!(bus.read(0x8000), 0x22);
+        bus.write(0x5FF8, 0x00); // song rebanks the window
+        assert_eq!(bus.read(0x8000), 0x11);
+        bus.reset_for_tune(&h);
+        assert_eq!(
+            bus.read(0x8000),
+            0x22,
+            "bank selection must return to the header's init values"
+        );
     }
 
     #[test]

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every `start_song` now performs the documented pre-INIT machine
+  scrub** (`docs/audio/nsf/nsf-nesdev-wiki.html` §"Initializing a
+  tune", mirrored by `docs/audio/nsf/nsfspec-kevtris-v1.61.txt`
+  §"'Proper' way to init a tune"): clear all RAM at `$0000-$07FF` and
+  `$6000-$7FFF`, write `$00` to `$4000-$4013`, `$00` then `$0F` to
+  `$4015`, `$40` to `$4017` (4-step, IRQ inhibit), and re-seed the
+  bank registers from header `$070-$077` — including the FDS-extended
+  `$5FF6/$5FF7` pair, which the wiki says must mirror `$076/$077` for
+  the `$6000-$7FFF` windows "before INIT is called" (previously never
+  seeded at all). New `NesBus::reset_for_tune` implements the
+  sequence; the player calls it before every INIT, so switching
+  tracks no longer leaks the previous song's RAM contents, APU
+  register state, bank mapping, or FDS RAM self-modifications into
+  the next song. A non-bankswitched tune loaded below `$8000` has its
+  program bytes re-placed after the RAM clear, per the documented
+  ordering. 3 new bus tests cover the RAM + register scrub (with the
+  `$4015=$0F` / `$4017=$40` observables), the low-load program
+  reload, and the bank-selection restore.
+
 - **`$4015` write/read IRQ-flag semantics now match the documented
   register contract** (`docs/audio/nsf/apu-nesdev-wiki.html` §"Status
   ($4015)"). A `$4015` *write* now clears the DMC interrupt flag
