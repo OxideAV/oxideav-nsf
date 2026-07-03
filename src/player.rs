@@ -165,6 +165,28 @@ pub struct NsfPlayer {
     nsf2_nmi_play: bool,
     /// NSF2 suppressed-PLAY bit — never invoke the play routine.
     nsf2_suppress_play: bool,
+    /// Player-policy default track time, used when the NSFe `time`
+    /// chunk is absent, too short, or carries a negative ("default")
+    /// entry — per `docs/audio/nsf/nsfe-nesdev-wiki.html` §time the
+    /// negative value "should be handled accordingly by the player".
+    /// `None` (the shipped default) means "no scheduled end": the
+    /// track plays until the host stops rendering.
+    default_time_ms: Option<u32>,
+    /// Player-policy default fadeout length, used when the `fade`
+    /// chunk is absent/short/negative. Shipped default 0 — per §fade
+    /// "A fade time of 0 means the track should immediately end
+    /// rather than fading out", so an unspecified fade becomes a
+    /// clean stop at the scheduled time.
+    default_fade_ms: u32,
+    /// Output-sample index at which the §time fadeout begins for the
+    /// active track (`None` = no scheduled end).
+    fade_start_samples: Option<u64>,
+    /// Fadeout length in output samples (§fade), 0 = immediate end.
+    fade_len_samples: u64,
+    /// Output samples rendered since `start_song`.
+    samples_rendered: u64,
+    /// Set once the active track has played its scheduled time + fade.
+    finished: bool,
 }
 
 impl NsfPlayer {
@@ -231,6 +253,12 @@ impl NsfPlayer {
             started: false,
             nsf2_nmi_play,
             nsf2_suppress_play,
+            default_time_ms: None,
+            default_fade_ms: 0,
+            fade_start_samples: None,
+            fade_len_samples: 0,
+            samples_rendered: 0,
+            finished: false,
         }
     }
 
@@ -328,6 +356,20 @@ impl NsfPlayer {
         self.cycles_since_play = 0;
         self.sample_acc = 0.0;
         self.filter.reset();
+
+        // Arm the NSFe `time` / `fade` schedule for this track. Per
+        // `docs/audio/nsf/nsfe-nesdev-wiki.html` §time: "When the
+        // track has played for the specified time, it should begin
+        // fading out. A time of 0 is valid, and should begin fadeout
+        // immediately"; §fade: "A fade time of 0 means the track
+        // should immediately end rather than fading out."
+        self.samples_rendered = 0;
+        self.finished = false;
+        let rate = self.sample_rate as u64;
+        self.fade_start_samples = self
+            .effective_track_time_ms(song)
+            .map(|ms| ms as u64 * rate / 1000);
+        self.fade_len_samples = self.effective_track_fade_ms(song) as u64 * rate / 1000;
     }
 
     /// Push the stop sentinel, seed registers, and jump to INIT.
@@ -365,6 +407,15 @@ impl NsfPlayer {
     /// Returns the i16 PCM sample.
     fn step_one_sample(&mut self) -> i16 {
         if !self.started {
+            return 0;
+        }
+        // §time / §fade gain for THIS sample, resolved before any CPU
+        // work: unity until the scheduled time, then a linear ramp to
+        // silence across the fade length. When the fade has run out
+        // (`finished`), nothing is emitted and the machine is left
+        // untouched.
+        let gain = self.fade_gain();
+        if self.finished {
             return 0;
         }
         // Spend `cycles_per_sample` worth of CPU cycles (fractional).
@@ -439,7 +490,26 @@ impl NsfPlayer {
         // i16 with a touch of headroom.
         let level = self.bus.apu.output_sample();
         let filtered = self.filter.process(level);
-        (filtered * 28_000.0).clamp(-32_768.0, 32_767.0) as i16
+        self.samples_rendered += 1;
+        (filtered * gain * 28_000.0).clamp(-32_768.0, 32_767.0) as i16
+    }
+
+    /// Current §time/§fade output gain for the sample about to be
+    /// emitted, flagging `finished` once the fade has run out.
+    fn fade_gain(&mut self) -> f32 {
+        let Some(start) = self.fade_start_samples else {
+            return 1.0;
+        };
+        if self.samples_rendered < start {
+            return 1.0;
+        }
+        let into = self.samples_rendered - start;
+        if into >= self.fade_len_samples {
+            self.finished = true;
+            0.0
+        } else {
+            1.0 - into as f32 / self.fade_len_samples as f32
+        }
     }
 
     fn invoke_play(&mut self) {
@@ -450,15 +520,87 @@ impl NsfPlayer {
 
     /// Fill `out` with mono i16 PCM samples. Returns the number of
     /// frames written (always `out.len()` unless the player has
-    /// halted).
+    /// halted or the track's NSFe `time` + `fade` schedule has run
+    /// out — check [`NsfPlayer::track_finished`]).
     pub fn render(&mut self, out: &mut [i16]) -> usize {
         for (i, slot) in out.iter_mut().enumerate() {
-            if self.cpu.halted {
+            if self.cpu.halted || self.finished {
                 return i;
             }
-            *slot = self.step_one_sample();
+            let s = self.step_one_sample();
+            if self.finished {
+                // This step crossed the end of the fade — it emitted
+                // nothing and the machine did not advance.
+                return i;
+            }
+            *slot = s;
         }
         out.len()
+    }
+
+    /// True once the active track has played through its scheduled
+    /// NSFe `time` + `fade` (never true when the track has no
+    /// scheduled end).
+    pub fn track_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Raw NSFe `time` chunk entry for 1-based `song`: the length in
+    /// milliseconds before the fadeout begins. `None` when the chunk
+    /// is absent or too short for this track ("a default time should
+    /// be assumed for these tracks"); a negative value is the chunk's
+    /// own "default" marker.
+    pub fn track_time_ms(&self, song: u8) -> Option<i32> {
+        let idx = song.checked_sub(1)? as usize;
+        self.header.metadata.track_times_ms.get(idx).copied()
+    }
+
+    /// Raw NSFe `fade` chunk entry for 1-based `song` (fadeout length
+    /// in milliseconds), with the same absence/negative semantics as
+    /// [`NsfPlayer::track_time_ms`].
+    pub fn track_fade_ms(&self, song: u8) -> Option<i32> {
+        let idx = song.checked_sub(1)? as usize;
+        self.header.metadata.track_fades_ms.get(idx).copied()
+    }
+
+    /// Effective play time before fadeout for 1-based `song`, after
+    /// resolving the chunk's negative/absent "default" entries against
+    /// the player-policy default. `None` = no scheduled end.
+    pub fn effective_track_time_ms(&self, song: u8) -> Option<u32> {
+        match self.track_time_ms(song) {
+            Some(t) if t >= 0 => Some(t as u32),
+            _ => self.default_time_ms,
+        }
+    }
+
+    /// Effective fadeout length for 1-based `song` (see
+    /// [`NsfPlayer::effective_track_time_ms`]).
+    pub fn effective_track_fade_ms(&self, song: u8) -> u32 {
+        match self.track_fade_ms(song) {
+            Some(f) if f >= 0 => f as u32,
+            _ => self.default_fade_ms,
+        }
+    }
+
+    /// Total scheduled duration (time + fade) for 1-based `song` in
+    /// milliseconds, or `None` when the track has no scheduled end.
+    pub fn track_duration_ms(&self, song: u8) -> Option<u64> {
+        self.effective_track_time_ms(song)
+            .map(|t| t as u64 + self.effective_track_fade_ms(song) as u64)
+    }
+
+    /// Set the player-policy default track time (used for chunk-less
+    /// or negative-entry tracks). Takes effect at the next
+    /// [`NsfPlayer::start_song`].
+    pub fn set_default_track_time_ms(&mut self, ms: Option<u32>) {
+        self.default_time_ms = ms;
+    }
+
+    /// Set the player-policy default fadeout length (used for
+    /// chunk-less or negative-entry tracks). Takes effect at the next
+    /// [`NsfPlayer::start_song`].
+    pub fn set_default_fade_ms(&mut self, ms: u32) {
+        self.default_fade_ms = ms;
     }
 
     /// Read-only view of the configured output sample rate.
@@ -790,6 +932,102 @@ mod tests {
             player.bus.apu.expansion.vrc7.ym2413_variant,
             "player must forward the NSFe VRC7 chunk to the chip"
         );
+    }
+
+    // ---------------- Round 386: NSFe time/fade playback schedule ----------------
+    //
+    // Spec source: `docs/audio/nsf/nsfe-nesdev-wiki.html`
+    //   §time — "When the track has played for the specified time, it
+    //   should begin fading out. A time of 0 is valid, and should
+    //   begin fadeout immediately. A time of less than 0 represents
+    //   the 'default' time, which should be handled accordingly by
+    //   the player."
+    //   §fade — "A fade time of 0 means the track should immediately
+    //   end rather than fading out. A fade time of less than 0
+    //   represents the default fade time."
+
+    /// Player over the tiny test program with the given time/fade
+    /// chunk contents.
+    fn player_with_schedule(times: Vec<i32>, fades: Vec<i32>) -> NsfPlayer {
+        let (hdr_bytes, prog) = _tiny_test_program();
+        let mut whole = hdr_bytes.to_vec();
+        whole.extend_from_slice(&prog);
+        let mut header = parse_nsf(&whole).unwrap();
+        header.metadata.track_times_ms = times;
+        header.metadata.track_fades_ms = fades;
+        NsfPlayer::new(header, 44_100)
+    }
+
+    #[test]
+    fn track_time_resolution_honours_defaults_and_negatives() {
+        let mut p = player_with_schedule(vec![120_000, 0, -1], vec![3_000, -1]);
+        // Raw values pass through.
+        assert_eq!(p.track_time_ms(1), Some(120_000));
+        assert_eq!(p.track_time_ms(2), Some(0));
+        assert_eq!(p.track_time_ms(3), Some(-1));
+        assert_eq!(p.track_time_ms(4), None, "chunk too short for track 4");
+        // Effective: negative + missing fall back to the player
+        // default (shipped: no scheduled end).
+        assert_eq!(p.effective_track_time_ms(1), Some(120_000));
+        assert_eq!(p.effective_track_time_ms(2), Some(0));
+        assert_eq!(p.effective_track_time_ms(3), None);
+        p.set_default_track_time_ms(Some(180_000));
+        assert_eq!(p.effective_track_time_ms(3), Some(180_000));
+        assert_eq!(p.effective_track_time_ms(4), Some(180_000));
+        // Fades: explicit, then negative/missing → default (0).
+        assert_eq!(p.effective_track_fade_ms(1), 3_000);
+        assert_eq!(p.effective_track_fade_ms(2), 0);
+        p.set_default_fade_ms(2_000);
+        assert_eq!(p.effective_track_fade_ms(2), 2_000);
+        assert_eq!(p.track_duration_ms(1), Some(123_000));
+    }
+
+    #[test]
+    fn render_stops_after_time_plus_fade() {
+        // 50 ms play + 50 ms fade at 44.1 kHz = 2205 + 2205 samples.
+        let mut p = player_with_schedule(vec![50], vec![50]);
+        p.start_song(1);
+        assert!(!p.track_finished());
+        let mut buf = vec![0i16; 8_820];
+        let n = p.render(&mut buf);
+        assert_eq!(n, 4_410, "render stops at time + fade");
+        assert!(p.track_finished());
+        // Subsequent renders emit nothing.
+        assert_eq!(p.render(&mut buf), 0);
+        // The fade actually attenuates: the tail of the faded region
+        // must be quieter than its head.
+        let head: i64 = buf[2_205..2_405].iter().map(|s| (*s as i64).abs()).sum();
+        let tail: i64 = buf[4_200..4_400].iter().map(|s| (*s as i64).abs()).sum();
+        assert!(
+            tail * 4 < head.max(1),
+            "fade tail should be much quieter (head {head}, tail {tail})"
+        );
+    }
+
+    #[test]
+    fn unscheduled_track_renders_indefinitely() {
+        // No time/fade chunks and no player default → no scheduled
+        // end; render always fills the whole buffer.
+        let mut p = player_with_schedule(vec![], vec![]);
+        p.start_song(1);
+        let mut buf = vec![0i16; 4_096];
+        assert_eq!(p.render(&mut buf), buf.len());
+        assert!(!p.track_finished());
+    }
+
+    #[test]
+    fn switching_songs_rearms_the_schedule() {
+        // Track 1 has a 10 ms hard stop; restarting the same song
+        // must reset the sample clock and play another 10 ms.
+        let mut p = player_with_schedule(vec![10], vec![0]);
+        p.start_song(1);
+        let mut buf = vec![0i16; 2_048];
+        let n1 = p.render(&mut buf);
+        assert!(p.track_finished());
+        p.start_song(1);
+        assert!(!p.track_finished());
+        let n2 = p.render(&mut buf);
+        assert_eq!(n1, n2, "schedule re-arms on start_song");
     }
 
     #[test]

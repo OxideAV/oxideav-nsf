@@ -166,7 +166,10 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   clock, invokes
   PLAY once per period (NTSC ~60 Hz / PAL ~50 Hz / Dendy ~50 Hz on the
   1.773448 MHz Dendy clock), exposes `plst` / `psfx` playlist
-  iteration, and resamples to 44 100 Hz mono S16.
+  iteration, honours the NSFe `time` / `fade` schedule (per-track
+  fadeout with `track_finished()` / `track_duration_ms()` and
+  player-policy defaults for negative/absent entries), and resamples
+  to 44 100 Hz mono S16.
 
 * **`Decoder` + `Demuxer` glue** behind the default-on `registry`
   feature wires the codec into the `oxideav-core` registry with a

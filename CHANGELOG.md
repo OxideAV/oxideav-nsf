@@ -67,6 +67,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelope speed-up from §"Frequency high ($4083)"), and release
   waits for a genuine carry into bit 18 before the position moves.
 
+- **NSFe `time`/`fade` playback schedule** per
+  `docs/audio/nsf/nsfe-nesdev-wiki.html` §time + §fade — the chunks
+  were decoded but playback ignored them. `NsfPlayer` now arms a
+  per-track schedule at `start_song`: unity gain until the track's
+  time ("When the track has played for the specified time, it should
+  begin fading out"; time 0 fades immediately), then a linear ramp
+  to silence across the fade length (fade 0 "should immediately end
+  rather than fading out"), after which `render` stops short and
+  `track_finished()` reads true — the machine is left untouched past
+  the boundary. Negative/absent entries resolve against player-policy
+  defaults (`set_default_track_time_ms` / `set_default_fade_ms`;
+  shipped: no scheduled end, hard stop). New surface:
+  `track_time_ms` / `track_fade_ms` (raw), `effective_track_time_ms`
+  / `effective_track_fade_ms`, `track_duration_ms`,
+  `track_finished`. 4 new tests cover default/negative resolution,
+  the render stop at time+fade with a genuinely attenuating tail,
+  unscheduled tracks, and schedule re-arming across `start_song`.
+
 - **NSFe `VRC7` chunk now reaches the synthesis path** per
   `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7. The chunk was decoded
   and surfaced but never applied. Now: device variant `1` (YM2413)
