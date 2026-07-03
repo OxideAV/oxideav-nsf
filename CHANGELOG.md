@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accumulator, FDS per-cycle env/unit walk, VRC7 Q8 operator clock)
   as a single regression test.
 
+- **MMC5 output polarity reversed** per the doc's opening section:
+  "the polarity of all MMC5 channels is reversed compared to the
+  APU" (squares "equivalent in volume … but the polarity … reversed";
+  PCM "similarly equivalent in volume to the APU with equivalent
+  input, and inverted"). The chip's mixer contribution is now
+  negated — inaudible in isolation once AC-coupled, but it flips the
+  phase-interference sense wherever MMC5 and 2A03 pulses double the
+  same material.
+
 - **VRC6 `$9003` 16x/256x frequency scaling now actually scales**
   (`docs/audio/nsf/vrc6-audio-wiki.html` §"Frequency Control
   ($9003)"): the B/A flags "effectively control a 4-bit and 8-bit

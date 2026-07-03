@@ -704,7 +704,16 @@ impl Mmc5 {
         // of AVcc) is the swing recentred about that midpoint:
         //   ((DAC/255)·0.4 + 0.1) − 0.3 = (DAC/255 − 0.5) · 0.4.
         let pcm_out = pin2_dac_ac(self.pcm);
-        pulse_out + pcm_out
+        // Polarity: per the doc's opening section, "the polarity of
+        // all MMC5 channels is reversed compared to the APU" (squares
+        // "equivalent in volume … but the polarity … reversed"; the
+        // PCM channel "similarly equivalent in volume to the APU with
+        // equivalent input, and inverted"). The whole chip
+        // contribution is therefore negated relative to the
+        // positive-swinging 2A03 mixer — inaudible in isolation once
+        // AC-coupled, but it flips the phase-interference sense
+        // wherever MMC5 and 2A03 pulses play the same material.
+        -(pulse_out + pcm_out)
     }
 }
 
@@ -3737,6 +3746,38 @@ mod tests {
             chip.pulse[0].pulse_output(),
             15,
             "sub-8 period must NOT silence the MMC5 pulse"
+        );
+    }
+
+    #[test]
+    fn mmc5_output_polarity_is_reversed_relative_to_the_apu() {
+        // Doc intro: "the polarity of all MMC5 channels is reversed
+        // compared to the APU". A pulse going high (which raises the
+        // 2A03 mixer output) must LOWER the MMC5 contribution, and a
+        // rising PCM byte (which raises the Pin 2 voltage) must lower
+        // it too — deltas measured against the same chip idle, since
+        // the AC-coupled PCM midpoint offset shifts the absolute
+        // level.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5000, 0x1F); // constant volume 15
+        chip.write(0x5002, 0x40);
+        chip.write(0x5003, 0x08); // arm length
+        chip.pulse[0].step = 0; // low duty step → idle baseline
+        let idle = chip.output();
+        chip.pulse[0].step = 1; // high duty step
+        assert!(
+            chip.output() < idle,
+            "pulse going high must swing the MMC5 output DOWN"
+        );
+        // PCM: a rising DAC byte lowers the (inverted) output.
+        let mut pcm = Mmc5::new();
+        pcm.write(0x5011, 0x01);
+        let low = pcm.output();
+        pcm.write(0x5011, 0xFF);
+        assert!(
+            pcm.output() < low,
+            "rising PCM byte must swing the MMC5 output DOWN"
         );
     }
 
