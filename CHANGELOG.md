@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **VRC6 `$9003` 16x/256x frequency scaling now actually scales**
+  (`docs/audio/nsf/vrc6-audio-wiki.html` §"Frequency Control
+  ($9003)"): the B/A flags "effectively control a 4-bit and 8-bit
+  right shift of the 12-bit period registers" (4 / 8 octave
+  increase, 256x overriding 16x). Previously the flags were consumed
+  as an internal batching chunk size, so the divider still counted
+  one step per CPU cycle and the pitch never changed at all. The
+  pulse + sawtooth dividers are now walked cycle-by-cycle at the
+  documented CPU rate ("Every cycle the divider counts down until it
+  reaches zero, at which point the divider resets and the duty cycle
+  generator is clocked") with the scaling applied to the reloaded
+  period, so the generators are phase-exact for any CPU batching.
+  4 new tests pin the 16x rate, the 256x override, and the sawtooth
+  scaling.
+
 - **Every `start_song` now performs the documented pre-INIT machine
   scrub** (`docs/audio/nsf/nsf-nesdev-wiki.html` §"Initializing a
   tune", mirrored by `docs/audio/nsf/nsfspec-kevtris-v1.61.txt`

@@ -32,7 +32,13 @@ pub struct Vrc6 {
     pub enabled: bool,
     pub pulse: [Vrc6Pulse; 2],
     pub saw: Vrc6Saw,
-    /// Output frequency divider (`$9003`): 1 / 16 / 256.
+    /// `$9003` frequency-scaling field (bits 2-1, `AB`). Per
+    /// `docs/audio/nsf/vrc6-audio-wiki.html` §"Frequency Control
+    /// ($9003)": B = "16x frequency, all oscillators (4 octave
+    /// increase)", A = "256x frequency, all oscillators (8 octave
+    /// increase)", and "The 256x flag overrides the 16x flag." The
+    /// flags "effectively control a 4-bit and 8-bit right shift of
+    /// the 12-bit period registers" — see [`Vrc6::period_shift`].
     pub freq_shift: u8,
     pub halt: bool,
 }
@@ -156,61 +162,79 @@ impl Vrc6 {
         }
     }
 
+    /// How far the 12-bit period registers are right-shifted by the
+    /// active `$9003` frequency-scaling flags. Per §"Frequency Control
+    /// ($9003)": "The 16x/256x flags effectively control a 4-bit and
+    /// 8-bit right shift of the 12-bit period registers", with "The
+    /// 256x flag overrides the 16x flag."
+    #[inline]
+    fn period_shift(&self) -> u8 {
+        // freq_shift holds `$9003` bits 2-1 (`AB`): bit 0 of the field
+        // = B (16x → 4-bit shift), bit 1 = A (256x → 8-bit shift,
+        // overriding B).
+        if self.freq_shift & 0b10 != 0 {
+            8
+        } else if self.freq_shift & 0b01 != 0 {
+            4
+        } else {
+            0
+        }
+    }
+
+    /// Advance the chip by `cycles` CPU cycles, one cycle at a time.
+    ///
+    /// §"Pulse Channels": "The CPU clock rate (1.79 MHz) drives the
+    /// 12-bit divider F. Every cycle the divider counts down until it
+    /// reaches zero, at which point the divider resets and the duty
+    /// cycle generator is clocked." The sawtooth divider works the
+    /// same way (§"Sawtooth Channel"). Each divider is walked
+    /// cycle-by-cycle so the generators stay phase-exact no matter how
+    /// the CPU batches its cycles, and the `$9003` 16x/256x flags are
+    /// applied as the documented right shift of the *reloaded* period
+    /// — the divider itself always counts at the full CPU rate.
     pub fn tick(&mut self, cycles: u32) {
         if self.halt {
+            // §"Frequency Control ($9003)": "H - halts all
+            // oscillators, stopping them in their current state" and
+            // "The halt flag overrides the other flags."
             return;
         }
-        let scale: u32 = match self.freq_shift {
-            0 => 1,
-            1 => 16,
-            _ => 256,
-        };
-        for p in &mut self.pulse {
-            if !p.enabled {
-                continue;
-            }
-            let mut left = cycles;
-            while left > 0 {
-                let take = left.min(scale);
+        let shift = self.period_shift();
+        for _ in 0..cycles {
+            for p in &mut self.pulse {
+                if !p.enabled {
+                    continue;
+                }
                 if p.timer == 0 {
-                    p.timer = p.timer_period;
+                    p.timer = p.timer_period >> shift;
                     // §"Pulse Channels": the duty generator counts
                     // down from 15 to 0, wrapping back to 15.
                     p.step = if p.step == 0 { 15 } else { p.step - 1 };
                 } else {
-                    p.timer = p.timer.saturating_sub(take.min(p.timer as u32) as u16);
+                    p.timer -= 1;
                 }
-                left = left.saturating_sub(take);
             }
-        }
-        if self.saw.enabled {
-            // §Sawtooth Channel: 14-step internal cycle. Each timer
-            // expiry advances `step` by 1 modulo 14:
-            //   * even-step positions 2, 4, 6, 8, 10, 12 each add the
-            //     6-bit rate value A to the 8-bit accumulator
-            //     ("when clocked, the rate value A is added to an
-            //     internal 8-bit accumulator"),
-            //   * odd-step positions 1, 3, 5, 7, 9, 11, 13 are
-            //     no-ops ("the accumulator only reacts on every 2
-            //     clocks"),
-            //   * step 0 (reached on the 14th clock from the previous
-            //     step 0) resets the accumulator to zero ("after A has
-            //     been added 6 times, on the 7th clock, instead of A
-            //     being added, the internal accumulator is reset to
-            //     zero").
-            //
-            // The walked example in the wiki (A=$08) reads
-            //   step 0 →$00, 2→$08, 4→$10, 6→$18, 8→$20, 10→$28,
-            //   12→$30, then back to step 0 → $00.
-            let mut left = cycles;
-            while left > 0 {
-                let take = left.min(scale);
+            if self.saw.enabled {
+                // §Sawtooth Channel: 14-step internal cycle. Each
+                // timer expiry advances `step` by 1 modulo 14:
+                //   * even-step positions 2, 4, 6, 8, 10, 12 each add
+                //     the 6-bit rate value A to the 8-bit accumulator
+                //     ("when clocked, the rate value A is added to an
+                //     internal 8-bit accumulator"),
+                //   * odd-step positions 1, 3, 5, 7, 9, 11, 13 are
+                //     no-ops ("the accumulator only reacts on every 2
+                //     clocks"),
+                //   * step 0 (reached on the 14th clock from the
+                //     previous step 0) resets the accumulator to zero
+                //     ("after A has been added 6 times, on the 7th
+                //     clock, instead of A being added, the internal
+                //     accumulator is reset to zero").
+                //
+                // The walked example in the wiki (A=$08) reads
+                //   step 0 →$00, 2→$08, 4→$10, 6→$18, 8→$20, 10→$28,
+                //   12→$30, then back to step 0 → $00.
                 if self.saw.timer == 0 {
-                    self.saw.timer = self.saw.timer_period;
-                    // 14-step modulo cycle (NOT a power-of-two mask;
-                    // the previous `& 0x0D` bit-mask gave a malformed
-                    // 1/2/3/8/9/12/13 sequence rather than the §example
-                    // 0..13 walk).
+                    self.saw.timer = self.saw.timer_period >> shift;
                     self.saw.step = (self.saw.step + 1) % 14;
                     if self.saw.step == 0 {
                         self.saw.accum = 0;
@@ -218,12 +242,8 @@ impl Vrc6 {
                         self.saw.accum = self.saw.accum.wrapping_add(self.saw.rate);
                     }
                 } else {
-                    self.saw.timer = self
-                        .saw
-                        .timer
-                        .saturating_sub(take.min(self.saw.timer as u32) as u16);
+                    self.saw.timer -= 1;
                 }
-                left = left.saturating_sub(take);
             }
         }
     }
@@ -2919,6 +2939,94 @@ mod tests {
         chip.tick(10_000);
         assert_eq!(chip.saw.step, 0);
         assert_eq!(chip.saw.accum, 0);
+    }
+
+    // ---------------- Round 386: VRC6 $9003 16x/256x scaling ----------------
+    //
+    // Spec source: `docs/audio/nsf/vrc6-audio-wiki.html`
+    //   §"Frequency Control ($9003)" — "B - 16x frequency, all
+    //   oscillators (4 octave increase)", "A - 256x frequency, all
+    //   oscillators (8 octave increase)", "The 256x flag overrides the
+    //   16x flag.", and "The 16x/256x flags effectively control a
+    //   4-bit and 8-bit right shift of the 12-bit period registers."
+    //
+    // Previously the flags were consumed as a batching chunk size, so
+    // the divider still counted one step per CPU cycle and the 16x /
+    // 256x speed-up never happened at all.
+
+    /// Count duty-generator steps of pulse 1 over `cycles` CPU cycles.
+    fn vrc6_pulse_steps_over(chip: &mut Vrc6, cycles: u32) -> u32 {
+        let mut steps = 0u32;
+        let mut prev = chip.pulse[0].step;
+        for _ in 0..cycles {
+            chip.tick(1);
+            if chip.pulse[0].step != prev {
+                steps += 1;
+                prev = chip.pulse[0].step;
+            }
+        }
+        steps
+    }
+
+    #[test]
+    fn vrc6_9003_16x_flag_shifts_period_right_four_bits() {
+        // Period t = $0FF. Normal rate: one duty step per (t+1) = 256
+        // cycles. With B set the divider reloads with (t >> 4) = $0F,
+        // i.e. one step per 16 cycles — 16x frequency.
+        let mut chip = Vrc6::new();
+        chip.write(0x9000, 0x0F); // vol=15, duty=0
+        chip.write(0x9001, 0xFF); // period low = $FF
+        chip.write(0x9002, 0x80); // E=1, period high = 0
+        assert_eq!(vrc6_pulse_steps_over(&mut chip, 2560), 10, "1x baseline");
+
+        let mut fast = Vrc6::new();
+        fast.write(0x9000, 0x0F);
+        fast.write(0x9001, 0xFF);
+        fast.write(0x9002, 0x80);
+        fast.write(0x9003, 0b0000_0010); // B = 16x
+        assert_eq!(
+            vrc6_pulse_steps_over(&mut fast, 2560),
+            160,
+            "16x flag → duty steps once per (t>>4)+1 = 16 cycles"
+        );
+    }
+
+    #[test]
+    fn vrc6_9003_256x_flag_overrides_16x() {
+        // A=1 (with B=1 too): §"The 256x flag overrides the 16x flag."
+        // Period t = $2FF → reload (t >> 8) = 2, one step per 3 cycles.
+        let mut chip = Vrc6::new();
+        chip.write(0x9000, 0x0F);
+        chip.write(0x9001, 0xFF);
+        chip.write(0x9002, 0x82); // E=1, period high = 2 → t = $2FF
+        chip.write(0x9003, 0b0000_0110); // A=1, B=1 → 256x wins
+        assert_eq!(
+            vrc6_pulse_steps_over(&mut chip, 300),
+            100,
+            "256x flag → duty steps once per (t>>8)+1 = 3 cycles"
+        );
+    }
+
+    #[test]
+    fn vrc6_9003_scaling_also_drives_the_sawtooth() {
+        // §"Frequency Control ($9003)": the flags scale "all
+        // oscillators". Saw period t = $0FF, A rate $08; with the 16x
+        // flag a full 14-step saw cycle takes 14 * ((t>>4)+1) = 224
+        // cycles instead of 14 * 256.
+        let mut chip = Vrc6::new();
+        chip.write(0xB000, 0x08);
+        chip.write(0xB001, 0xFF); // period low = $FF
+        chip.write(0xB002, 0x80); // E=1, period high = 0
+        chip.write(0x9003, 0b0000_0010); // 16x
+                                         // Walk exactly one full 14-step cycle: 14 * 16 = 224 cycles.
+        chip.tick(224);
+        assert_eq!(chip.saw.step, 0, "14 steps in 224 cycles at 16x");
+        // Accumulator was reset on re-reaching step 0.
+        assert_eq!(chip.saw.accum, 0);
+        // Half a cycle later we sit at step 7 with 4 adds applied.
+        chip.tick(112);
+        assert_eq!(chip.saw.step, 7);
+        assert_eq!(chip.saw.accum, 0x08 * 3);
     }
 
     // ---------------- Round 290: VRC6 pulse duty generator -----------------

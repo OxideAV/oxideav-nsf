@@ -83,7 +83,11 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   `Y=$80` / `Y=$81` + NMI-wrapper PLAY), and suppressed PLAY.
 
 * **Expansion chips** (`expansion`) — summed into the APU mixer:
-  * **VRC6** — 2 pulses (16-step duty down-counter) + 14-step sawtooth.
+  * **VRC6** — 2 pulses (16-step duty down-counter) + 14-step sawtooth,
+    with the dividers stepped cycle-by-cycle at the CPU rate and the
+    `$9003` 16x/256x frequency-scaling flags applied as the documented
+    4-/8-bit right shift of the 12-bit period (256x overrides 16x;
+    halt freezes all oscillators in place).
   * **MMC5** — 2 pulses with the chip's fixed 240 Hz envelope + length
     unit, plus 8-bit raw PCM with `$5010` PCM Mode/IRQ semantics and the
     analog Pin 2 DAC transfer curve (the
