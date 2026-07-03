@@ -43,13 +43,30 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   * The **pulse** /2 (APU-cycle) prescaler retains its dropped
     half-cycle across CPU instructions, so pulse pitch is invariant to
     however the CPU batches its cycles.
-  * The **triangle** holds its current sequencer position when its
-    length/linear counters expire (rather than snapping to silence),
-    and reports the spec's lowpass-averaged "7.5" level for the
-    ultrasonic (period < 2) silencing case.
-  * The **frame counter** advances through the documented region/mode
-    event schedule, so the 4-step interrupt period is exactly
-    29830 (NTSC) / 33254 (PAL) CPU cycles.
+  * The **triangle** holds its current sequencer position for *every*
+    silencing method — length/linear counter expiry AND the `$4015`
+    disable ("merely halts it… continue to output its last value
+    rather than 0") — and reports the spec's lowpass-averaged "7.5"
+    level while the sequencer is cycling ultrasonically (period < 2).
+  * The **frame counter** fires each event at its exact documented CPU
+    half-cycle: quarter/half signals land on the PUT half of their APU
+    cycle (CPU = 2×APU+1), the 4-step interrupt flag is set at its
+    three consecutive documented cycles (29828/29829/29830 NTSC,
+    33252/33253/33254 PAL), 5-step mode clocks nothing at step 4 and
+    both units at step 5, and `$4017` writes take effect on the
+    documented 3-or-4-CPU-cycle phase-dependent delay.
+  * Frame events **interleave exactly with the channel timers**: each
+    CPU batch is split at the next scheduled event, so sweep rewrites
+    and counter expiries land cycle-exactly regardless of how the CPU
+    chunks its cycles.
+  * `$4015` honours the documented IRQ-flag contract: a **write**
+    clears the DMC interrupt flag; a **read** clears the frame
+    interrupt flag but *not* the DMC flag.
+  * **DMC DMA steals CPU time**: every sample-byte fetch stalls the
+    CPU (accounted at 4 cycles, the top of the documented 1–4 range)
+    while the APU runs on, so PLAY cadence tracks the DMA-stretched
+    wall clock; the DMC output unit powers up silent, keeping `$4011`
+    direct-load PCM levels rock-steady until a sample actually plays.
 
 * **Output conditioning** (`NsfPlayer`) — the rendered stream passes
   through the documented post-DAC analog filter chain (two first-order
@@ -122,8 +139,12 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     master sound-enable / waveform-halt, and the `$4090..=$4097` read
     register window.
 
-* **Player glue** (`NsfPlayer`) — loads the program / bank pool, runs
-  INIT for a chosen song, steps CPU + APU at the NES clock, invokes
+* **Player glue** (`NsfPlayer`) — loads the program / bank pool,
+  performs the documented pre-INIT machine scrub before every song
+  (RAM clears, `$00` to `$4000-$4013`, `$00` then `$0F` to `$4015`,
+  `$40` to `$4017`, header bank re-seed incl. the FDS `$5FF6/$5FF7`
+  pair), runs INIT for a chosen song, steps CPU + APU at the NES
+  clock, invokes
   PLAY once per period (NTSC ~60 Hz / PAL ~50 Hz / Dendy ~50 Hz on the
   1.773448 MHz Dendy clock), exposes `plst` / `psfx` playlist
   iteration, and resamples to 44 100 Hz mono S16.
@@ -135,9 +156,17 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 
 ## Known gaps
 
-* Cycle-accurate per-cycle CPU + APU timing (frame-counter jitter,
-  DMC CPU-stall accounting); envelope tick timers are stepped in
+* The 2A03 frame counter + channel timers are now cycle-exact, but
+  the *expansion chips'* internal envelope/LFO timers still step in
   CPU-cycle batches — adequate for music, not cycle-exact.
+* DMC DMA stalls are accounted at a flat 4 CPU cycles; the documented
+  1/2/3-cycle per-alignment special cases live in the wiki's DMA
+  article, which is not staged under `docs/audio/nsf/`.
+* The dedicated APU Sweep page is not staged (the pulse page only
+  says "overflow from the sweep unit's adder is silencing the
+  channel"), so the shift-count-zero adder-mute semantics rest on the
+  §"Sequencer behavior" frequency-range reading documented in
+  `PulseChannel::sweep_mutes`.
 * OPLL envelope *attack*: the live **Attack** path is now §7-driven —
   its transition *timing* uses the silicon-measured global-counter
   `eg_shift`/`eg_select` duty (the same model as decay) and each step
