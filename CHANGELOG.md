@@ -67,6 +67,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelope speed-up from §"Frequency high ($4083)"), and release
   waits for a genuine carry into bit 18 before the position moves.
 
+- **N163 `$E000-$E7FF` Sound Enable register + full register
+  windows** per `docs/audio/nsf/namco-163-audio-wiki.html`: bit 6
+  "Disables sound if set" ("Sound is enabled on the 163 by writing a
+  clear bit 6 to this register (0 is sufficient)") now stops the
+  15-cycle update loop and silences the mix; and the Address Port /
+  Data Port decode their documented full ranges (`$F800-$FFFF`,
+  `$4800-$4FFF`) instead of only the exact base addresses, so a
+  driver poking a mirror is no longer ignored. 2 new tests cover the
+  window mirrors (with auto-increment) and the disable/re-enable
+  cycle.
+
 ### Fixed
 
 - **FDS envelope ramps now interleave with the 16-cycle wave/mod

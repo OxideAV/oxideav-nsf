@@ -1153,6 +1153,12 @@ pub struct N163 {
     /// sum instead of presenting whichever single channel happened to
     /// tick most recently.
     pub chan_hold: [f32; 8],
+    /// `$E000-$E7FF` bit 6 per §"Sound Enable ($E000-E7FF)":
+    /// "Disables sound if set. Sound is enabled on the 163 by writing
+    /// a clear bit 6 to this register (0 is sufficient)." While set,
+    /// the update cycle is stopped (no phase advance / RAM
+    /// write-back) and the chip contributes silence.
+    pub sound_disabled: bool,
 }
 
 impl Default for N163 {
@@ -1167,6 +1173,7 @@ impl Default for N163 {
             next_chan_slot: 0,
             last_output: 0.0,
             chan_hold: [0.0; 8],
+            sound_disabled: false,
         }
     }
 }
@@ -1199,11 +1206,21 @@ impl N163 {
 
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
-            0xF800 => {
+            // §"Sound Enable ($E000-E7FF)": bit 6 "Disables sound if
+            // set. Sound is enabled on the 163 by writing a clear
+            // bit 6 to this register (0 is sufficient)." (Bits 5-0
+            // are PRG banking, outside the audio path.)
+            0xE000..=0xE7FF => {
+                self.sound_disabled = value & 0x40 != 0;
+            }
+            // §"Address Port ($F800-$FFFF)" — the whole 2 KiB window
+            // decodes to the one register.
+            0xF800..=0xFFFF => {
                 self.addr = value & 0x7F;
                 self.addr_inc = value & 0x80 != 0;
             }
-            0x4800 => {
+            // §"Data Port ($4800-$4FFF)" — likewise a full window.
+            0x4800..=0x4FFF => {
                 let target = self.addr as usize;
                 self.ram[target] = value;
                 if self.addr_inc {
@@ -1236,10 +1253,11 @@ impl N163 {
             // is set. Per `docs/audio/nsf/namco-163-audio-wiki.html`
             // §"Address Port ($F800-$FFFF)" the increment happens "on
             // writes and reads to the Data Port ($4800)", and §"Data
-            // Port" confirms "When read, the appropriate byte is
-            // returned." Like the write path the pointer "does not wrap,
-            // instead stopping at $7F".
-            0x4800 => {
+            // Port ($4800-$4FFF)" confirms "When read, the appropriate
+            // byte is returned" — the whole window decodes. Like the
+            // write path the pointer "does not wrap, instead stopping
+            // at $7F".
+            0x4800..=0x4FFF => {
                 let value = self.ram[self.addr as usize];
                 if self.addr_inc && self.addr < 0x7F {
                     self.addr += 1;
@@ -1349,10 +1367,14 @@ impl N163 {
     }
 
     /// CPU-side tick: the chip updates one channel every 15 CPU
-    /// cycles. Batch the work — we only need to call `tick_one_channel`
-    /// once per accumulated 15-cycle window.
+    /// cycles (§"Channel Update": "It takes exactly 15 CPU cycles to
+    /// update and output one channel"). The accumulator carries the
+    /// sub-15-cycle remainder across batches, so the update cadence
+    /// is exact for any CPU chunking. While the §"Sound Enable
+    /// ($E000-E7FF)" disable bit is set the update cycle is stopped —
+    /// no phase advance, no RAM write-back.
     pub fn tick(&mut self, cycles: u32) {
-        if !self.enabled {
+        if !self.enabled || self.sound_disabled {
             return;
         }
         self.cycle_accum += cycles;
@@ -1376,7 +1398,7 @@ impl N163 {
     /// the real multiplexer transfers; we accept that documented bound
     /// rather than reproduce the audible switching waveform.
     pub fn output(&self) -> f32 {
-        if self.channels_active == 0 {
+        if self.channels_active == 0 || self.sound_disabled {
             return 0.0;
         }
         let mut sum = 0.0f32;
@@ -4719,6 +4741,56 @@ mod tests {
         chip.write(0x4800, 0xAB);
         assert_eq!(chip.ram[0x10], 0xAB);
         assert_eq!(chip.addr, 0x11);
+    }
+
+    // ---------------- Round 386: N163 register windows + sound enable ----------------
+    //
+    // Spec source: `docs/audio/nsf/namco-163-audio-wiki.html` — the
+    // register headings are ranges, not single addresses: §"Sound
+    // Enable ($E000-E7FF)" (bit 6 "Disables sound if set"; "Sound is
+    // enabled on the 163 by writing a clear bit 6 to this register"),
+    // §"Address Port ($F800-$FFFF)", §"Data Port ($4800-$4FFF)".
+    // Previously only the exact base addresses $F800 / $4800 decoded
+    // and the sound-enable register did not exist at all.
+
+    #[test]
+    fn n163_address_and_data_ports_decode_their_full_windows() {
+        let mut chip = N163::new();
+        chip.write(0xFFFF, 0x80 | 0x10); // top of the $F800-$FFFF window
+        assert_eq!(chip.addr, 0x10);
+        chip.write(0x4FFF, 0xAB); // top of the $4800-$4FFF window
+        assert_eq!(chip.ram[0x10], 0xAB);
+        assert_eq!(chip.addr, 0x11, "auto-increment through the mirror");
+        chip.write(0xF923, 0x10); // mid-window address write, back to $10
+        assert_eq!(chip.read(0x4A00), 0xAB, "mid-window data read");
+    }
+
+    #[test]
+    fn n163_e000_bit6_disables_sound() {
+        let mut chip = N163::new();
+        chip.enabled = true;
+        n163_setup_channel(&mut chip, 8, 0, 15);
+        // Give channel 8 a non-zero frequency so ticking moves phase.
+        let base = N163::chan_base(8);
+        chip.ram[base] = 0x40;
+        chip.tick(15);
+        let phase_before = chip.ram[base + 1];
+        assert_ne!(phase_before, 0, "sanity: enabled chip advances phase");
+
+        chip.write(0xE000, 0x40); // bit 6 set → sound disabled
+        assert!(chip.sound_disabled);
+        assert_eq!(chip.output(), 0.0, "disabled chip is silent");
+        chip.tick(150);
+        assert_eq!(
+            chip.ram[base + 1],
+            phase_before,
+            "update cycle stops while disabled"
+        );
+
+        chip.write(0xE7FF, 0x00); // clear via the window top re-enables
+        assert!(!chip.sound_disabled);
+        chip.tick(150);
+        assert_ne!(chip.ram[base + 1], phase_before, "updates resume");
     }
 
     #[test]

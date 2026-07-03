@@ -101,7 +101,9 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     CPU batches so the chip's clock stays exact while the CPU
     executes (previously sub-16-cycle instruction batches were
     silently discarded).
-  * **Namco 163** — wavetable RAM, up to 8 channels, per-channel timer
+  * **Namco 163** — wavetable RAM, up to 8 channels, the `$E000-$E7FF`
+    sound-enable register (bit 6 disables), full-window Address / Data
+    port mirrors (`$F800-$FFFF` / `$4800-$4FFF`), per-channel timer
     accumulators (one update / 15 CPU cycles), the documented
     emitted-frequency / channel-update-rate calibration, and the
     §"Mixing" multi-channel mix (sum the active channels' held samples
