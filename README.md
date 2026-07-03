@@ -1,5 +1,7 @@
 # oxideav-nsf
 
+[![CI](https://github.com/OxideAV/oxideav-nsf/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-nsf/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-nsf.svg)](https://crates.io/crates/oxideav-nsf) [![docs.rs](https://docs.rs/oxideav-nsf/badge.svg)](https://docs.rs/oxideav-nsf) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust NSF (Nintendo Sound Format) player for the
 [oxideav](https://github.com/OxideAV) framework. Clean-room from the
 public NSF / NSFe documentation staged under `docs/audio/nsf/`.
