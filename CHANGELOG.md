@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.3...v0.0.4) - 2026-07-03
+
+### Other
+
+- nsf mmc5: chip output polarity is reversed relative to the APU
+- nsf expansion: aggregate ragged-batch invariance capstone test
+- nsf player: honour the NSFe time/fade per-track playback schedule
+- nsf vrc7: apply the NSFe VRC7 chunk (device variant + patch-set override)
+- nsf n163: $E000-$E7FF sound-enable + full address/data-port windows
+- nsf fds: $4083 bit-7 wave-unit halt + cycle-true env/unit interleave
+- nsf mmc5: pulse timers count APU cycles (pitch was an octave sharp)
+- nsf s5b: carry the 16-clock remainder across CPU batches
+- nsf vrc6: $9003 16x/256x scaling is a period right-shift; per-cycle dividers
+- README — round 383 2A03 per-sample accuracy + pre-INIT scrub
+- nsf apu: triangle $4015 disable holds output position, not zero
+- documented pre-INIT scrub on every start_song
+- account DMC DMA CPU stalls in instruction timing
+- nsf apu: $4017 write effects land on the 3/4-cycle phase delay
+- nsf apu: frame events interleave exactly with channel timers
+- nsf apu: frame-counter events at exact documented CPU half-cycles
+- nsf apu: DMC output unit powers up silent (fresh 8-bit cycle)
+- nsf apu: $4015 write clears DMC IRQ flag; $4015 read no longer does
+- end-to-end noise render test (audible + DC-free through the player)
+- nsf apu: don't sweep-mute low pulse notes when shift count is zero
+- nsf player: apply documented post-DAC analog filter chain to output
+- nsf apu: drive frame counter on documented region/mode event schedule
+- nsf apu: triangle holds sequencer position on silence + ultrasonic 7.5 midpoint
+- nsf apu: fix noise clock rate (CPU-cycle period table) + pulse prescaler carry
+- nsf README: document the parse_fuzz robustness battery + fuzz/ libfuzzer crate
+- extend parse fuzz harness with bankswitched + FDS + random-program coverage
+- add cargo-fuzz crate (parse_nsf / parse_and_render / nsfe_metadata)
+- fix FDS empty-RAM panic on non-bankswitched headers + add parse/render fuzz battery
+- §7 global-counter-driven Attack envelope with measured 12-level sequence
+- reload patch-0 channels on user-patch ($00-$07) writes
+- strengthen the §7 decay cadence test to the worked-example rate 14
+- nsf README: §7 global-counter EG model now drives the live decay/release path
+- end-to-end §7 decay tests through the VRC7 register ports
+- drive live envelope decay/release from the §7 global-counter EG model
+- end-to-end VRC7 frame-render integration test through the register ports
+- fix phase generator to 10.9 fixed-point (9 frac bits) — VRC7/OPLL notes were rendering subsonic
+- scrub this-round enumerated-emulator denials from r339 OPLL doc comments
+- README — §8a AM gap closed, §7 EG model staged
+- per-channel §8a/§8b LFO synthesis property tests
+- §7 silicon-measured EG rate-increment tables + advance algorithm
+- §8a silicon-measured AM (tremolo) LFO depth table
+- VIB vibrato uses silicon-measured §8b 8x8 PM table + exact phase-step
+- YM2413 rhythm noise generator (OpllNoiseLfsr) — 23-bit x^23+x^9+1 LFSR
+- sum-and-divide multi-channel mixing per audio-wiki §Mixing
+- OPLL rhythm: bass-drum (BD) two-slot FM synthesis (§V-4 / Table III-9)
+- make the AM/VIB LFO audible via §7 physical depths (round 319)
+- raw-PCM analog Pin 2 DAC transfer curve (round 315)
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - **Expansion-tier capstone test: aggregate batch invariance.** With
