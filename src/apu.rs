@@ -287,7 +287,6 @@ impl PulseChannel {
     }
 }
 
-#[derive(Default)]
 struct TriangleChannel {
     enabled: bool,
     timer_period: u16,
@@ -299,6 +298,28 @@ struct TriangleChannel {
     linear_reload_value: u8,
     linear_reload: bool,
     control_flag: bool, // shares the length-halt bit
+}
+
+impl Default for TriangleChannel {
+    /// Power-up state. The staged docs do not pin the sequencer's
+    /// power-up position; we seed it at step 15 (the sequence's zero
+    /// output value) so a never-played triangle holds silence rather
+    /// than an arbitrary DC step. Once the channel has run, every
+    /// silencing method holds whatever step it stopped on, per the
+    /// documented behaviour (see `output_halfsteps`).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timer_period: 0,
+            timer: 0,
+            seq_step: 15,
+            length: LengthCounter::default(),
+            linear_counter: 0,
+            linear_reload_value: 0,
+            linear_reload: false,
+            control_flag: false,
+        }
+    }
 }
 
 impl TriangleChannel {
@@ -351,23 +372,34 @@ impl TriangleChannel {
     /// Sequencer output expressed in half-steps (units of ½ level) so the
     /// ultrasonic "7.5" averaged value the spec describes can be returned
     /// without rounding bias. A normal step `s` is `2 * TRIANGLE_TABLE[s]`.
+    /// True while the sequencer is actually advancing (mirrors the
+    /// gate in `tick_timer`): both counters non-zero and the period is
+    /// not ultrasonic-halted.
+    fn sequencer_running(&self) -> bool {
+        self.length.active() && self.linear_counter > 0
+    }
+
     fn output_halfsteps(&self) -> u8 {
-        if !self.enabled {
-            return 0;
-        }
         // The triangle has no volume gate: its level is purely the
-        // sequencer's current step. When the length counter or linear
-        // counter is zero the sequencer stops advancing (see
-        // `tick_timer`) and the channel *holds* its current step rather
-        // than snapping to silence — the hardware's "halt it in whatever
-        // its current output position is" behaviour
+        // sequencer's current step. EVERY silencing method — length or
+        // linear counter reaching zero, and the `$4015` disable (which
+        // merely clears the length counter) — stops the sequencer and
+        // *holds* its current step rather than snapping to silence:
+        // "Silencing the triangle channel merely halts it. It will
+        // continue to output its last value rather than 0"
+        // (docs/audio/nsf/apu-nesdev-wiki.html §Triangle), and the
+        // `$4015` method is listed among the ways that "halt it in
+        // whatever its current output position is"
         // (docs/audio/nsf/apu-triangle-wiki.html §"silenced by several
-        // methods"). When the period is ultrasonic (< 2) the sequencer
-        // sweeps faster than the output rate can resolve and the lowpass
-        // average is "halfway between 7 and 8" per the same section, so
-        // we report the documented 7.5 (= 15 half-steps) instead of the
-        // held step.
-        if self.timer_period < 2 {
+        // methods"). When the period is ultrasonic (< 2) *and the
+        // sequencer is cycling*, it sweeps faster than the output rate
+        // can resolve and the lowpass average is "halfway between 7
+        // and 8" per the same section, so we report the documented 7.5
+        // (= 15 half-steps); a halted channel holds its step instead,
+        // whatever the period. The residual DC a held step leaves in
+        // the mix is what the documented post-DAC high-pass chain
+        // removes downstream.
+        if self.timer_period < 2 && self.sequencer_running() {
             return 15; // 7.5 in level units
         }
         2 * TRIANGLE_TABLE[self.seq_step as usize]
@@ -1529,19 +1561,53 @@ mod tests {
 
     #[test]
     fn triangle_ultrasonic_reports_midpoint_not_silence() {
-        // A period < 2 sweeps faster than the output resolves; the spec
-        // gives the averaged level as 7.5. output_halfsteps must report
-        // 15 (= 7.5) rather than 0 (the old hard-silence behaviour).
+        // A period < 2 sweeps faster than the output resolves while
+        // the sequencer is cycling; the spec gives the averaged level
+        // as 7.5. output_halfsteps must report 15 (= 7.5) rather than
+        // 0 — but only while the sequencer actually runs (counters
+        // non-zero); a halted channel holds its step instead.
         let mut tri = TriangleChannel {
             enabled: true,
             ..TriangleChannel::default()
         };
+        // Period = 1 → ultrasonic. Counters at zero → halted: holds
+        // the power-up step (15, output 0), NOT the midpoint.
         tri.write_period_lo(0x01);
-        tri.write_period_hi(0x00); // period = 1 → ultrasonic
-        assert_eq!(tri.output_halfsteps(), 15);
-        // Disabled still silences.
+        assert_eq!(tri.output_halfsteps(), 0, "halted channel holds");
+        // Cycling + ultrasonic → the documented 7.5 average.
+        tri.length.counter = 4;
+        tri.linear_counter = 4;
+        assert_eq!(tri.output_halfsteps(), 15, "cycling ultrasonic = 7.5");
+    }
+
+    #[test]
+    fn triangle_4015_disable_holds_position_not_zero() {
+        // "Use $4015 to turn off the channel, which will clear its
+        // length counter" is one of the documented silencing methods
+        // that "halt it in whatever its current output position is" —
+        // and "Silencing the triangle channel merely halts it. It will
+        // continue to output its last value rather than 0." Advance
+        // the sequencer to a mid-wave step, disable via the $4015
+        // path, and require the held (non-zero) level to persist.
+        let mut tri = TriangleChannel {
+            enabled: true,
+            ..TriangleChannel::default()
+        };
+        tri.write_period_lo(0x10);
+        tri.length.counter = 100;
+        tri.linear_counter = 100;
+        tri.tick_timer(17 * 5); // a few sequencer steps past power-up
+        let held = tri.output_halfsteps();
+        assert_ne!(held, 0, "mid-wave step should be non-zero");
+        // $4015 disable: enable flag clears + length counter zeroed.
         tri.enabled = false;
-        assert_eq!(tri.output_halfsteps(), 0);
+        tri.length.silence_if_disabled(false);
+        tri.tick_timer(17 * 50);
+        assert_eq!(
+            tri.output_halfsteps(),
+            held,
+            "disabled triangle must hold its last output, not snap to 0"
+        );
     }
 
     #[test]

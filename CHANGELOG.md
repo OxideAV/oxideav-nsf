@@ -28,6 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$4015=$0F` / `$4017=$40` observables), the low-load program
   reload, and the bank-selection restore.
 
+- **Triangle `$4015`-disable now holds the sequencer's output instead
+  of snapping to zero.** "Use $4015 to turn off the channel, which
+  will clear its length counter" is one of the silencing methods the
+  triangle doc says "halt it in whatever its current output position
+  is", and the register reference states "Silencing the triangle
+  channel merely halts it. It will continue to output its last value
+  rather than 0" — but the `enabled == false` path still hard-zeroed
+  the output, re-introducing exactly the pop the counter-expiry hold
+  fix removed for the other silencing paths. The enable flag no longer
+  gates the DAC level (it already halts the sequencer through the
+  cleared length counter); the residual DC of a held step is removed
+  by the documented post-DAC high-pass chain downstream. The
+  ultrasonic "7.5" average is now also correctly limited to a
+  *cycling* sequencer (counters non-zero) — a halted channel holds its
+  step whatever the period. The power-up sequencer position is not
+  pinned by the staged docs; it is seeded at step 15 (the sequence's
+  zero-output value) so a never-played triangle idles silent. New
+  `triangle_4015_disable_holds_position_not_zero` test; the ultrasonic
+  test now pins the cycling-only midpoint.
+
 - **`$4015` write/read IRQ-flag semantics now match the documented
   register contract** (`docs/audio/nsf/apu-nesdev-wiki.html` §"Status
   ($4015)"). A `$4015` *write* now clears the DMC interrupt flag
