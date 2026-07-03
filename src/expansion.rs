@@ -338,6 +338,12 @@ pub struct Mmc5 {
     /// free-runs and fires both the envelope and length steps each
     /// time it crosses `MMC5_FRAME_CPU`.
     pub frame_acc: u32,
+    /// Dropped half-cycle of the pulse /2 prescaler, carried across
+    /// batches. §"Pulse 1": the channels "behave almost identically
+    /// to the native pulse channels in the NES APU", whose 11-bit
+    /// timer counts APU (CPU/2) cycles — so an odd CPU batch must
+    /// leave its odd cycle for the next batch instead of rounding.
+    pub pulse_prescaler_carry: u32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -615,35 +621,57 @@ impl Mmc5 {
     }
 
     pub fn tick(&mut self, cycles: u32) {
-        for p in &mut self.pulse {
-            if !p.enabled {
-                continue;
+        // Split each batch at the next 240 Hz boundary so the
+        // envelope / length clock fires exactly *between* the timer
+        // cycles that surround its CPU offset — the same interleaving
+        // discipline the 2A03 frame counter uses. Without the split,
+        // a whole batch of timer cycles would run before an
+        // envelope / length step that belongs in its middle.
+        let mut remaining = cycles;
+        while remaining > 0 {
+            let until_frame = MMC5_FRAME_CPU - self.frame_acc;
+            let n = remaining.min(until_frame);
+            self.advance_pulse_timers(n);
+            self.frame_acc += n;
+            if self.frame_acc >= MMC5_FRAME_CPU {
+                self.frame_acc -= MMC5_FRAME_CPU;
+                // §"Pulse 1": "envelope and length counter are fixed
+                // to a 240hz update rate" with no frame sequencer.
+                // The free-running clock steps both units at once
+                // (the length counter runs "twice as fast as the APU
+                // length counter", i.e. the APU's 120 Hz half-frame
+                // clock doubled to 240 Hz).
+                for p in &mut self.pulse {
+                    p.clock_envelope();
+                    p.clock_length();
+                }
             }
-            let mut left = cycles;
-            while left > 0 {
-                let take = left.min(2); // /2 prescaler (matches 2A03 pulse).
+            remaining -= n;
+        }
+    }
+
+    /// Advance the two pulse timers by `cycles` CPU cycles. §"Pulse 1":
+    /// the channels "behave almost identically to the native pulse
+    /// channels in the NES APU" — the 11-bit timer counts down once
+    /// per APU (CPU/2) cycle, and on reaching zero reloads and clocks
+    /// the 8-step duty sequencer, i.e. one duty step per
+    /// `2 * (t + 1)` CPU cycles (f = CPU / (16 * (t + 1))). The /2
+    /// prescaler keeps its dropped half-cycle across batches, and the
+    /// timers run whether or not the channel is enabled (as on the
+    /// 2A03, `$5015` gates the length counter / output, not the
+    /// timer).
+    fn advance_pulse_timers(&mut self, cycles: u32) {
+        let total = cycles + self.pulse_prescaler_carry;
+        let apu_cycles = total / 2;
+        self.pulse_prescaler_carry = total & 1;
+        for p in &mut self.pulse {
+            for _ in 0..apu_cycles {
                 if p.timer == 0 {
                     p.timer = p.timer_period;
                     p.step = (p.step + 1) & 0x07;
                 } else {
-                    p.timer = p.timer.saturating_sub(take.min(p.timer as u32) as u16);
+                    p.timer -= 1;
                 }
-                left = left.saturating_sub(take);
-            }
-        }
-
-        // §"Pulse 1": "envelope and length counter are fixed to a 240hz
-        // update rate" with no frame sequencer. The MMC5 free-runs a
-        // single 240 Hz clock; each tick steps both the envelope and
-        // the length counter (the latter being "twice as fast as the
-        // APU length counter", i.e. the APU's 120 Hz half-frame length
-        // clock doubled to 240 Hz).
-        self.frame_acc += cycles;
-        while self.frame_acc >= MMC5_FRAME_CPU {
-            self.frame_acc -= MMC5_FRAME_CPU;
-            for p in &mut self.pulse {
-                p.clock_envelope();
-                p.clock_length();
             }
         }
     }
@@ -3629,6 +3657,103 @@ mod tests {
         assert_eq!(chip.pulse[0].length, 2, "sub-period tick must not step");
         chip.tick(1); // crosses the boundary
         assert_eq!(chip.pulse[0].length, 1);
+    }
+
+    // ---------------- Round 386: MMC5 pulse timer rate ----------------
+    //
+    // Spec source: `docs/audio/nsf/mmc5-audio-wiki.html` — the pulse
+    // channels "behave almost identically to the native pulse channels
+    // in the NES APU" and "function the same as to those found in the
+    // NES APU except for the following differences" (none of which
+    // touch the timer). The APU pulse timer counts APU (CPU/2) cycles
+    // and clocks the 8-step duty sequencer on expiry, so one duty step
+    // takes 2*(t+1) CPU cycles (f = CPU / (16*(t+1))). The old tick
+    // decremented the timer once per CPU cycle — every MMC5 pulse
+    // played roughly an octave sharp — and dropped odd cycles at batch
+    // edges.
+
+    /// Tick one CPU cycle at a time until pulse 0's duty step changes;
+    /// returns how many CPU cycles that took.
+    fn mmc5_cpu_cycles_to_next_duty_step(chip: &mut Mmc5) -> u32 {
+        let start = chip.pulse[0].step;
+        let mut cycles = 0u32;
+        while chip.pulse[0].step == start {
+            chip.tick(1);
+            cycles += 1;
+            assert!(cycles < 10_000, "duty sequencer never stepped");
+        }
+        cycles
+    }
+
+    #[test]
+    fn mmc5_pulse_duty_steps_every_two_t_plus_one_cpu_cycles() {
+        // t = 0x40 → one duty step per 2*(t+1) = 130 CPU cycles
+        // (f = CPU / (16*(t+1)) across the 8-step sequence). The
+        // power-up timer is empty, so the very first APU cycle
+        // reloads + steps; every following step costs 130.
+        let mut chip = Mmc5::new();
+        chip.write(0x5015, 0x01);
+        chip.write(0x5002, 0x40);
+        chip.write(0x5003, 0x00); // timer_period high = 0 (+ length load)
+        let _first = mmc5_cpu_cycles_to_next_duty_step(&mut chip);
+        for _ in 0..4 {
+            assert_eq!(
+                mmc5_cpu_cycles_to_next_duty_step(&mut chip),
+                2 * (0x40 + 1),
+                "APU-identical rate: 2*(t+1) CPU cycles per duty step"
+            );
+        }
+    }
+
+    #[test]
+    fn mmc5_pulse_prescaler_carries_odd_cycles_across_batches() {
+        // The same total cycle count driven whole and in ragged
+        // 1/3/5/7-cycle chunks must land the pulse timers, duty
+        // steps, prescaler carry, and 240 Hz accumulator in exactly
+        // the same state.
+        let setup = |chip: &mut Mmc5| {
+            chip.write(0x5015, 0x03);
+            chip.write(0x5000, 0x10); // constant volume
+            chip.write(0x5002, 0x40);
+            chip.write(0x5003, 0x08); // length + phase reset
+            chip.write(0x5006, 0x33);
+            chip.write(0x5007, 0x10);
+        };
+        let mut whole = Mmc5::new();
+        let mut ragged = Mmc5::new();
+        setup(&mut whole);
+        setup(&mut ragged);
+
+        const TOTAL: u32 = 30_011; // odd + spans several 240 Hz events
+        whole.tick(TOTAL);
+        let chunks = [1u32, 3, 5, 7];
+        let mut left = TOTAL;
+        let mut i = 0usize;
+        while left > 0 {
+            let n = chunks[i % chunks.len()].min(left);
+            ragged.tick(n);
+            left -= n;
+            i += 1;
+        }
+        for ch in 0..2 {
+            assert_eq!(whole.pulse[ch].timer, ragged.pulse[ch].timer);
+            assert_eq!(whole.pulse[ch].step, ragged.pulse[ch].step);
+            assert_eq!(whole.pulse[ch].length, ragged.pulse[ch].length);
+            assert_eq!(whole.pulse[ch].env_decay, ragged.pulse[ch].env_decay);
+        }
+        assert_eq!(whole.frame_acc, ragged.frame_acc);
+        assert_eq!(whole.pulse_prescaler_carry, ragged.pulse_prescaler_carry);
+    }
+
+    #[test]
+    fn mmc5_timer_runs_while_channel_disabled() {
+        // As on the 2A03, `$5015` gates the length counter / output,
+        // not the timer: a disabled channel's sequencer keeps moving.
+        let mut chip = Mmc5::new();
+        chip.write(0x5002, 0x10); // t = 0x10, channel stays disabled
+        let before = chip.pulse[0].step;
+        chip.tick(2 * (0x10 + 1) * 3);
+        assert_ne!(chip.pulse[0].step, before);
     }
 
     #[test]

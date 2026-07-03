@@ -36,6 +36,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any batch chunking. 2 new tests pin 64×1-cycle ≡ 1×64-cycle and
   full state invariance under ragged 1/3/5/7-cycle batching.
 
+- **MMC5 pulse timers now count APU (CPU/2) cycles — pitch was an
+  octave sharp** (`docs/audio/nsf/mmc5-audio-wiki.html`: the pulse
+  channels "behave almost identically to the native pulse channels
+  in the NES APU", none of the listed differences touching the
+  timer). The old tick decremented the 11-bit timer once per CPU
+  cycle instead of once per APU cycle, doubling every MMC5 pulse
+  frequency, and dropped odd cycles at batch edges. The timers now
+  step per APU cycle behind a /2 prescaler that carries its dropped
+  half-cycle across batches (as the 2A03 pulses do), run whether or
+  not `$5015` enables the channel (the enable gates length/output,
+  not the timer), and the free-running 240 Hz envelope + length
+  clock is interleaved *between* the timer cycles that surround its
+  exact CPU offset instead of firing at batch end. 3 new tests pin
+  the `2*(t+1)`-CPU-cycles-per-duty-step rate, full state invariance
+  under ragged 1/3/5/7-cycle batching, and the disabled-channel
+  timer.
+
 - **Every `start_song` now performs the documented pre-INIT machine
   scrub** (`docs/audio/nsf/nsf-nesdev-wiki.html` §"Initializing a
   tune", mirrored by `docs/audio/nsf/nsfspec-kevtris-v1.61.txt`

@@ -88,7 +88,9 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     `$9003` 16x/256x frequency-scaling flags applied as the documented
     4-/8-bit right shift of the 12-bit period (256x overrides 16x;
     halt freezes all oscillators in place).
-  * **MMC5** — 2 pulses with the chip's fixed 240 Hz envelope + length
+  * **MMC5** — 2 pulses with APU-identical timers (per-APU-cycle /2
+    prescaler with cross-batch half-cycle carry, so pitch is exactly
+    `CPU / (16·(t+1))`) and the chip's fixed 240 Hz envelope + length
     unit, plus 8-bit raw PCM with `$5010` PCM Mode/IRQ semantics and the
     analog Pin 2 DAC transfer curve (the
     `Voltage = (DAC/255)·0.4·AVcc + 0.1·AVcc` characteristic, AC-coupled
