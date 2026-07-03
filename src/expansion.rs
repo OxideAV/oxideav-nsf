@@ -6268,4 +6268,119 @@ mod tests {
             assert!(p.mod_mult <= 0x0F && p.car_mult <= 0x0F);
         }
     }
+
+    // ---------------- Round 386: aggregate batch invariance ----------------
+    //
+    // Capstone for the expansion timing tier: with all six chips
+    // enabled and playing at once, driving the aggregate for the same
+    // total cycle count must land every chip in the same state no
+    // matter how the CPU chunks its cycles. Each chip carries its own
+    // sub-interval remainder (VRC6 per-cycle dividers, MMC5 /2
+    // prescaler carry + 240 Hz accumulator, S5B 16-clock remainder,
+    // N163 15-cycle accumulator, FDS per-cycle env/unit walk, VRC7
+    // Q8 operator-clock accumulator).
+
+    #[test]
+    fn expansion_aggregate_state_is_invariant_to_batch_chunking() {
+        let setup = |exp: &mut Expansion| {
+            exp.set_flags(ExpansionChips(0x3F)); // all six chips
+                                                 // VRC6: pulse 1 + saw.
+            exp.write(0x9000, 0x0F);
+            exp.write(0x9001, 0x37);
+            exp.write(0x9002, 0x80);
+            exp.write(0xB000, 0x08);
+            exp.write(0xB001, 0x53);
+            exp.write(0xB002, 0x80);
+            // VRC7: key-on channel 0, patch 2.
+            exp.write(0x9010, 0x30);
+            exp.write(0x9030, 0x20);
+            exp.write(0x9010, 0x10);
+            exp.write(0x9030, 0x80);
+            exp.write(0x9010, 0x20);
+            exp.write(0x9030, 0x17);
+            // MMC5: pulse 0 with envelope.
+            exp.write(0x5015, 0x01);
+            exp.write(0x5000, 0x02);
+            exp.write(0x5002, 0x40);
+            exp.write(0x5003, 0x08);
+            // N163: one channel with a live frequency.
+            exp.write(0xF800, 0x80 | 0x40); // addr $40, auto-inc
+            for _ in 0..0x40 {
+                exp.write(0x4800, 0x9A); // wave data + channel regs
+            }
+            // S5B: tone A + envelope.
+            exp.write(0xC000, 0x00);
+            exp.write(0xE000, 0x1B);
+            exp.write(0xC000, 0x08);
+            exp.write(0xE000, 0x10);
+            exp.write(0xC000, 0x0B);
+            exp.write(0xE000, 0x21);
+            exp.write(0xC000, 0x0D);
+            exp.write(0xE000, 0x0E);
+            // FDS: wave + mod + both envelopes.
+            exp.write(0x4089, 0x80);
+            exp.write(0x4040, 0x20);
+            exp.write(0x4041, 0x3F);
+            exp.write(0x4089, 0x00);
+            exp.write(0x4085, 0x08);
+            exp.write(0x4088, 0x02);
+            exp.write(0x4086, 0x7F);
+            exp.write(0x4087, 0x01);
+            exp.write(0x4084, 0x0A);
+            exp.write(0x4080, 0x15);
+            exp.write(0x408A, 0x20);
+            exp.write(0x4082, 0x80);
+            exp.write(0x4083, 0x01);
+        };
+        let mut whole = Expansion::new();
+        let mut ragged = Expansion::new();
+        setup(&mut whole);
+        setup(&mut ragged);
+
+        const TOTAL: u32 = 60_017;
+        whole.tick(TOTAL);
+        let chunks = [1u32, 2, 3, 5, 7, 11, 13, 36];
+        let mut left = TOTAL;
+        let mut i = 0usize;
+        while left > 0 {
+            let n = chunks[i % chunks.len()].min(left);
+            ragged.tick(n);
+            left -= n;
+            i += 1;
+        }
+
+        // VRC6.
+        assert_eq!(whole.vrc6.pulse[0].timer, ragged.vrc6.pulse[0].timer);
+        assert_eq!(whole.vrc6.pulse[0].step, ragged.vrc6.pulse[0].step);
+        assert_eq!(whole.vrc6.saw.step, ragged.vrc6.saw.step);
+        assert_eq!(whole.vrc6.saw.accum, ragged.vrc6.saw.accum);
+        // VRC7.
+        assert_eq!(whole.vrc7.op_cycles_q8, ragged.vrc7.op_cycles_q8);
+        assert_eq!(whole.vrc7.latched_output, ragged.vrc7.latched_output);
+        // MMC5.
+        assert_eq!(whole.mmc5.pulse[0].timer, ragged.mmc5.pulse[0].timer);
+        assert_eq!(whole.mmc5.pulse[0].step, ragged.mmc5.pulse[0].step);
+        assert_eq!(
+            whole.mmc5.pulse[0].env_decay,
+            ragged.mmc5.pulse[0].env_decay
+        );
+        assert_eq!(whole.mmc5.frame_acc, ragged.mmc5.frame_acc);
+        // N163 — phase bytes live in sound RAM.
+        assert_eq!(whole.n163.ram, ragged.n163.ram);
+        assert_eq!(whole.n163.cycle_accum, ragged.n163.cycle_accum);
+        // S5B.
+        assert_eq!(whole.s5b.channels[0].timer, ragged.s5b.channels[0].timer);
+        assert_eq!(whole.s5b.channels[0].level, ragged.s5b.channels[0].level);
+        assert_eq!(whole.s5b.envelope.step, ragged.s5b.envelope.step);
+        assert_eq!(whole.s5b.clock_rem, ragged.s5b.clock_rem);
+        // FDS.
+        assert_eq!(whole.fds.wave_acc, ragged.fds.wave_acc);
+        assert_eq!(whole.fds.mod_counter, ragged.fds.mod_counter);
+        assert_eq!(whole.fds.mod_gain, ragged.fds.mod_gain);
+        assert_eq!(whole.fds.volume, ragged.fds.volume);
+        assert_eq!(whole.fds.cycle_acc, ragged.fds.cycle_acc);
+
+        // And the mixed output is identical.
+        assert_eq!(whole.output(), ragged.output());
+    }
 }

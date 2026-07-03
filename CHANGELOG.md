@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Expansion-tier capstone test: aggregate batch invariance.** With
+  all six expansion chips enabled and playing at once, driving
+  `Expansion::tick` for the same total cycle count whole vs. in
+  ragged 1/2/3/5/7/11/13/36-cycle chunks now provably lands every
+  chip's timers, envelopes, phase accumulators, prescaler carries,
+  and the mixed output in identical state — pinning the round's
+  per-chip remainder-carry work (VRC6 per-cycle dividers, MMC5 /2
+  carry + 240 Hz accumulator, S5B 16-clock remainder, N163 15-cycle
+  accumulator, FDS per-cycle env/unit walk, VRC7 Q8 operator clock)
+  as a single regression test.
+
 - **VRC6 `$9003` 16x/256x frequency scaling now actually scales**
   (`docs/audio/nsf/vrc6-audio-wiki.html` §"Frequency Control
   ($9003)"): the B/A flags "effectively control a 4-bit and 8-bit
