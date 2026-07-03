@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 new tests pin the 16x rate, the 256x override, and the sawtooth
   scaling.
 
+- **Sunsoft 5B no longer loses CPU cycles between batches**
+  (`docs/audio/nsf/sunsoft-5b-audio-wiki.html` §Sound: tone / noise /
+  envelope are driven by "a counter that counts up on every 16th
+  clock cycle" of the CPU clock). The tick previously truncated
+  `cycles / 16` and threw the remainder away; since a CPU instruction
+  is only 2-7 cycles, per-instruction batches almost never reached a
+  whole interval and the entire chip stalled (or ran arbitrarily
+  slow) while the CPU was executing code. A `clock_rem` carry now
+  preserves the leftover cycles, making the chip's clock exact for
+  any batch chunking. 2 new tests pin 64×1-cycle ≡ 1×64-cycle and
+  full state invariance under ragged 1/3/5/7-cycle batching.
+
 - **Every `start_song` now performs the documented pre-INIT machine
   scrub** (`docs/audio/nsf/nsf-nesdev-wiki.html` §"Initializing a
   tune", mirrored by `docs/audio/nsf/nsfspec-kevtris-v1.61.txt`

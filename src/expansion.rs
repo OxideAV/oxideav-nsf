@@ -740,6 +740,14 @@ pub struct Sunsoft5b {
     /// Envelope generator — 16-bit period at `$0B`/`$0C`, 32-step
     /// ramp, shape parameters at `$0D` low nibble.
     pub envelope: S5bEnvelope,
+    /// CPU-cycle remainder toward the next 16-clock minor tick.
+    /// §Sound drives tone / noise / envelope off "every 16th clock
+    /// cycle" of the CPU clock; batches are rarely multiples of 16,
+    /// so the leftover cycles must carry into the next batch — the
+    /// old `cycles / 16` truncation silently discarded them, running
+    /// the whole chip slow by exactly the fraction of time the CPU
+    /// spent executing short instructions.
+    pub clock_rem: u32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -867,9 +875,14 @@ impl Sunsoft5b {
 
     pub fn tick(&mut self, cycles: u32) {
         // The 5B's audio is driven by the CPU clock; tone, noise and
-        // envelope all observe a 16-clock minor tick per §Sound. We
-        // count whole 16-clock intervals here.
-        let intervals = cycles / 16;
+        // envelope all observe a 16-clock minor tick per §Sound
+        // ("counts up on every 16th clock cycle"). Whole 16-clock
+        // intervals are consumed here and the remainder carries into
+        // the next batch, so the chip's clock is exact regardless of
+        // how the CPU chunks its cycles.
+        let total = self.clock_rem + cycles;
+        let intervals = total / 16;
+        self.clock_rem = total % 16;
         for _ in 0..intervals {
             // Tone channels — flip when the counter reaches the
             // period (`>= period`), then reset to 0 per §Sound. A
@@ -3710,6 +3723,75 @@ mod tests {
         assert_eq!(chip.channels[0].level, start ^ 1);
         chip.tick(64); // next 64 clocks — flip back
         assert_eq!(chip.channels[0].level, start);
+    }
+
+    // ---------------- Round 386: 16-clock prescaler carry ----------------
+    //
+    // Spec source: `docs/audio/nsf/sunsoft-5b-audio-wiki.html` §Sound —
+    // "a counter that counts up on every 16th clock cycle". A CPU
+    // instruction is 2-7 cycles, so per-instruction batches almost
+    // never contain a whole 16-clock interval; the old `cycles / 16`
+    // truncation dropped the remainder and the whole chip fell silent
+    // (or ran arbitrarily slow) while the CPU was executing code.
+
+    #[test]
+    fn s5b_single_cycle_ticks_accumulate_across_batches() {
+        // 64 one-cycle ticks must behave exactly like one tick(64):
+        // with tone period 4 (flip every 64 clocks) the level flips
+        // exactly once.
+        let mut chip = Sunsoft5b::new();
+        s5b_write_reg(&mut chip, 0, 0x04);
+        s5b_write_reg(&mut chip, 1, 0x00);
+        let start = chip.channels[0].level;
+        for _ in 0..64 {
+            chip.tick(1);
+        }
+        assert_eq!(
+            chip.channels[0].level,
+            start ^ 1,
+            "sixty-four 1-cycle batches = one 64-cycle batch"
+        );
+    }
+
+    #[test]
+    fn s5b_state_is_invariant_to_batch_chunking() {
+        // Drive two identical chips (tone + noise + envelope all
+        // active) for the same total cycle count, one in a single
+        // batch and one in ragged 1/3/5/7-cycle chunks; every piece
+        // of audible state must match.
+        let setup = |chip: &mut Sunsoft5b| {
+            s5b_write_reg(chip, 0, 0x07); // tone A period lo
+            s5b_write_reg(chip, 1, 0x00);
+            s5b_write_reg(chip, 6, 0x03); // noise period
+            s5b_write_reg(chip, 0x0B, 0x05); // env period lo
+            s5b_write_reg(chip, 0x0C, 0x00);
+            s5b_write_reg(chip, 0x0D, 0x0E); // continue+attack+alternate
+            s5b_write_reg(chip, 8, 0x10); // ch A: envelope-routed
+        };
+        let mut whole = Sunsoft5b::new();
+        let mut ragged = Sunsoft5b::new();
+        setup(&mut whole);
+        setup(&mut ragged);
+
+        const TOTAL: u32 = 16_384;
+        whole.tick(TOTAL);
+        let mut left = TOTAL;
+        let chunks = [1u32, 3, 5, 7];
+        let mut i = 0usize;
+        while left > 0 {
+            let n = chunks[i % chunks.len()].min(left);
+            ragged.tick(n);
+            left -= n;
+            i += 1;
+        }
+
+        assert_eq!(whole.channels[0].level, ragged.channels[0].level);
+        assert_eq!(whole.channels[0].timer, ragged.channels[0].timer);
+        assert_eq!(whole.noise.lfsr, ragged.noise.lfsr);
+        assert_eq!(whole.noise.timer, ragged.noise.timer);
+        assert_eq!(whole.envelope.step, ragged.envelope.step);
+        assert_eq!(whole.envelope.timer, ragged.envelope.timer);
+        assert_eq!(whole.clock_rem, ragged.clock_rem);
     }
 
     #[test]

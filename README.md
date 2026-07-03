@@ -95,7 +95,10 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     about its 0.3·AVcc midpoint).
   * **Sunsoft 5B** — 3 squares with AY-style log-volume envelopes
     (17-bit LFSR noise, 32-step envelope shapes, select-port write
-    lock-out).
+    lock-out); the 16-clock minor tick carries its remainder across
+    CPU batches so the chip's clock stays exact while the CPU
+    executes (previously sub-16-cycle instruction batches were
+    silently discarded).
   * **Namco 163** — wavetable RAM, up to 8 channels, per-channel timer
     accumulators (one update / 15 CPU cycles), the documented
     emitted-frequency / channel-update-rate calibration, and the
