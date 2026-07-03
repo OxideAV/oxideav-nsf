@@ -144,7 +144,12 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     recovered by Berlekamp-Massey from the silicon-RE SD-tail capture,
     with the all-zero trap, non-zero seed, and the 72-cycle
     HH-sample / 3-step / SD-sample / 15-step rhythm-frame tap protocol —
-    the noise source HH + SD synthesis consume.
+    the noise source HH + SD synthesis consume. The NSFe `VRC7` chunk
+    is applied to the synthesis path: device variant 1 swaps the
+    default instrument ROM to the silicon-dumped YM2413 patch set, and
+    a supplied 128-/152-byte replacement patch table overrides slots
+    1-15 (slot 0 stays the live user patch; the 152-byte rhythm tail
+    is accepted but inaudible — no rhythm DAC).
   * **FDS** — wavetable + frequency-modulation unit, the volume + mod
     envelope ramp generators (`c = 8·(e+1)·(m+1)` timer) interleaved
     cycle-exactly with the 16-cycle wave/mod unit ticks, the `$4083`

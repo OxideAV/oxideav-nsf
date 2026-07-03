@@ -200,6 +200,19 @@ impl NsfPlayer {
             bus.apu.apply_mixe_overrides(&header.metadata.mixer);
         }
 
+        // Apply the NSFe `VRC7` chunk (device variant + optional
+        // replacement patch set) to the VRC7 synthesis path. Per
+        // `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7 the chunk
+        // swaps the instrument ROM: device 1 selects the YM2413
+        // default set, and a supplied 128-/152-byte table replaces
+        // the built-in patches outright.
+        if let Some(v) = &header.metadata.vrc7 {
+            bus.apu
+                .expansion
+                .vrc7
+                .apply_nsfe_chunk(v.device, v.patches.as_deref());
+        }
+
         let nsf2_nmi_play = header.nsf2.non_returning_init();
         let nsf2_suppress_play = header.nsf2.suppressed_play();
 
@@ -756,6 +769,26 @@ mod tests {
         assert_eq!(
             player.bus.ram[NMI_WRAPPER_ADDR as usize], 0x48,
             "NMI wrapper should start with PHA ($48)"
+        );
+    }
+
+    #[test]
+    fn nsfe_vrc7_chunk_reaches_the_synthesis_path() {
+        // Per `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7 the chunk
+        // must actually change the instrument set the chip decodes —
+        // device 1 selects the YM2413 default ROM.
+        let (hdr_bytes, prog) = _tiny_test_program();
+        let mut whole = hdr_bytes.to_vec();
+        whole.extend_from_slice(&prog);
+        let mut header = parse_nsf(&whole).unwrap();
+        header.metadata.vrc7 = Some(crate::nsfe::NsfeVrc7 {
+            device: 1,
+            patches: None,
+        });
+        let player = NsfPlayer::new(header, 44_100);
+        assert!(
+            player.bus.apu.expansion.vrc7.ym2413_variant,
+            "player must forward the NSFe VRC7 chunk to the chip"
         );
     }
 

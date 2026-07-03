@@ -1524,6 +1524,37 @@ pub const VRC7_RHYTHM_ROM: [[u8; 8]; 3] = [
     [0x05, 0x01, 0x00, 0x00, 0xF8, 0xAA, 0x59, 0x55], // Tom / Top Cymbal
 ];
 
+/// The 16 hardwired instrument patches of the original YM2413 (OPLL),
+/// transcribed from
+/// `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §2a — silicon-RE
+/// ROM contents (YM2413B debug-mode dump cross-checked against the
+/// FHB013 die-shot bits). Slot 0 is the user "custom patch"
+/// placeholder, as on the VRC7.
+///
+/// Selected as the default patch set when an NSFe `VRC7` chunk names
+/// device variant `1` (YM2413) — per
+/// `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7: "If a replacement
+/// patch set is not contained in this chunk, an appropriate default
+/// patch set should be used for the selected device."
+pub const YM2413_INSTRUMENT_ROM: [[u8; 8]; 16] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0 (Custom Patch)
+    [0x71, 0x61, 0x1E, 0x17, 0xD0, 0x78, 0x00, 0x17], // 1 Violin
+    [0x13, 0x41, 0x1A, 0x0D, 0xD8, 0xF7, 0x23, 0x13], // 2 Guitar
+    [0x13, 0x01, 0x99, 0x00, 0xF2, 0xC4, 0x11, 0x23], // 3 Piano
+    [0x31, 0x61, 0x0E, 0x07, 0xA8, 0x64, 0x70, 0x27], // 4 Flute
+    [0x32, 0x21, 0x1E, 0x06, 0xE0, 0x76, 0x00, 0x28], // 5 Clarinet
+    [0x31, 0x22, 0x16, 0x05, 0xE0, 0x71, 0x00, 0x18], // 6 Oboe
+    [0x21, 0x61, 0x1D, 0x07, 0x82, 0x81, 0x10, 0x07], // 7 Trumpet
+    [0x23, 0x21, 0x2D, 0x14, 0xA2, 0x72, 0x00, 0x07], // 8 Organ
+    [0x61, 0x61, 0x1B, 0x06, 0x64, 0x65, 0x10, 0x17], // 9 Horn
+    [0x41, 0x61, 0x0B, 0x18, 0x85, 0xF7, 0x71, 0x07], // A Synthesizer
+    [0x13, 0x01, 0x83, 0x11, 0xFA, 0xE4, 0x10, 0x04], // B Harpsichord
+    [0x17, 0xC1, 0x24, 0x07, 0xF8, 0xF8, 0x22, 0x12], // C Vibraphone
+    [0x61, 0x50, 0x0C, 0x05, 0xC2, 0xF5, 0x20, 0x42], // D Synthesizer Bass
+    [0x01, 0x01, 0x55, 0x03, 0xC9, 0x95, 0x03, 0x02], // E Acoustic Bass
+    [0x61, 0x41, 0x89, 0x03, 0xF1, 0xE4, 0x40, 0x13], // F Electric Guitar
+];
+
 /// Decoded 2-operator patch parameters per the §"Custom Patch"
 /// table in `docs/audio/nsf/vrc7-audio-wiki.html`. The patch defines
 /// one modulator + one carrier; bytes `$00`/`$04`/`$06` describe the
@@ -1701,6 +1732,21 @@ pub struct Vrc7 {
     /// while this bit is set." Default false (BIOS starts the chip
     /// in the unreset state).
     pub audio_reset_held: bool,
+    /// NSFe `VRC7` chunk device selector — `true` when the chunk named
+    /// device variant `1` (YM2413), which swaps the default instrument
+    /// ROM to [`YM2413_INSTRUMENT_ROM`] per
+    /// `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7 ("an appropriate
+    /// default patch set should be used for the selected device").
+    pub ym2413_variant: bool,
+    /// NSFe `VRC7` chunk replacement patch set: 16 patches × 8 bytes
+    /// in register format, overriding the built-in instrument ROM for
+    /// slots `1..=15` (slot 0 stays the live user patch — the spec
+    /// expects the table's first 8 bytes to be zero "since on the
+    /// VRC7 patch 0 is custom-only"). The optional 24 extra bytes of
+    /// the 152-byte form customise YM2413 rhythm instruments, which
+    /// the VRC7 cannot voice (no rhythm DAC), so they are not stored
+    /// here.
+    pub patch_override: Option<[[u8; 8]; 16]>,
     /// Built-in AM (tremolo) + VIB (vibrato) low-frequency
     /// oscillators. Per `docs/audio/nsf/vrc7-audio-wiki.html`
     /// §"Test Register $0F" the LFO phases advance once every 64
@@ -1728,6 +1774,8 @@ impl Default for Vrc7 {
             latched_output: 0,
             test_register: crate::opll::TestRegister::default(),
             audio_reset_held: false,
+            ym2413_variant: false,
+            patch_override: None,
             lfo: crate::opll::Lfo::default(),
         }
     }
@@ -1887,9 +1935,12 @@ impl Vrc7 {
 
     /// Return the decoded patch parameters for instrument slot
     /// `index`. Slot `0` reads from the user-programmable
-    /// `regs[0x00..=0x07]`; slots `1..=15` read from
-    /// [`VRC7_INSTRUMENT_ROM`]. Indices `>= 16` wrap modulo 16 (the
-    /// `$3X` instrument field is only 4 bits wide so this is a
+    /// `regs[0x00..=0x07]`; slots `1..=15` read from the NSFe `VRC7`
+    /// chunk's replacement patch set when one was supplied, otherwise
+    /// from the built-in ROM of the selected device variant
+    /// ([`VRC7_INSTRUMENT_ROM`], or [`YM2413_INSTRUMENT_ROM`] when
+    /// the chunk named device `1`). Indices `>= 16` wrap modulo 16
+    /// (the `$3X` instrument field is only 4 bits wide so this is a
     /// defensive default, never a real write).
     pub fn patch(&self, index: u8) -> Vrc7Patch {
         let i = (index as usize) & 0x0F;
@@ -1897,8 +1948,37 @@ impl Vrc7 {
             let mut b = [0u8; 8];
             b.copy_from_slice(&self.regs[0x00..0x08]);
             Vrc7Patch::from_bytes(&b)
+        } else if let Some(table) = &self.patch_override {
+            Vrc7Patch::from_bytes(&table[i])
+        } else if self.ym2413_variant {
+            Vrc7Patch::from_bytes(&YM2413_INSTRUMENT_ROM[i])
         } else {
             Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[i])
+        }
+    }
+
+    /// Apply an NSFe `VRC7` chunk to the chip per
+    /// `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7: byte 0 selects
+    /// the device variant ("0 = VRC7, 1 = YM2413" — the variant picks
+    /// the default instrument ROM), and the optional 128- or 152-byte
+    /// remainder is "a replacement patch set for the device" (16 × 8
+    /// register-format bytes; "The first 8 bytes of this patch set
+    /// are expected to be zero, since on the VRC7 patch 0 is
+    /// custom-only"). The 24 extra bytes of the 152-byte form are
+    /// YM2413 rhythm patches, "not accessible on VRC7" — the VRC7 has
+    /// no rhythm DAC, so they are accepted and ignored.
+    pub fn apply_nsfe_chunk(&mut self, device: u8, patches: Option<&[u8]>) {
+        self.ym2413_variant = device == 1;
+        if let Some(bytes) = patches {
+            if bytes.len() >= 128 {
+                let mut table = [[0u8; 8]; 16];
+                for (i, row) in table.iter_mut().enumerate() {
+                    row.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+                }
+                // Slot 0 stays live user-patch territory regardless of
+                // what the table carried; `patch()` never reads it.
+                self.patch_override = Some(table);
+            }
         }
     }
 
@@ -6113,6 +6193,79 @@ mod tests {
                 plain.latched_output, poked.latched_output,
                 "melody output unaffected by $0E"
             );
+        }
+    }
+
+    // ---------------- Round 386: NSFe VRC7 chunk application ----------------
+    //
+    // Spec source: `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7 —
+    // byte 0 selects the device ("0 = VRC7, 1 = YM2413"), "The next
+    // 128 or 152 bytes are optional, and contain a replacement patch
+    // set for the device", and "If a replacement patch set is not
+    // contained in this chunk, an appropriate default patch set
+    // should be used for the selected device." YM2413 default bytes
+    // from `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §2a.
+
+    #[test]
+    fn vrc7_nsfe_device_1_selects_the_ym2413_default_rom() {
+        let mut chip = Vrc7::new();
+        chip.apply_nsfe_chunk(1, None);
+        assert!(chip.ym2413_variant);
+        // Slot 1: YM2413 "Violin" vs VRC7 "Buzzy Bell" — different
+        // silicon, different bytes, different decode.
+        let got = chip.patch(1);
+        assert_eq!(got, Vrc7Patch::from_bytes(&YM2413_INSTRUMENT_ROM[1]));
+        assert_ne!(got, Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[1]));
+        // Device 0 restores the VRC7 ROM.
+        chip.apply_nsfe_chunk(0, None);
+        assert_eq!(
+            chip.patch(1),
+            Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[1])
+        );
+    }
+
+    #[test]
+    fn vrc7_nsfe_replacement_patch_set_overrides_the_rom() {
+        let mut chip = Vrc7::new();
+        // A distinctive replacement table: slot 2 carries the VRC7's
+        // own "Flute" bytes, everything else zero (slot 0 must be
+        // zero per spec).
+        let mut table = vec![0u8; 128];
+        table[2 * 8..2 * 8 + 8].copy_from_slice(&VRC7_INSTRUMENT_ROM[4]);
+        chip.apply_nsfe_chunk(0, Some(&table));
+        assert_eq!(
+            chip.patch(2),
+            Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[4]),
+            "slot 2 must decode the replacement bytes"
+        );
+        // Slot 0 still reads the live user-patch registers, not the
+        // table ("on the VRC7 patch 0 is custom-only").
+        chip.enabled = true;
+        vrc7_write_reg(&mut chip, 0x00, 0x21);
+        vrc7_write_reg(&mut chip, 0x01, 0x61);
+        let user = chip.patch(0);
+        assert_eq!(user.mod_mult, 0x01);
+        assert_eq!(user.car_mult, 0x01);
+        // A 152-byte table (with the trailing YM2413 rhythm bytes the
+        // VRC7 cannot voice) is accepted identically.
+        let mut long = vec![0u8; 152];
+        long[..128].copy_from_slice(&table);
+        let mut chip2 = Vrc7::new();
+        chip2.apply_nsfe_chunk(1, Some(&long));
+        assert_eq!(
+            chip2.patch(2),
+            Vrc7Patch::from_bytes(&VRC7_INSTRUMENT_ROM[4]),
+            "152-byte form: melody table applies, rhythm tail ignored"
+        );
+    }
+
+    #[test]
+    fn ym2413_rom_slot_zero_is_blank_user_placeholder() {
+        assert_eq!(YM2413_INSTRUMENT_ROM[0], [0u8; 8]);
+        // Every preset decodes through the standard 8-byte layout.
+        for row in &YM2413_INSTRUMENT_ROM[1..] {
+            let p = Vrc7Patch::from_bytes(row);
+            assert!(p.mod_mult <= 0x0F && p.car_mult <= 0x0F);
         }
     }
 }

@@ -67,6 +67,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelope speed-up from §"Frequency high ($4083)"), and release
   waits for a genuine carry into bit 18 before the position moves.
 
+- **NSFe `VRC7` chunk now reaches the synthesis path** per
+  `docs/audio/nsf/nsfe-nesdev-wiki.html` §VRC7. The chunk was decoded
+  and surfaced but never applied. Now: device variant `1` (YM2413)
+  swaps the default instrument ROM to the silicon-dumped YM2413 patch
+  set (new `YM2413_INSTRUMENT_ROM`, transcribed from
+  `docs/audio/nsf/opll-ym2413/opll-ym2413-tables.md` §2a — the
+  YM2413B debug-mode dump cross-checked against the FHB013 die-shot),
+  and a supplied 128-/152-byte replacement patch set overrides slots
+  `1..=15` outright ("If a replacement patch set is not contained in
+  this chunk, an appropriate default patch set should be used for
+  the selected device"). Slot 0 stays live user-patch territory
+  ("on the VRC7 patch 0 is custom-only") and the 152-byte form's
+  rhythm tail is accepted-but-inaudible (the VRC7 has no rhythm DAC).
+  4 new tests: device-1 ROM swap, replacement-table override +
+  slot-0 passthrough + 152-byte form, ROM sanity, and the
+  player-level chunk forwarding.
+
 - **N163 `$E000-$E7FF` Sound Enable register + full register
   windows** per `docs/audio/nsf/namco-163-audio-wiki.html`: bit 6
   "Disables sound if set" ("Sound is enabled on the 163 by writing a

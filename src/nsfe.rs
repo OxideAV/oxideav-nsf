@@ -76,8 +76,10 @@ pub struct NsfeRate {
 
 /// Decoded `VRC7` chunk — device selector plus an optional replacement
 /// patch table. The patch table is preserved verbatim (128 or 152
-/// bytes per spec); decoding the patches into operator parameters is
-/// blocked on the OPLL operator-internals docs gap (task #861).
+/// bytes per spec); the player feeds it to
+/// `expansion::Vrc7::apply_nsfe_chunk`, which overrides the built-in
+/// instrument ROM for slots 1..=15 (and swaps the default ROM to the
+/// silicon-dumped YM2413 set when `device == 1`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NsfeVrc7 {
     /// 0 = VRC7 native, 1 = YM2413.
