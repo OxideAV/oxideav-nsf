@@ -308,3 +308,47 @@ fn nsfe_structured_chunk_fuzz_never_panic() {
         let _ = drive(&buf);
     }
 }
+
+#[test]
+fn dma_heavy_programs_never_panic_or_hang() {
+    // Directed battery for the DMA stall paths: programs that hammer
+    // $4014 OAM DMA (each write steals a 513/514-cycle halt), churn
+    // the DMC on/off (load-DMA arming + armed-fetch cancellation), and
+    // run DPCM at the fastest rate so reload DMAs land inside OAM
+    // windows. All the stolen cycles count toward the render budget,
+    // so render() must still converge on every variant.
+    let variants: [&[u8]; 4] = [
+        // PLAY: STA $4014 in an infinite loop (non-returning PLAY).
+        &[0xA9, 0x02, 0x8D, 0x14, 0x40, 0x4C, 0x03, 0x80],
+        // PLAY: enable DMC, immediately disable (cancel armed fetch),
+        // re-enable, then OAM DMA, RTS.
+        &[
+            0xA9, 0x4F, 0x8D, 0x10, 0x40, // LDA #$4F / STA $4010 (loop, fastest)
+            0xA9, 0x10, 0x8D, 0x15, 0x40, // STA $4015 (DMC on)
+            0xA9, 0x00, 0x8D, 0x15, 0x40, // STA $4015 (DMC off — abort)
+            0xA9, 0x10, 0x8D, 0x15, 0x40, // STA $4015 (DMC on again)
+            0x8D, 0x14, 0x40, // STA $4014 (OAM DMA over live DPCM)
+            0x60,
+        ],
+        // PLAY: back-to-back OAM DMAs (both write parities exercised).
+        &[0x8D, 0x14, 0x40, 0x8D, 0x14, 0x40, 0x8D, 0x14, 0x40, 0x60],
+        // PLAY: read $4015 between OAM DMAs (status read on the
+        // stall-stretched clock).
+        &[0x8D, 0x14, 0x40, 0xAD, 0x15, 0x40, 0x8D, 0x14, 0x40, 0x60],
+    ];
+    for (i, play) in variants.iter().enumerate() {
+        let mut buf = vec![0u8; NSF_HEADER_LEN];
+        buf[..5].copy_from_slice(&NSF_MAGIC);
+        buf[0x05] = 0x01;
+        buf[0x06] = 0x01;
+        buf[0x07] = 0x01;
+        buf[0x08..0x0a].copy_from_slice(&0x8000u16.to_le_bytes());
+        buf[0x0a..0x0c].copy_from_slice(&0x8000u16.to_le_bytes());
+        buf[0x0c..0x0e].copy_from_slice(&0x8003u16.to_le_bytes());
+        buf[0x6e..0x70].copy_from_slice(&16666u16.to_le_bytes());
+        // INIT = SEI; CLD; RTS, PLAY at $8003.
+        buf.extend_from_slice(&[0x78, 0xD8, 0x60]);
+        buf.extend_from_slice(play);
+        assert!(drive(&buf), "variant {i} failed to parse+render");
+    }
+}

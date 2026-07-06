@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **DMA-heavy directed robustness battery** in `tests/parse_fuzz.rs`
+  (`dma_heavy_programs_never_panic_or_hang`): rips that loop `$4014`
+  OAM DMAs (non-returning PLAY included), churn the DMC on/off across
+  armed fetches, run OAM DMA over live fastest-rate DPCM, and read
+  `$4015` on the stall-stretched clock must all parse + render within
+  budget — pinning that the stolen DMA cycles count toward the render
+  budget and can never hang `render()`.
+
 - **End-to-end integration tests for the round's DMA/sweep work**
   (`tests/parse_header.rs`): a synthetic bottom-octave (`$420`) pulse
   rip renders silent with the sweep unconfigured and audibly (> 10×
