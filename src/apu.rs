@@ -717,6 +717,20 @@ impl DmcChannel {
         if !enable {
             self.bytes_remaining = 0;
             self.next_fetch_is_load = false;
+            // Cancel an armed-but-unserviced fetch: clearing $4015 D4
+            // zeroes bytes remaining, and the memory reader only
+            // fetches while "the sample buffer is in an empty state
+            // and bytes remaining is not zero"
+            // (docs/audio/nsf/apu-dmc-wiki.html §"Memory reader").
+            // apu-dma-wiki §Bugs concurs on the hardware outcome for a
+            // DMA already scheduled at the stop: it "is aborted after
+            // a single cycle" without performing its read, so the
+            // sample buffer must NOT be filled from a stale fetch —
+            // previously a caller draining the queue after the disable
+            // would fetch anyway and a later re-enable played one
+            // never-fetched byte. (The abort's 1-cycle stall itself
+            // needs sub-instruction stop timing and is not modelled.)
+            self.pending_fetch = false;
         } else if self.bytes_remaining == 0 {
             self.restart_sample();
             // apu-dma-wiki §"DMC DMA": "Load DMAs occur after $4015 D4
@@ -1867,6 +1881,38 @@ mod tests {
             stall2, DMC_DMA_RELOAD_STALL_CYCLES,
             "buffer-emptied refetch is a reload"
         );
+    }
+
+    #[test]
+    fn dmc_disable_cancels_pending_fetch() {
+        // §"Memory reader": fetches require "bytes remaining is not
+        // zero", and a $4015 D4 clear zeroes it — the hardware DMA
+        // scheduled at that point aborts without reading (apu-dma-wiki
+        // §Bugs). A stale armed fetch must not survive the disable and
+        // fill the sample buffer.
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x4010, 0x0F);
+        apu.write_register(0x4012, 0x00);
+        apu.write_register(0x4013, 0x00);
+        apu.write_status(0x10);
+        apu.tick_cpu_cycles(1);
+        assert!(apu.dmc_pending_fetch().is_some(), "fetch armed");
+        apu.write_status(0x00); // explicit stop
+        assert!(
+            apu.dmc_pending_fetch().is_none(),
+            "disable must cancel the armed fetch"
+        );
+        assert!(
+            !apu.dmc.sample_buffer_filled,
+            "no byte may reach the buffer from the aborted DMA"
+        );
+        // Re-enabling restarts the sample from its seed with a fresh
+        // load DMA.
+        apu.write_status(0x10);
+        apu.tick_cpu_cycles(1);
+        let (addr, stall) = apu.dmc_pending_fetch().expect("fresh load armed");
+        assert_eq!(addr, 0xC000);
+        assert_eq!(stall, DMC_DMA_LOAD_STALL_CYCLES);
     }
 
     #[test]

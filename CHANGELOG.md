@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CPU-time cost only). 2 new tests pin the 513/514 write-parity split
   and the exactly-one-refetch 2-cycle overlap window.
 
+### Fixed
+
+- **`$4015` D4 clear now cancels an armed-but-unserviced DMC fetch.**
+  §"Memory reader" only fetches while "bytes remaining is not zero"
+  (which the disable zeroes), and apu-dma-wiki §Bugs concurs a DMA
+  scheduled at the stop "is aborted after a single cycle" without
+  performing its read. Previously a caller draining the fetch queue
+  after the disable still fetched and filled the sample buffer, so a
+  later re-enable played one byte hardware never read. The abort's
+  own 1-cycle stall needs sub-instruction stop timing and remains
+  unmodelled. New `dmc_disable_cancels_pending_fetch` test also pins
+  the fresh post-re-enable load DMA.
+
 ### Changed
 
 - **DMC DMA stalls now follow the DMA page's load/reload get-put
