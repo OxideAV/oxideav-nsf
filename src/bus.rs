@@ -612,12 +612,12 @@ impl NesBus {
             self.apu.tick_cpu_cycles(n);
             self.nsf2_timer.tick(n);
             // Drain pending DMC fetches; each one halts the CPU for
-            // DMC_DMA_STALL_CYCLES while the rest of the machine runs
-            // on.
-            while let Some(addr) = self.apu.dmc_pending_fetch() {
+            // its DMA type's cycle count (3-cycle load / 4-cycle
+            // reload, per docs/audio/nsf/apu-dma-wiki.html §"DMC DMA")
+            // while the rest of the machine runs on.
+            while let Some((addr, stall)) = self.apu.dmc_pending_fetch() {
                 let byte = self.read(addr);
                 self.apu.dmc_supply_byte(byte);
-                let stall = crate::apu::DMC_DMA_STALL_CYCLES;
                 self.pending_dmc_stall = self.pending_dmc_stall.saturating_add(stall);
                 self.cycles = self.cycles.wrapping_add(stall as u64);
                 self.apu.tick_cpu_cycles(stall);
@@ -981,9 +981,10 @@ mod tests {
     #[test]
     fn dmc_dma_fetch_stalls_are_accounted() {
         // §"Memory reader" of the DMC doc: every sample-byte fetch
-        // stalls the CPU. The bus accrues DMC_DMA_STALL_CYCLES per
-        // fetch, keeps the APU running through the stall, and drains
-        // the total via take_dmc_stall().
+        // stalls the CPU. The bus accrues the per-DMA-type stall (a
+        // 3-cycle load DMA for the post-$4015 fetch, 4-cycle reload
+        // DMAs after — apu-dma-wiki §"DMC DMA"), keeps the APU running
+        // through the stall, and drains the total via take_dmc_stall().
         let mut bus = NesBus::new();
         bus.write(0x4010, 0x4F); // loop flag, fastest rate (54 cy/bit)
         bus.write(0x4012, 0x00); // sample address $C000
@@ -993,17 +994,24 @@ mod tests {
         bus.tick_cycles(1);
         assert_eq!(
             bus.take_dmc_stall(),
-            crate::apu::DMC_DMA_STALL_CYCLES,
-            "first byte fetch must stall the CPU"
+            crate::apu::DMC_DMA_LOAD_STALL_CYCLES,
+            "the post-$4015 fetch is a 3-cycle load DMA"
         );
         assert_eq!(bus.take_dmc_stall(), 0, "stall drains on take");
         // A looping 1-byte sample re-fetches once per 8-bit output
-        // cycle (8 × 54 CPU cycles at rate $F). Four cycles' worth of
-        // ticking must accrue at least three more fetch stalls.
+        // cycle (8 × 54 CPU cycles at rate $F); each refetch is a
+        // 4-cycle reload DMA. Four output cycles' worth of ticking
+        // must accrue at least three more fetch stalls, all reloads.
         bus.tick_cycles(54 * 8 * 4);
+        let stall = bus.take_dmc_stall();
         assert!(
-            bus.take_dmc_stall() >= 3 * crate::apu::DMC_DMA_STALL_CYCLES,
-            "looping sample must keep accruing fetch stalls"
+            stall >= 3 * crate::apu::DMC_DMA_RELOAD_STALL_CYCLES,
+            "looping sample must keep accruing reload stalls (got {stall})"
+        );
+        assert_eq!(
+            stall % crate::apu::DMC_DMA_RELOAD_STALL_CYCLES,
+            0,
+            "every buffer-emptied refetch is a reload DMA"
         );
     }
 

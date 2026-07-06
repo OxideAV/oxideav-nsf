@@ -2048,8 +2048,8 @@ mod tests {
         let cy = cpu.step(&mut bus);
         assert_eq!(
             cy,
-            2 + crate::apu::DMC_DMA_STALL_CYCLES,
-            "NOP (2 cycles) + the first DMC fetch stall"
+            2 + crate::apu::DMC_DMA_LOAD_STALL_CYCLES,
+            "NOP (2 cycles) + the first DMC fetch's 3-cycle load-DMA stall"
         );
         // With the buffer full, the next instruction runs unstalled.
         bus.ram[0x0201] = 0xEA;

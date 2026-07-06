@@ -526,15 +526,46 @@ impl NoiseChannel {
     }
 }
 
-/// CPU cycles the DMC's memory reader steals from the CPU per sample
-/// byte fetched. `docs/audio/nsf/apu-dmc-wiki.html` §"Memory reader":
-/// "The CPU is stalled for 1-4 CPU cycles to read a sample byte. The
-/// exact cycle count depends on many factors and is described in
-/// detail in the DMA article." We account the full 4-cycle halt for
-/// every fetch — the top of the documented range. DOCS-GAP: the DMA
-/// article with the per-alignment 1/2/3-cycle special cases is not
-/// staged under `docs/audio/nsf/`, so the shorter cases cannot be
-/// modelled yet; the constant keeps the refinement a one-line edit.
+/// CPU cycles a **"load" DMC DMA** steals from the CPU — the first
+/// fetch after a `$4015` D4 write with the sample buffer empty.
+///
+/// `docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA": load DMAs "are
+/// scheduled to halt the CPU on a get cycle during the 2nd APU cycle
+/// after the write", and DMC DMA "performs a halt cycle, a dummy
+/// cycle, an optional alignment cycle, and a get". With the halt
+/// landing on a get cycle, the dummy occupies the put half and the
+/// sample read lands on the very next get — no alignment cycle is
+/// needed, so "load DMAs take 3 cycles".
+///
+/// The §Behavior write-cycle halt delays ("Delays of up to 3 cycles
+/// are possible, with read-modify-write instructions having 2
+/// consecutive writes and interrupts having 3") — which flip the halt
+/// parity when odd and toggle the 3/4 count — are not modelled: the
+/// 6502 core here executes instructions atomically, so each DMA
+/// accounts the cycle count of its documented scheduled parity.
+pub const DMC_DMA_LOAD_STALL_CYCLES: u32 = 3;
+
+/// CPU cycles a **"reload" DMC DMA** steals from the CPU — every fetch
+/// triggered by the sample buffer emptying at the end of an output
+/// cycle.
+///
+/// `docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA": reload DMAs "are
+/// scheduled to halt the CPU on a put cycle", so the halt occupies a
+/// put, the dummy the following get, an alignment cycle the next put,
+/// and the sample read the get after that — "reload DMAs take 4"
+/// cycles. See [`DMC_DMA_LOAD_STALL_CYCLES`] for the un-modelled
+/// write-delay parity flips.
+pub const DMC_DMA_RELOAD_STALL_CYCLES: u32 = 4;
+
+/// Historical flat per-fetch stall estimate from
+/// `docs/audio/nsf/apu-dmc-wiki.html` §"Memory reader" ("The CPU is
+/// stalled for 1-4 CPU cycles to read a sample byte"), used while the
+/// DMA article was not yet staged. The article now is, and the live
+/// path accounts [`DMC_DMA_LOAD_STALL_CYCLES`] /
+/// [`DMC_DMA_RELOAD_STALL_CYCLES`] per fetch type instead.
+#[deprecated(
+    note = "the DMA page is staged; use DMC_DMA_LOAD_STALL_CYCLES / DMC_DMA_RELOAD_STALL_CYCLES"
+)]
 pub const DMC_DMA_STALL_CYCLES: u32 = 4;
 
 /// DMC rate table (NTSC). Each entry is the number of CPU cycles per
@@ -552,7 +583,8 @@ const DMC_RATE_PAL: [u16; 16] = [
 ///
 /// nesdev.org/wiki/APU_DMC: a 1-bit delta sample stream that drives a
 /// 7-bit DAC. Sample bytes are fetched from main memory through the
-/// CPU bus, stalling the CPU per fetch (see `DMC_DMA_STALL_CYCLES`).
+/// CPU bus, stalling the CPU per fetch (see
+/// [`DMC_DMA_LOAD_STALL_CYCLES`] / [`DMC_DMA_RELOAD_STALL_CYCLES`]).
 struct DmcChannel {
     enabled: bool,
     irq_enable: bool,
@@ -581,6 +613,15 @@ struct DmcChannel {
     /// after each `tick_cpu_cycles` chunk.
     pending_fetch: bool,
     pending_fetch_addr: u16,
+    /// True when the *next* fetch to arm is a "load" DMA — i.e. it was
+    /// initiated by a `$4015` D4 write with the sample buffer empty,
+    /// rather than by the buffer emptying at the end of an output
+    /// cycle. Load and reload DMAs halt the CPU on opposite get/put
+    /// parities and so steal different cycle counts
+    /// (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA").
+    next_fetch_is_load: bool,
+    /// Captured [`Self::next_fetch_is_load`] for the armed fetch.
+    pending_fetch_is_load: bool,
 
     /// DMC interrupt flag. Set when the bytes-remaining counter hits
     /// zero with the `$4010` IRQ-enable bit set; cleared by a `$4015`
@@ -629,6 +670,8 @@ impl DmcChannel {
             timer_period: 0,
             pending_fetch: false,
             pending_fetch_addr: 0,
+            next_fetch_is_load: false,
+            pending_fetch_is_load: false,
             irq_flag: false,
         }
     }
@@ -673,8 +716,16 @@ impl DmcChannel {
         self.enabled = enable;
         if !enable {
             self.bytes_remaining = 0;
+            self.next_fetch_is_load = false;
         } else if self.bytes_remaining == 0 {
             self.restart_sample();
+            // apu-dma-wiki §"DMC DMA": "Load DMAs occur after $4015 D4
+            // is set, but only if the sample buffer is empty." The
+            // fetch this write starts is the 3-cycle load DMA; every
+            // buffer-emptied refetch after it is a 4-cycle reload.
+            if !self.sample_buffer_filled && !self.pending_fetch {
+                self.next_fetch_is_load = true;
+            }
         }
     }
 
@@ -684,6 +735,8 @@ impl DmcChannel {
         if !self.sample_buffer_filled && self.bytes_remaining > 0 && !self.pending_fetch {
             self.pending_fetch = true;
             self.pending_fetch_addr = self.current_addr;
+            self.pending_fetch_is_load = self.next_fetch_is_load;
+            self.next_fetch_is_load = false;
         }
         // Output unit: counts down `timer_period` then shifts a bit out.
         if self.timer == 0 {
@@ -719,10 +772,18 @@ impl DmcChannel {
         }
     }
 
-    /// Bus calls this to surface a pending fetch address to the CPU bus.
-    fn pending_fetch(&self) -> Option<u16> {
+    /// Bus calls this to surface a pending fetch to the CPU bus:
+    /// the sample address plus the CPU cycles the DMA halt steals
+    /// (3 for a load DMA, 4 for a reload DMA — see
+    /// [`DMC_DMA_LOAD_STALL_CYCLES`] / [`DMC_DMA_RELOAD_STALL_CYCLES`]).
+    fn pending_fetch(&self) -> Option<(u16, u32)> {
         if self.pending_fetch {
-            Some(self.pending_fetch_addr)
+            let stall = if self.pending_fetch_is_load {
+                DMC_DMA_LOAD_STALL_CYCLES
+            } else {
+                DMC_DMA_RELOAD_STALL_CYCLES
+            };
+            Some((self.pending_fetch_addr, stall))
         } else {
             None
         }
@@ -978,8 +1039,13 @@ impl Apu2A03 {
         self.expansion.observe_prg_read(addr, byte);
     }
 
-    /// Bus pulls this every tick to see if a DMC sample byte is needed.
-    pub fn dmc_pending_fetch(&self) -> Option<u16> {
+    /// Bus pulls this every tick to see if a DMC sample byte is
+    /// needed. Returns the fetch address and the CPU cycles the DMA
+    /// steals for this fetch: [`DMC_DMA_LOAD_STALL_CYCLES`] for the
+    /// post-`$4015` "load" DMA, [`DMC_DMA_RELOAD_STALL_CYCLES`] for a
+    /// buffer-emptied "reload" DMA
+    /// (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA").
+    pub fn dmc_pending_fetch(&self) -> Option<(u16, u32)> {
         self.dmc.pending_fetch()
     }
 
@@ -1765,13 +1831,69 @@ mod tests {
             apu.tick_cpu_cycles(1);
         }
         let pending = apu.dmc_pending_fetch();
-        assert_eq!(pending, Some(0xC000));
+        assert_eq!(pending, Some((0xC000, DMC_DMA_LOAD_STALL_CYCLES)));
         apu.dmc_supply_byte(0xAB);
         // Address advances; bytes remaining decrements.
         assert_eq!(apu.dmc.current_addr, 0xC001);
         assert_eq!(apu.dmc.bytes_remaining, 16);
         assert!(apu.dmc.sample_buffer_filled);
         assert!(apu.dmc_pending_fetch().is_none());
+    }
+
+    #[test]
+    fn dmc_dma_load_then_reload_stall_cycles() {
+        // apu-dma-wiki §"DMC DMA": "load DMAs take 3 cycles and reload
+        // DMAs take 4" — the post-$4015 fetch halts on a get cycle
+        // (halt + dummy + read), while a buffer-emptied refetch halts
+        // on a put cycle and needs the extra alignment cycle.
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x4010, 0x4F); // loop, fastest rate (54 cy/bit)
+        apu.write_register(0x4012, 0x00); // address = $C000
+        apu.write_register(0x4013, 0x00); // 1-byte sample
+        apu.write_status(0x10); // enable DMC → the load DMA
+        apu.tick_cpu_cycles(1);
+        let (addr, stall) = apu.dmc_pending_fetch().expect("load fetch armed");
+        assert_eq!(addr, 0xC000);
+        assert_eq!(
+            stall, DMC_DMA_LOAD_STALL_CYCLES,
+            "post-$4015 fetch is a load"
+        );
+        apu.dmc_supply_byte(0xAA);
+        // Run a full 8-bit output cycle so the buffer drains into the
+        // shift register; the looping sample then arms a refetch.
+        apu.tick_cpu_cycles(54 * 8 + 16);
+        let (_, stall2) = apu.dmc_pending_fetch().expect("reload fetch armed");
+        assert_eq!(
+            stall2, DMC_DMA_RELOAD_STALL_CYCLES,
+            "buffer-emptied refetch is a reload"
+        );
+    }
+
+    #[test]
+    fn dmc_reenable_after_sample_end_is_a_load_dma() {
+        // A non-looping sample ends; re-setting $4015 D4 restarts it,
+        // and that restart fetch is again a 3-cycle load DMA per
+        // apu-dma-wiki §"DMC DMA" ("Load DMAs occur after $4015 D4 is
+        // set, but only if the sample buffer is empty").
+        let mut apu = Apu2A03::new();
+        apu.write_register(0x4010, 0x0F); // no loop, fastest rate
+        apu.write_register(0x4012, 0x00);
+        apu.write_register(0x4013, 0x00); // 1-byte sample
+        apu.write_status(0x10);
+        apu.tick_cpu_cycles(1);
+        let (_, stall) = apu.dmc_pending_fetch().expect("first load armed");
+        assert_eq!(stall, DMC_DMA_LOAD_STALL_CYCLES);
+        apu.dmc_supply_byte(0x55);
+        // Drain the byte fully (8 bits + the following empty cycle).
+        apu.tick_cpu_cycles(54 * 16 + 32);
+        assert!(
+            apu.dmc_pending_fetch().is_none(),
+            "sample ended, no refetch"
+        );
+        apu.write_status(0x10); // restart
+        apu.tick_cpu_cycles(1);
+        let (_, stall2) = apu.dmc_pending_fetch().expect("restart load armed");
+        assert_eq!(stall2, DMC_DMA_LOAD_STALL_CYCLES, "restart fetch is a load");
     }
 
     #[test]

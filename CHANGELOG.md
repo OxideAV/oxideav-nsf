@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **DMC DMA stalls now follow the DMA page's load/reload get-put
+  cadence** (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA"), closing
+  the README's flat-4-cycle DOCS-GAP now that the DMA article is
+  staged. The post-`$4015` **"load" DMA** is "scheduled to halt the
+  CPU on a get cycle during the 2nd APU cycle after the write" — halt
+  (get) + dummy (put) + sample read (get) — and steals **3** CPU
+  cycles; every buffer-emptied **"reload" DMA** is "scheduled to halt
+  the CPU on a put cycle" and needs the extra alignment cycle before
+  its get, stealing **4**. `Apu2A03::dmc_pending_fetch` now returns
+  `(addr, stall_cycles)` and the bus accrues the per-fetch amount;
+  `DMC_DMA_STALL_CYCLES` is deprecated in favour of
+  `DMC_DMA_LOAD_STALL_CYCLES` / `DMC_DMA_RELOAD_STALL_CYCLES`. A
+  DPCM-heavy tune previously overcharged every sample-start fetch by
+  one CPU cycle. Not modelled (documented): the §Behavior write-cycle
+  halt delays (the 6502 core here is instruction-atomic), the
+  stop-timing aborted/unexpected-DMA bugs, and OAM-DMA overlap. 2 new
+  tests pin load-then-reload and the restart-is-a-load rule; the bus
+  test now asserts the 3-cycle first fetch and reload-multiple totals.
+
 ### Fixed
 
 - **Pulse sweep unit rebuilt against the newly-staged dedicated sweep

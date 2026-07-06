@@ -73,9 +73,12 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   * `$4015` honours the documented IRQ-flag contract: a **write**
     clears the DMC interrupt flag; a **read** clears the frame
     interrupt flag but *not* the DMC flag.
-  * **DMC DMA steals CPU time**: every sample-byte fetch stalls the
-    CPU (accounted at 4 cycles, the top of the documented 1–4 range)
-    while the APU runs on, so PLAY cadence tracks the DMA-stretched
+  * **DMC DMA steals CPU time per the DMA page's get/put cadence**:
+    the post-`$4015` "load" DMA (scheduled to halt on a get cycle)
+    steals 3 CPU cycles — halt + dummy + sample read — while every
+    buffer-emptied "reload" DMA (scheduled to halt on a put cycle)
+    steals 4, the extra being the documented alignment cycle. The APU
+    runs on through the stall, so PLAY cadence tracks the DMA-stretched
     wall clock; the DMC output unit powers up silent, keeping `$4011`
     direct-load PCM levels rock-steady until a sample actually plays.
 
@@ -192,9 +195,13 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * The 2A03 frame counter + channel timers are now cycle-exact, but
   the *expansion chips'* internal envelope/LFO timers still step in
   CPU-cycle batches — adequate for music, not cycle-exact.
-* DMC DMA stalls are accounted at a flat 4 CPU cycles; the documented
-  1/2/3-cycle per-alignment special cases live in the wiki's DMA
-  article, which is not staged under `docs/audio/nsf/`.
+* DMC DMA stalls account each fetch at its scheduled parity's cycle
+  count (3-cycle load / 4-cycle reload). The DMA page's write-cycle
+  halt delays (up to 3 cycles on RMW stores / interrupts, which flip
+  the halt parity when odd and toggle the 3/4 count) are not modelled
+  because the 6502 core executes instructions atomically; the
+  aborted-DMA / unexpected-DMA stop bugs and OAM-DMA overlap need the
+  same sub-instruction bus timing.
 * OPLL envelope *attack*: the live **Attack** path is now §7-driven —
   its transition *timing* uses the silicon-measured global-counter
   `eg_shift`/`eg_select` duty (the same model as decay) and each step
