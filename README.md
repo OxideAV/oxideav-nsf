@@ -61,6 +61,15 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     CPU batch is split at the next scheduled event, so sweep rewrites
     and counter expiries land cycle-exactly regardless of how the CPU
     chunks its cycles.
+  * The **pulse sweep units** follow the dedicated sweep page: the
+    target period is computed continuously (pulse 1 ones'-complement /
+    pulse 2 two's-complement negate, negative sums clamped to zero),
+    and the `period < 8` / `target > $7FF` mutes apply even while the
+    sweep unit is disabled — including the shift-count-zero add-mode
+    case that silences the pulse bottom octave on real hardware
+    (a `$08` negate write lifts it, exactly as the page prescribes).
+    While muting blocks a period update, the divider still counts and
+    reloads as normal.
   * `$4015` honours the documented IRQ-flag contract: a **write**
     clears the DMC interrupt flag; a **read** clears the frame
     interrupt flag but *not* the DMC flag.
@@ -186,11 +195,6 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * DMC DMA stalls are accounted at a flat 4 CPU cycles; the documented
   1/2/3-cycle per-alignment special cases live in the wiki's DMA
   article, which is not staged under `docs/audio/nsf/`.
-* The dedicated APU Sweep page is not staged (the pulse page only
-  says "overflow from the sweep unit's adder is silencing the
-  channel"), so the shift-count-zero adder-mute semantics rest on the
-  §"Sequencer behavior" frequency-range reading documented in
-  `PulseChannel::sweep_mutes`.
 * OPLL envelope *attack*: the live **Attack** path is now §7-driven —
   its transition *timing* uses the silicon-measured global-counter
   `eg_shift`/`eg_select` duty (the same model as decay) and each step

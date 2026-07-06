@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pulse sweep unit rebuilt against the newly-staged dedicated sweep
+  page** (`docs/audio/nsf/apu-sweep-wiki.html`), closing the README's
+  named sweep docs gap. Three corrections:
+  * **Shift-count-zero adder muting is unconditional** — §Muting:
+    "Muting happens regardless of whether the sweep unit is disabled
+    (because either the Enabled flag or the Shift count are zero) and
+    regardless of whether the sweep divider is outputting a clock
+    signal." With negate false and shift 0 the change amount equals
+    the current period, so any period ≥ `$400` targets > `$7FF` and
+    mutes — the doc's "why several publishers' NES games never seem
+    to use the bottom octave of the pulse waves". This reverses the
+    earlier shift-zero carve-out, which predated the dedicated page
+    being staged and rested on a frequency-range reading of the pulse
+    page; the documented way to play the bottom octave is the `$08`
+    negate write ("to fully disable the sweep unit, a program must
+    additionally turn on the Negate flag"), which now works.
+  * **Negative target sums clamp to zero** — §"Calculating the target
+    period": the target is "clamped to zero if this sum is negative".
+    The old two's-complement wrap could push a small negated period to
+    a huge value and falsely trip the > `$7FF` mute.
+  * The pulse 1 ones'-complement (−c − 1) vs pulse 2 two's-complement
+    (−c) negate wiring and the while-muting divider behaviour ("the
+    pulse's period remains unchanged, but the sweep unit's divider
+    continues to count down and reload […] as normal") are now pinned
+    by tests.
+  5 new/rewritten tests: bottom-octave mute + `$3FF` boundary, the
+  `$08` full-disable write, the zero clamp, the per-channel negate
+  carry, and the muting-divider cadence.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.3...v0.0.4) - 2026-07-03
 
 ### Other

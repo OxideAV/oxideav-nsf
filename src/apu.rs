@@ -229,34 +229,62 @@ impl PulseChannel {
         self.length.clock();
     }
 
+    /// The sweep unit's continuously-computed target period, per
+    /// `docs/audio/nsf/apu-sweep-wiki.html` §"Calculating the target
+    /// period": a barrel shifter shifts the 11-bit raw timer period
+    /// right by the shift count to produce the change amount; the
+    /// negate flag makes the change amount negative; and "The target
+    /// period is the sum of the current period and the change amount,
+    /// clamped to zero if this sum is negative."
+    ///
+    /// "The two pulse channels have their adders' carry inputs wired
+    /// differently": pulse 1 adds the ones' complement (−c − 1, so
+    /// making 20 negative produces −21), pulse 2 the two's complement
+    /// (−c).
     fn target_period(&self) -> u16 {
-        let shifted = self.timer_period >> self.sweep_shift;
+        let change = (self.timer_period >> self.sweep_shift) as i32;
         if self.sweep_negate {
-            // Pulse 1: -shifted - 1; Pulse 2: -shifted.
             let bias = if self.is_pulse_two { 0 } else { 1 };
-            self.timer_period.wrapping_sub(shifted).wrapping_sub(bias)
+            (self.timer_period as i32 - change - bias).max(0) as u16
         } else {
-            self.timer_period.wrapping_add(shifted)
+            // Period ≤ 0x7FF and change ≤ period, so no u16 overflow.
+            self.timer_period + change as u16
         }
     }
 
-    /// The sweep unit silences the channel when its current timer period
-    /// is below 8 or the sweep adder's target overflows the 11-bit range
-    /// (docs/audio/nsf/apu-pulse-wiki.html §"Pulse channel output to
-    /// mixer": "the timer has a value less than eight" and "overflow
-    /// from the sweep unit's adder is silencing the channel").
+    /// Sweep-unit muting, per `docs/audio/nsf/apu-sweep-wiki.html`
+    /// §"Muting": "If the current period is less than 8" or "If at any
+    /// time the target period is greater than $7FF, the sweep unit
+    /// mutes the channel."
     ///
-    /// The adder-overflow half only applies when the sweep shift count
-    /// is non-zero: with a zero shift the adder produces no change
-    /// amount, so it can never push a legitimately-low note's period
-    /// out of range. (Without this guard a pulse that never configures a
-    /// sweep — leaving shift at 0 — would mute every period above 0x3FF
-    /// in add mode, silencing audible bass notes the §"Sequencer
-    /// behavior" frequency range says should play.)
+    /// "Muting happens regardless of whether the sweep unit is
+    /// disabled (because either the Enabled flag or the Shift count
+    /// are zero) and regardless of whether the sweep divider is
+    /// outputting a clock signal." In particular, with the negate flag
+    /// false and the shift count zero the change amount equals the
+    /// current period, so any period ≥ $400 targets > $7FF and mutes —
+    /// the doc's "why several publishers' NES games never seem to use
+    /// the bottom octave of the pulse waves". To fully disable the
+    /// sweep unit a program must turn on the negate flag (e.g. write
+    /// $08), which keeps the target at or below the current period.
+    ///
+    /// (This deliberately reverses an earlier shift-count-zero
+    /// carve-out that predated the dedicated sweep page being staged —
+    /// the page pins the mute as unconditional.)
     fn sweep_mutes(&self) -> bool {
-        self.timer_period < 8 || (self.sweep_shift > 0 && self.target_period() > 0x07FF)
+        self.timer_period < 8 || self.target_period() > 0x07FF
     }
 
+    /// Half-frame sweep clock, per `docs/audio/nsf/apu-sweep-wiki.html`
+    /// §"Updating the period": when the divider's counter is zero, the
+    /// sweep is enabled, the shift count is nonzero ("If SSS is 0, then
+    /// behaves like E=0") and the unit is not muting, the period is set
+    /// to the target; while muting "the pulse's period remains
+    /// unchanged, but the sweep unit's divider continues to count down
+    /// and reload the divider's period as normal". Then "If the
+    /// divider's counter is zero or the reload flag is true: The
+    /// divider counter is set to P and the reload flag is cleared.
+    /// Otherwise, the divider counter is decremented."
     fn clock_sweep(&mut self) {
         let target = self.target_period();
         if self.sweep_divider == 0
@@ -1346,20 +1374,32 @@ mod tests {
     }
 
     #[test]
-    fn pulse_low_note_plays_without_sweep_configured() {
-        // A pulse with a large period (low bass note) and no sweep set
-        // up (shift 0) must NOT be silenced by the sweep adder. Period
-        // 0x500 is well inside the audible range per the §"Sequencer
-        // behavior" frequency formula.
+    fn pulse_bottom_octave_mutes_with_sweep_unconfigured() {
+        // apu-sweep-wiki §Muting: "Muting happens regardless of whether
+        // the sweep unit is disabled (because either the Enabled flag
+        // or the Shift count are zero)". With negate false and shift 0
+        // the change amount equals the current period, so any period
+        // ≥ $400 targets > $7FF and mutes — "why several publishers'
+        // NES games never seem to use the bottom octave of the pulse
+        // waves".
         let mut p = PulseChannel::new(false);
         p.enabled = true;
         p.write_main(0xBF); // duty 50%, halt, constant vol 15
         p.write_period_lo(0x00);
         p.write_period_hi(0x05); // timer_period = 0x500, length loaded
         p.length.counter = 10;
-        // sweep never configured → shift 0.
-        assert!(!p.sweep_mutes(), "low note wrongly muted by sweep adder");
-        // Drive the duty into a high slot and confirm non-zero output.
+        // Sweep never configured → E=0, shift 0, negate false.
+        assert!(p.sweep_mutes(), "period ≥ $400 must mute with negate false");
+        for _ in 0..0x4000 {
+            p.tick_timer(1);
+            assert_eq!(p.output(), 0, "muted channel must send 0 to the mixer");
+        }
+        // Just below the boundary the target (2 × period) stays ≤ $7FF
+        // and the note plays.
+        p.write_period_lo(0xFF);
+        p.write_period_hi(0x03); // timer_period = 0x3FF → target 0x7FE
+        p.length.counter = 10;
+        assert!(!p.sweep_mutes(), "period $3FF must not mute");
         let mut saw = false;
         for _ in 0..0x4000 {
             p.tick_timer(1);
@@ -1368,7 +1408,65 @@ mod tests {
                 break;
             }
         }
-        assert!(saw, "low-period pulse produced no output");
+        assert!(saw, "period-$3FF pulse produced no output");
+    }
+
+    #[test]
+    fn pulse_write_08_fully_disables_sweep_muting() {
+        // apu-sweep-wiki §Muting: "to fully disable the sweep unit, a
+        // program must additionally turn on the Negate flag, such as by
+        // writing $08. This ensures that the target period is not
+        // greater than the current period and therefore not greater
+        // than $7FF." The bottom octave becomes playable again.
+        let mut p = PulseChannel::new(false);
+        p.enabled = true;
+        p.write_main(0xBF);
+        p.write_period_lo(0x00);
+        p.write_period_hi(0x05); // timer_period = 0x500
+        p.length.counter = 10;
+        assert!(p.sweep_mutes(), "sanity: mutes before the $08 write");
+        p.write_sweep(0x08); // negate on, E=0, shift 0
+        assert!(!p.sweep_mutes(), "$08 write must lift the adder mute");
+        let mut saw = false;
+        for _ in 0..0x8000 {
+            p.tick_timer(1);
+            if p.output() > 0 {
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "negate-disabled low pulse produced no output");
+    }
+
+    #[test]
+    fn pulse_negative_target_clamps_to_zero() {
+        // apu-sweep-wiki §"Calculating the target period": the target
+        // is "clamped to zero if this sum is negative". Pulse 1 with
+        // period 20, negate, shift 0 computes 20 + (−21) = −1 → 0, not
+        // a wrapped huge value (which would falsely trip the > $7FF
+        // mute).
+        let mut p = PulseChannel::new(false);
+        p.write_period_lo(20);
+        p.write_sweep(0x08); // negate, shift 0
+        assert_eq!(p.target_period(), 0);
+        assert!(!p.sweep_mutes(), "clamped target must not mute");
+    }
+
+    #[test]
+    fn pulse_negate_carry_differs_between_channels() {
+        // apu-sweep-wiki §"Calculating the target period": "Pulse 1
+        // adds the ones' complement (−c − 1). Making 20 negative
+        // produces a change amount of −21. Pulse 2 adds the two's
+        // complement (−c). Making 20 negative produces a change amount
+        // of −20." Period 40, shift 1 → change 20.
+        let mut p1 = PulseChannel::new(false);
+        p1.write_period_lo(40);
+        p1.write_sweep(0x09); // negate, shift 1
+        assert_eq!(p1.target_period(), 40 - 21);
+        let mut p2 = PulseChannel::new(true);
+        p2.write_period_lo(40);
+        p2.write_sweep(0x09);
+        assert_eq!(p2.target_period(), 40 - 20);
     }
 
     #[test]
@@ -1383,6 +1481,33 @@ mod tests {
         p.write_sweep(0x01); // shift 1, add mode → target = 0x700 + 0x380 > 0x7FF
         assert!(p.sweep_mutes(), "sweep overflow should mute");
         assert_eq!(p.output(), 0);
+    }
+
+    #[test]
+    fn sweep_divider_keeps_counting_while_muting() {
+        // apu-sweep-wiki §"Updating the period": while the sweep unit
+        // is muting "the pulse's period remains unchanged, but the
+        // sweep unit's divider continues to count down and reload the
+        // divider's period as normal".
+        let mut p = PulseChannel::new(false);
+        p.enabled = true;
+        p.length.counter = 10;
+        p.write_period_lo(0x00);
+        p.write_period_hi(0x06); // timer_period = 0x600
+        p.write_sweep(0xA1); // E=1, P=2, add mode, shift 1 → target > $7FF
+        assert!(p.sweep_mutes());
+        // First clock consumes the reload; divider = P.
+        p.clock_sweep();
+        assert_eq!(p.sweep_divider, 2);
+        for expected in [1u8, 0] {
+            p.clock_sweep();
+            assert_eq!(p.sweep_divider, expected, "divider must keep counting");
+        }
+        // Divider hit zero while muting: period unchanged, divider
+        // reloads on the next clock.
+        p.clock_sweep();
+        assert_eq!(p.timer_period, 0x600, "muting must block the period update");
+        assert_eq!(p.sweep_divider, 2, "divider must reload as normal");
     }
 
     #[test]
