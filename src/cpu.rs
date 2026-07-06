@@ -92,7 +92,7 @@ impl Cpu6502 {
         if bus.take_nmi() {
             let cy = self.service_interrupt(bus, 0xFFFA);
             bus.tick_cycles(cy);
-            return cy + bus.take_dmc_stall();
+            return cy + bus.take_dma_stall();
         }
         // IRQ is level-triggered: serviced whenever the I flag is
         // clear and the bus is asserting the IRQ line (NSF2 timer
@@ -101,12 +101,12 @@ impl Cpu6502 {
         if (self.p & FLAG_I) == 0 && bus.irq_line() {
             let cy = self.service_interrupt(bus, 0xFFFE);
             bus.tick_cycles(cy);
-            return cy + bus.take_dmc_stall();
+            return cy + bus.take_dma_stall();
         }
         let opcode = self.fetch_byte(bus);
         let cycles = self.dispatch(bus, opcode);
         bus.tick_cycles(cycles);
-        cycles + bus.take_dmc_stall()
+        cycles + bus.take_dma_stall()
     }
 
     /// Push PC + processor flags (B=0, U=1), set I, then jump through

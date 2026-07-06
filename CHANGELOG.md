@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`$4014` OAM DMA CPU halt** per `docs/audio/nsf/apu-dma-wiki.html`
+  §"OAM DMA" — the register was previously a silent no-op. A `$4014`
+  write now steals the documented 513 CPU cycles (get-half write) or
+  514 (put-half write spends the alignment cycle) while the APU + NSF2
+  timer run on through the halt; game rips frequently keep their
+  engine's sprite-DMA write in the PLAY routine, so on hardware this
+  bite out of the frame is real wall-clock time and the PLAY cadence
+  now reflects it. Per §"DMC DMA during OAM DMA", a DMC fetch landing
+  inside the OAM window costs the documented 2-cycle overlap ("1 cycle
+  for the DMC DMA get and then 1 cycle for OAM DMA to align back to a
+  get") instead of its usual 4-cycle reload, stretching the window.
+  `NesBus::take_dmc_stall` is renamed `take_dma_stall` (deprecated
+  alias kept); new `OAM_DMA_BASE_STALL_CYCLES` /
+  `DMC_DMA_DURING_OAM_STALL_CYCLES` constants. Not modelled
+  (documented): the 1-/3-cycle end-of-window DMC special cases, and
+  the 256 OAM source reads are not replayed through the bus (no PPU;
+  CPU-time cost only). 2 new tests pin the 513/514 write-parity split
+  and the exactly-one-refetch 2-cycle overlap window.
+
 ### Changed
 
 - **DMC DMA stalls now follow the DMA page's load/reload get-put

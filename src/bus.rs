@@ -9,7 +9,7 @@
 //! | `$0800..=$1FFF`  | three mirrors of the 2 KiB CPU RAM                          |
 //! | `$2000..=$3FFF`  | PPU registers (open bus — NSF does not draw video)          |
 //! | `$4000..=$4013`  | APU register file (pulse / triangle / noise / DMC)          |
-//! | `$4014`          | OAM DMA — open bus for NSF                                  |
+//! | `$4014`          | OAM DMA — 513/514-cycle CPU halt (no PPU to receive it)     |
 //! | `$4015`          | APU status                                                  |
 //! | `$4016`          | controller 1 strobe (open bus for NSF)                      |
 //! | `$4017`          | APU frame counter / controller 2 strobe                     |
@@ -159,6 +159,20 @@ pub const BANK_SIZE: usize = 0x1000;
 /// Number of windows that tile `$8000..=$FFFF` at 4 KiB each.
 pub const NUM_BANK_WINDOWS: usize = 8;
 
+/// Base CPU cycles a `$4014` OAM DMA steals when the write lands on a
+/// get cycle: the halt cycle + 256 get/put pairs. A put-half write
+/// adds one alignment cycle for the documented 514-cycle case
+/// (`docs/audio/nsf/apu-dma-wiki.html` §"OAM DMA": "taking 513 or 514
+/// cycles, depending on whether alignment is needed").
+pub const OAM_DMA_BASE_STALL_CYCLES: u32 = 513;
+
+/// Extra CPU cycles a DMC sample fetch costs when it collides with an
+/// in-progress OAM DMA: "DMC DMA occurring during OAM DMA will cost
+/// only 2 cycles: 1 cycle for the DMC DMA get and then 1 cycle for
+/// OAM DMA to align back to a get"
+/// (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA during OAM DMA").
+pub const DMC_DMA_DURING_OAM_STALL_CYCLES: u32 = 2;
+
 /// 64 KiB CPU view of the NES bus.
 pub struct NesBus {
     pub ram: [u8; RAM_SIZE],
@@ -206,9 +220,9 @@ pub struct NesBus {
     /// on the next `step`.
     pub nmi_pending: bool,
 
-    /// CPU cycles stolen by DMC sample-byte DMA since the last
-    /// [`NesBus::take_dmc_stall`] — the §"Memory reader" CPU stall.
-    pending_dmc_stall: u32,
+    /// CPU cycles stolen by DMA (DMC sample-byte fetches + `$4014`
+    /// OAM DMA) since the last [`NesBus::take_dma_stall`].
+    pending_dma_stall: u32,
 }
 
 impl Default for NesBus {
@@ -234,7 +248,7 @@ impl NesBus {
             vector_overlay_active: false,
             vector_overlay: [0u8; 6],
             nmi_pending: false,
-            pending_dmc_stall: 0,
+            pending_dma_stall: 0,
         }
     }
 
@@ -530,7 +544,7 @@ impl NesBus {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize] = value,
             0x2000..=0x3FFF => {}
             0x4000..=0x4013 => self.apu.write_register(addr, value),
-            0x4014 => {}
+            0x4014 => self.oam_dma(),
             0x4015 => self.apu.write_status(value),
             0x4016 => {}
             0x4017 => self.apu.write_frame_counter(value),
@@ -598,7 +612,7 @@ impl NesBus {
     /// is stalled for 1-4 CPU cycles to read a sample byte"): the
     /// stolen cycles are real wall-clock time, so the APU + NSF2 timer
     /// keep running through them here, and the total is accumulated
-    /// for [`NesBus::take_dmc_stall`] so the CPU/player can extend the
+    /// for [`NesBus::take_dma_stall`] so the CPU/player can extend the
     /// current instruction's cycle count accordingly.
     pub fn tick_cycles(&mut self, cycles: u32) {
         self.cycles = self.cycles.wrapping_add(cycles as u64);
@@ -618,7 +632,7 @@ impl NesBus {
             while let Some((addr, stall)) = self.apu.dmc_pending_fetch() {
                 let byte = self.read(addr);
                 self.apu.dmc_supply_byte(byte);
-                self.pending_dmc_stall = self.pending_dmc_stall.saturating_add(stall);
+                self.pending_dma_stall = self.pending_dma_stall.saturating_add(stall);
                 self.cycles = self.cycles.wrapping_add(stall as u64);
                 self.apu.tick_cpu_cycles(stall);
                 self.nsf2_timer.tick(stall);
@@ -627,12 +641,70 @@ impl NesBus {
         }
     }
 
-    /// Drain the CPU cycles stolen by DMC sample-byte DMA since the
-    /// last call. [`crate::cpu::Cpu6502::step`] folds them into the
-    /// executing instruction's cycle count so the caller's scheduling
-    /// (PLAY cadence, samples-per-cycle budget) sees the stall.
+    /// `$4014` OAM DMA — the CPU halt is real even though the NSF
+    /// machine has no PPU to receive the 256 bytes.
+    ///
+    /// `docs/audio/nsf/apu-dma-wiki.html` §"OAM DMA": the DMA "halts
+    /// the CPU, performs an optional alignment cycle, and then gets
+    /// and puts 256 times, taking 513 or 514 cycles" — 513 when the
+    /// `$4014` write lands on a get cycle (per the doc's first
+    /// example, the halt occupies the put half and the first read
+    /// starts on the next get), 514 when it lands on a put (an
+    /// alignment cycle is spent before the first get). Get/put parity
+    /// uses the same pinned power-up alignment as the frame counter's
+    /// PUT-half events: even CPU cycles are the get half. Game rips
+    /// frequently keep their engine's sprite-DMA write in the PLAY
+    /// routine, so this ~513-cycle bite out of the frame is real
+    /// wall-clock time on hardware.
+    ///
+    /// §"DMC DMA during OAM DMA": a DMC fetch colliding with the OAM
+    /// window "will cost only 2 cycles: 1 cycle for the DMC DMA get
+    /// and then 1 cycle for OAM DMA to align back to a get" — the
+    /// common mid-window case ([`DMC_DMA_DURING_OAM_STALL_CYCLES`]);
+    /// the 1-/3-cycle end-of-window special cases are not modelled.
+    ///
+    /// The 256 OAM source reads are not replayed through the bus (no
+    /// PPU, and replaying them could spuriously trigger read-side
+    /// register effects the real DMA would only cause for exotic
+    /// source pages); only the CPU-time cost is modelled, with the
+    /// APU + NSF2 timer running on through the halt.
+    fn oam_dma(&mut self) {
+        let alignment = (self.cycles & 1) as u32; // put-half write → +1
+        let mut remaining = OAM_DMA_BASE_STALL_CYCLES + alignment;
+        let mut total = 0u32;
+        while remaining > 0 {
+            let n = remaining.min(8);
+            self.apu.tick_cpu_cycles(n);
+            self.nsf2_timer.tick(n);
+            total += n;
+            remaining -= n;
+            // DMC fetches landing inside the OAM window overlap with
+            // it at the documented 2-cycle cost, stretching the halt.
+            while let Some((addr, _)) = self.apu.dmc_pending_fetch() {
+                let byte = self.read(addr);
+                self.apu.dmc_supply_byte(byte);
+                self.apu.tick_cpu_cycles(DMC_DMA_DURING_OAM_STALL_CYCLES);
+                self.nsf2_timer.tick(DMC_DMA_DURING_OAM_STALL_CYCLES);
+                total += DMC_DMA_DURING_OAM_STALL_CYCLES;
+            }
+        }
+        self.cycles = self.cycles.wrapping_add(total as u64);
+        self.pending_dma_stall = self.pending_dma_stall.saturating_add(total);
+    }
+
+    /// Drain the CPU cycles stolen by DMA (DMC sample-byte fetches +
+    /// `$4014` OAM DMA) since the last call.
+    /// [`crate::cpu::Cpu6502::step`] folds them into the executing
+    /// instruction's cycle count so the caller's scheduling (PLAY
+    /// cadence, samples-per-cycle budget) sees the stall.
+    pub fn take_dma_stall(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_dma_stall)
+    }
+
+    /// Renamed: the accumulator covers OAM DMA too now.
+    #[deprecated(note = "renamed to take_dma_stall (now also covers $4014 OAM DMA)")]
     pub fn take_dmc_stall(&mut self) -> u32 {
-        std::mem::take(&mut self.pending_dmc_stall)
+        self.take_dma_stall()
     }
 }
 
@@ -984,26 +1056,26 @@ mod tests {
         // stalls the CPU. The bus accrues the per-DMA-type stall (a
         // 3-cycle load DMA for the post-$4015 fetch, 4-cycle reload
         // DMAs after — apu-dma-wiki §"DMC DMA"), keeps the APU running
-        // through the stall, and drains the total via take_dmc_stall().
+        // through the stall, and drains the total via take_dma_stall().
         let mut bus = NesBus::new();
         bus.write(0x4010, 0x4F); // loop flag, fastest rate (54 cy/bit)
         bus.write(0x4012, 0x00); // sample address $C000
         bus.write(0x4013, 0x00); // 1-byte sample
         bus.write(0x4015, 0x10); // enable DMC → arms the first fetch
-        assert_eq!(bus.take_dmc_stall(), 0, "no fetch before ticking");
+        assert_eq!(bus.take_dma_stall(), 0, "no fetch before ticking");
         bus.tick_cycles(1);
         assert_eq!(
-            bus.take_dmc_stall(),
+            bus.take_dma_stall(),
             crate::apu::DMC_DMA_LOAD_STALL_CYCLES,
             "the post-$4015 fetch is a 3-cycle load DMA"
         );
-        assert_eq!(bus.take_dmc_stall(), 0, "stall drains on take");
+        assert_eq!(bus.take_dma_stall(), 0, "stall drains on take");
         // A looping 1-byte sample re-fetches once per 8-bit output
         // cycle (8 × 54 CPU cycles at rate $F); each refetch is a
         // 4-cycle reload DMA. Four output cycles' worth of ticking
         // must accrue at least three more fetch stalls, all reloads.
         bus.tick_cycles(54 * 8 * 4);
-        let stall = bus.take_dmc_stall();
+        let stall = bus.take_dma_stall();
         assert!(
             stall >= 3 * crate::apu::DMC_DMA_RELOAD_STALL_CYCLES,
             "looping sample must keep accruing reload stalls (got {stall})"
@@ -1012,6 +1084,57 @@ mod tests {
             stall % crate::apu::DMC_DMA_RELOAD_STALL_CYCLES,
             0,
             "every buffer-emptied refetch is a reload DMA"
+        );
+    }
+
+    #[test]
+    fn oam_dma_stall_is_513_or_514_by_write_parity() {
+        // apu-dma-wiki §"OAM DMA": "All together, OAM DMA on its own
+        // takes 513 or 514 cycles, depending on whether alignment is
+        // needed" — no alignment for a get-half write, one alignment
+        // cycle for a put-half write.
+        let mut bus = NesBus::new();
+        // Fresh bus: cycle 0 = get half of the first APU cycle.
+        bus.write(0x4014, 0x02);
+        assert_eq!(
+            bus.take_dma_stall(),
+            OAM_DMA_BASE_STALL_CYCLES,
+            "get-half $4014 write needs no alignment cycle"
+        );
+        // The 513-cycle DMA leaves the clock on an odd (put) cycle.
+        bus.write(0x4014, 0x02);
+        assert_eq!(
+            bus.take_dma_stall(),
+            OAM_DMA_BASE_STALL_CYCLES + 1,
+            "put-half $4014 write spends an alignment cycle"
+        );
+    }
+
+    #[test]
+    fn oam_dma_keeps_the_apu_running_and_overlaps_dmc_fetches() {
+        // apu-dma-wiki §"DMC DMA during OAM DMA": "In the common case,
+        // DMC DMA occurring during OAM DMA will cost only 2 cycles"
+        // instead of its usual 4-cycle reload. A looping 1-byte sample
+        // at the fastest rate empties its buffer once per 8 × 54 = 432
+        // CPU cycles, so exactly one refetch lands inside the ~513-
+        // cycle OAM window and stretches it by the 2-cycle overlap.
+        let mut bus = NesBus::new();
+        bus.write(0x4010, 0x4F); // loop flag, fastest rate (54 cy/bit)
+        bus.write(0x4012, 0x00);
+        bus.write(0x4013, 0x00); // 1-byte sample
+        bus.write(0x4015, 0x10); // enable DMC
+        bus.tick_cycles(1); // service the 3-cycle load DMA
+        assert_eq!(bus.take_dma_stall(), crate::apu::DMC_DMA_LOAD_STALL_CYCLES);
+        // Clock now at 1 + 3 = 4 CPU cycles (a get half).
+        bus.write(0x4014, 0x02);
+        assert_eq!(
+            bus.take_dma_stall(),
+            OAM_DMA_BASE_STALL_CYCLES + DMC_DMA_DURING_OAM_STALL_CYCLES,
+            "one in-window DMC refetch costs the 2-cycle overlap"
+        );
+        assert!(
+            bus.apu.dmc_pending_fetch().is_none(),
+            "the in-window refetch must have been serviced"
         );
     }
 

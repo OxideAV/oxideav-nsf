@@ -81,6 +81,13 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
     runs on through the stall, so PLAY cadence tracks the DMA-stretched
     wall clock; the DMC output unit powers up silent, keeping `$4011`
     direct-load PCM levels rock-steady until a sample actually plays.
+  * **`$4014` OAM DMA halts the CPU** for the documented 513/514
+    cycles (put-half writes spend the alignment cycle) even though the
+    NSF machine has no PPU to receive the 256 bytes — game rips
+    frequently keep their engine's sprite-DMA write in the PLAY
+    routine, and the halt is real wall-clock time on hardware. A DMC
+    fetch colliding with the OAM window costs the documented 2-cycle
+    overlap instead of its usual 4-cycle reload.
 
 * **Output conditioning** (`NsfPlayer`) — the rendered stream passes
   through the documented post-DAC analog filter chain (two first-order
@@ -200,8 +207,11 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   halt delays (up to 3 cycles on RMW stores / interrupts, which flip
   the halt parity when odd and toggle the 3/4 count) are not modelled
   because the 6502 core executes instructions atomically; the
-  aborted-DMA / unexpected-DMA stop bugs and OAM-DMA overlap need the
-  same sub-instruction bus timing.
+  aborted-DMA / unexpected-DMA stop bugs need the same
+  sub-instruction bus timing. DMC-during-OAM overlap uses the
+  documented 2-cycle common case; the 1-/3-cycle end-of-window
+  special cases are not modelled, and the 256 OAM source reads are
+  not replayed through the bus (CPU-time cost only).
 * OPLL envelope *attack*: the live **Attack** path is now §7-driven —
   its transition *timing* uses the silicon-measured global-counter
   `eg_shift`/`eg_select` duty (the same model as decay) and each step
