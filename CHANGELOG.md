@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- **End-to-end integration tests for the round's DMA/sweep work**
+  (`tests/parse_header.rs`): a synthetic bottom-octave (`$420`) pulse
+  rip renders silent with the sweep unconfigured and audibly (> 10×
+  peak) with the documented `$08` negate write — proving the
+  apu-sweep-wiki §Muting semantics through the whole parse → CPU →
+  APU → filter pipeline; and a rip whose PLAY routine kept its
+  engine's sprite-DMA `STA $4014` keeps rendering with the OAM halt
+  folded into the player's scheduling.
+
 ### Added
 
 - **`$4014` OAM DMA CPU halt** per `docs/audio/nsf/apu-dma-wiki.html`

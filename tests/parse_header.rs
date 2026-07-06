@@ -885,3 +885,123 @@ fn dendy_player_renders_audible_pcm_through_dendy_clock() {
     let peak = buf.iter().map(|s| s.unsigned_abs() as u32).max().unwrap();
     assert!(peak > 1000, "Dendy render too quiet: peak {peak}");
 }
+
+/// Build an NSF whose INIT programs pulse 1 to a bottom-octave period
+/// (`$420` ≈ 106 Hz NTSC) — a range the sweep unit's continuously-
+/// computed target period mutes unless the rip writes `$08` (negate
+/// on) to `$4001` first, per `docs/audio/nsf/apu-sweep-wiki.html`
+/// §Muting.
+fn synth_bottom_octave_nsf(write_negate: bool) -> Vec<u8> {
+    let mut header = vec![0u8; 0x80];
+    header[..5].copy_from_slice(b"NESM\x1a");
+    header[0x05] = 1;
+    header[0x06] = 1;
+    header[0x07] = 1;
+    header[0x08..0x0A].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0A..0x0C].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0C..0x0E].copy_from_slice(&0x8030u16.to_le_bytes());
+    header[0x6E..0x70].copy_from_slice(&16666u16.to_le_bytes());
+    header[0x7A] = 0; // NTSC
+
+    let mut prog: Vec<u8> = vec![
+        0xA9, 0x01, 0x8D, 0x15, 0x40, // LDA #$01 / STA $4015 (enable pulse 1)
+        0xA9, 0xBF, 0x8D, 0x00, 0x40, // LDA #$BF / STA $4000 (duty 50, halt, vol 15)
+    ];
+    if write_negate {
+        // The documented "fully disable the sweep unit" write.
+        prog.extend_from_slice(&[0xA9, 0x08, 0x8D, 0x01, 0x40]); // LDA #$08 / STA $4001
+    }
+    prog.extend_from_slice(&[
+        0xA9, 0x20, 0x8D, 0x02, 0x40, // LDA #$20 / STA $4002 (period lo)
+        0xA9, 0x04, 0x8D, 0x03, 0x40, // LDA #$04 / STA $4003 (period hi = 4 → $420)
+        0x60, // RTS
+    ]);
+    let mut blob = header;
+    blob.extend_from_slice(&prog);
+    while blob.len() < 0x80 + 0x30 {
+        blob.push(0xEA);
+    }
+    blob.push(0xEA); // PLAY: NOP
+    blob.push(0x60); // RTS
+    blob
+}
+
+#[test]
+fn bottom_octave_pulse_mutes_unless_negate_written() {
+    // End-to-end proof of the apu-sweep-wiki §Muting semantics through
+    // the whole parse → CPU → APU → filter-chain pipeline: a period-
+    // $420 pulse with the sweep left unconfigured is silenced by the
+    // continuously-computed target overflow ("why several publishers'
+    // NES games never seem to use the bottom octave"), while the same
+    // rip with the documented $08 negate write plays audibly.
+    let muted_nsf = synth_bottom_octave_nsf(false);
+    let h = parse_nsf(&muted_nsf).unwrap();
+    let mut player = NsfPlayer::new(h, 44_100);
+    player.start_song(1);
+    let mut pcm = vec![0i16; 8192];
+    assert_eq!(player.render(&mut pcm), pcm.len());
+    let muted_peak = pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap();
+
+    let audible_nsf = synth_bottom_octave_nsf(true);
+    let h = parse_nsf(&audible_nsf).unwrap();
+    let mut player = NsfPlayer::new(h, 44_100);
+    player.start_song(1);
+    let mut pcm = vec![0i16; 8192];
+    assert_eq!(player.render(&mut pcm), pcm.len());
+    let audible_peak = pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap();
+
+    assert!(
+        muted_peak < 50,
+        "unconfigured-sweep bottom octave must be muted (peak {muted_peak})"
+    );
+    assert!(
+        audible_peak > 500,
+        "$08-negate bottom octave must play (peak {audible_peak})"
+    );
+    assert!(
+        audible_peak > muted_peak * 10,
+        "negate write must make an order-of-magnitude difference \
+         (muted {muted_peak} vs audible {audible_peak})"
+    );
+}
+
+#[test]
+fn play_routine_oam_dma_write_keeps_player_running() {
+    // A game-rip PLAY routine that kept its engine's sprite-DMA write
+    // (STA $4014) now steals the documented 513/514-cycle OAM halt
+    // every frame; the player must fold the stall into its scheduling
+    // and keep rendering the enabled pulse without halting.
+    let mut header = vec![0u8; 0x80];
+    header[..5].copy_from_slice(b"NESM\x1a");
+    header[0x05] = 1;
+    header[0x06] = 1;
+    header[0x07] = 1;
+    header[0x08..0x0A].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0A..0x0C].copy_from_slice(&0x8000u16.to_le_bytes());
+    header[0x0C..0x0E].copy_from_slice(&0x8030u16.to_le_bytes());
+    header[0x6E..0x70].copy_from_slice(&16666u16.to_le_bytes());
+    header[0x7A] = 0; // NTSC
+
+    let prog: Vec<u8> = vec![
+        0xA9, 0x01, 0x8D, 0x15, 0x40, // LDA #$01 / STA $4015
+        0xA9, 0xBF, 0x8D, 0x00, 0x40, // LDA #$BF / STA $4000
+        0xA9, 0x40, 0x8D, 0x02, 0x40, // LDA #$40 / STA $4002
+        0xA9, 0x00, 0x8D, 0x03, 0x40, // LDA #$00 / STA $4003
+        0x60, // RTS
+    ];
+    let mut blob = header;
+    blob.extend_from_slice(&prog);
+    while blob.len() < 0x80 + 0x30 {
+        blob.push(0xEA);
+    }
+    // PLAY: LDA #$02 / STA $4014 (sprite DMA) / RTS.
+    blob.extend_from_slice(&[0xA9, 0x02, 0x8D, 0x14, 0x40, 0x60]);
+
+    let h = parse_nsf(&blob).unwrap();
+    let mut player = NsfPlayer::new(h, 44_100);
+    player.start_song(1);
+    let mut pcm = vec![0i16; 8192];
+    assert_eq!(player.render(&mut pcm), pcm.len(), "player halted on $4014");
+    let peak = pcm.iter().map(|s| s.unsigned_abs() as u32).max().unwrap();
+    assert!(peak > 1000, "OAM-DMA-writing rip too quiet: peak {peak}");
+}
