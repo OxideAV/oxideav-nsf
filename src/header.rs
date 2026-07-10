@@ -225,7 +225,7 @@ impl NsfDrvTag {
 }
 
 /// Parsed NSF header + the raw program data tail.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NsfHeader {
     pub version: u8,
     pub total_songs: u8,
@@ -762,8 +762,18 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
 
     let bankswitch_init = bank_init.unwrap_or([0u8; 8]);
 
+    // NSFe itself is versionless, but the optional `NSF2` chunk "permits
+    // the use of NSF2 features from an NSFe file" — a stream with active
+    // feature bits is semantically a version-2 NSF (and serializes back
+    // to the fixed-header shape as one).
+    let version = if nsf2_features.unwrap_or(0) != 0 {
+        2
+    } else {
+        1
+    };
+
     Ok(NsfHeader {
-        version: 1,
+        version,
         total_songs: info.total_songs,
         starting_song: info.starting_song,
         load_addr: info.load_addr,

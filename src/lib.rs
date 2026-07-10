@@ -18,6 +18,7 @@ pub mod header;
 pub mod nsfe;
 pub mod opll;
 pub mod player;
+pub mod writer;
 
 #[cfg(feature = "registry")]
 mod registry;
@@ -33,6 +34,7 @@ pub use nsfe::{
     NsfeAuth, NsfeMetaError, NsfeMetadata, NsfeMixerEntry, NsfeRate, NsfeRegions, NsfeVrc7,
 };
 pub use player::NsfPlayer;
+pub use writer::{write_metadata_chunks, NsfWriteError};
 
 #[cfg(feature = "registry")]
 pub use registry::{register_codecs, register_containers, CODEC_ID_STR};

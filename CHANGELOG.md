@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Container writers** (`src/writer.rs`): `NsfHeader::write_nsf()`
+  serializes the classic `NESM\x1a` fixed-header shape (v1/v2),
+  appending any extended metadata after the program as an NSFe-style
+  chunk run delimited by the 24-bit length at `$7D-$7F` and
+  terminated by `NEND` (the NSF2 appended-metadata mechanism, legal
+  even on v1 files); `NsfHeader::write_nsfe()` emits the chunk
+  container (`INFO` first, `DATA` after it, `NEND` last), re-homing
+  fixed-header-only fields into synthesized `RATE` / `auth` chunks so
+  v1 → NSFe conversion loses nothing; standalone
+  `write_metadata_chunks()` emits the bare NSF2 appended-metadata
+  shape. Writers emit canonical encodings (fixed chunk order, minimal
+  `RATE`/`regn` lengths, UTF-8 strings) so `write ∘ parse ∘ write` is
+  byte-idempotent, validate contract violations via the new
+  `NsfWriteError` (zero songs, bad version, NSF2 features on a v1
+  header, > 31-byte / interior-NUL strings, oversized program, bad
+  `VRC7` patch length, chunk-length overflow), and both write the
+  container-correct starting-song base (1-based fixed header, 0-based
+  `INFO`). A Dendy region synthesizes the `regn` chunk that is its
+  only on-disk encoding. `NsfHeader` now derives `PartialEq`/`Eq`.
+  11-test round-trip battery in `tests/roundtrip.rs` covers
+  field-preservation both shapes, byte-idempotence, v1 ↔ NSFe
+  conversion fidelity, Dendy synthesis, NSF2 features + appended
+  metadata, legacy-8-bit string re-encoding convergence, and every
+  writer error path.
+- **NSFe streams carrying an active `NSF2` feature chunk now parse as
+  `version == 2`** (previously always 1), so serializing such a
+  header back to the fixed-header shape keeps its feature bits
+  instead of erroring.
 - **Typed per-track metadata API** on `NsfHeader`: `track_count()`,
   `track_info(index)` / `tracks()` returning the new `NsfTrackInfo`
   view (0-based `index`, 1-based `number`, `tlbl` label, `taut`
