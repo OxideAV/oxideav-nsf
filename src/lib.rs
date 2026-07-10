@@ -27,6 +27,7 @@ pub use bus::NesBus;
 pub use cpu::Cpu6502;
 pub use header::{
     parse_nsf, ExpansionChips, Nsf2Features, NsfDrvId, NsfDrvTag, NsfError, NsfHeader, NsfRegion,
+    NsfTrackInfo,
 };
 pub use nsfe::{
     NsfeAuth, NsfeMetaError, NsfeMetadata, NsfeMixerEntry, NsfeRate, NsfeRegions, NsfeVrc7,

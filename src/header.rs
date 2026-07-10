@@ -307,6 +307,83 @@ impl NsfHeader {
         self.expansion.0 != 0
     }
 
+    /// 1-based starting-song number, normalized across container
+    /// variants.
+    ///
+    /// The raw [`NsfHeader::starting_song`] field is
+    /// container-dependent: the v1 header byte `$07` counts from 1
+    /// ("1 = 1st song") while the NSFe `INFO` chunk's offset-9 byte
+    /// counts from 0 ("0 = 1st song") per
+    /// `docs/audio/nsf/nsfe-nesdev-wiki.html` §INFO. This accessor
+    /// resolves the base difference, clamping the (out-of-spec) v1
+    /// value 0 to song 1 and saturating an NSFe index of 255.
+    pub fn starting_song_number(&self) -> u8 {
+        if self.is_nsfe {
+            self.starting_song.saturating_add(1)
+        } else {
+            self.starting_song.max(1)
+        }
+    }
+
+    /// 0-based starting-song index (see
+    /// [`NsfHeader::starting_song_number`]).
+    pub fn starting_song_index(&self) -> u8 {
+        if self.is_nsfe {
+            self.starting_song
+        } else {
+            self.starting_song.max(1) - 1
+        }
+    }
+
+    /// Number of tracks carried by the file (alias of
+    /// [`NsfHeader::total_songs`], named for the per-track metadata
+    /// APIs).
+    pub fn track_count(&self) -> u8 {
+        self.total_songs
+    }
+
+    /// Typed per-track metadata view for the 0-based track `index`,
+    /// combining the `tlbl` label, `taut` author and `time`/`fade`
+    /// schedule entries. Returns `None` when `index >=`
+    /// [`NsfHeader::track_count`]. Fields whose chunk is absent or too
+    /// short for this track are `None` — per spec the player then
+    /// applies its own defaults ("If this chunk is not long enough to
+    /// specify all tracks in the NSF, a default ... should be
+    /// assumed").
+    pub fn track_info(&self, index: u8) -> Option<NsfTrackInfo<'_>> {
+        if index >= self.total_songs {
+            return None;
+        }
+        let i = index as usize;
+        Some(NsfTrackInfo {
+            index,
+            number: index + 1,
+            label: self.track_labels.get(i).map(String::as_str),
+            author: self.metadata.track_authors.get(i).map(String::as_str),
+            time_ms: self.metadata.track_times_ms.get(i).copied(),
+            fade_ms: self.metadata.track_fades_ms.get(i).copied(),
+        })
+    }
+
+    /// Iterator over [`NsfHeader::track_info`] for every track.
+    pub fn tracks(&self) -> impl Iterator<Item = NsfTrackInfo<'_>> {
+        (0..self.total_songs).filter_map(|i| self.track_info(i))
+    }
+
+    /// Playback order as 0-based track indexes: the `plst` playlist
+    /// verbatim when the file ships one (entries may repeat or omit
+    /// tracks per spec), otherwise the natural `0..track_count` order.
+    /// Note `plst` entries are not validated against `track_count` —
+    /// the spec places no such constraint, so callers should bound
+    /// them via [`NsfHeader::track_info`].
+    pub fn playback_order(&self) -> Vec<u8> {
+        if self.metadata.playlist.is_empty() {
+            (0..self.total_songs).collect()
+        } else {
+            self.metadata.playlist.clone()
+        }
+    }
+
     /// Best-effort NSFDRV sound-driver identification, per
     /// `docs/audio/nsf/nsfdrv-nesdev-wiki.html`. Returns the 8-byte
     /// tag at the start of the program data only when its 6-byte ID
@@ -326,6 +403,28 @@ impl NsfHeader {
         let tag = NsfDrvTag::read(&self.program)?;
         tag.known_id().map(|_| tag)
     }
+}
+
+/// Typed per-track metadata view produced by [`NsfHeader::track_info`]
+/// — the aggregation of the NSFe `tlbl` / `taut` / `time` / `fade`
+/// per-track chunks for one track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NsfTrackInfo<'a> {
+    /// 0-based track index (the base used by NSFe `INFO`/`plst`).
+    pub index: u8,
+    /// 1-based track number (the base used by the v1 header and
+    /// [`crate::NsfPlayer::start_song`]).
+    pub number: u8,
+    /// `tlbl` label for this track, when the chunk supplies one.
+    pub label: Option<&'a str>,
+    /// `taut` per-track author, when the chunk supplies one.
+    pub author: Option<&'a str>,
+    /// Raw `time` entry: play length in ms before fadeout. Negative =
+    /// the chunk's own "default" marker; `None` = chunk absent/short.
+    pub time_ms: Option<i32>,
+    /// Raw `fade` entry: fadeout length in ms (0 = hard stop).
+    /// Negative = default marker; `None` = chunk absent/short.
+    pub fade_ms: Option<i32>,
 }
 
 /// Failures from the on-disk header parser.
@@ -865,6 +964,94 @@ mod tests {
         out.extend_from_slice(&(body.len() as u32).to_le_bytes());
         out.extend_from_slice(tag);
         out.extend_from_slice(body);
+    }
+
+    #[test]
+    fn starting_song_base_is_normalized_per_container() {
+        // v1: header byte $07 is 1-based.
+        let mut buf = fake_v1();
+        buf[0x07] = 2; // second song
+        let h = parse_nsf(&buf).unwrap();
+        assert_eq!(h.starting_song, 2);
+        assert_eq!(h.starting_song_number(), 2);
+        assert_eq!(h.starting_song_index(), 1);
+
+        // Out-of-spec v1 value 0 clamps to song 1.
+        buf[0x07] = 0;
+        let h = parse_nsf(&buf).unwrap();
+        assert_eq!(h.starting_song_number(), 1);
+        assert_eq!(h.starting_song_index(), 0);
+
+        // NSFe: INFO offset 9 is 0-based ("0=1st song, 1=2nd song").
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        let info: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 3, 1];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"DATA", &[0x60]);
+        push_chunk(&mut out, b"NEND", &[]);
+        let h = parse_nsf(&out).unwrap();
+        assert_eq!(h.starting_song, 1); // raw NSFe byte
+        assert_eq!(h.starting_song_number(), 2); // == 2nd track
+        assert_eq!(h.starting_song_index(), 1);
+    }
+
+    #[test]
+    fn track_info_combines_per_track_chunks() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        let info: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 3, 0];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"tlbl", b"Overworld\0Boss\0"); // only 2 of 3
+        push_chunk(&mut out, b"taut", b"Composer A\0"); // only 1 of 3
+        let mut time = Vec::new();
+        for v in [120_000i32, -1, 0] {
+            time.extend_from_slice(&v.to_le_bytes());
+        }
+        push_chunk(&mut out, b"time", &time);
+        let mut fade = Vec::new();
+        for v in [3_000i32, 0] {
+            fade.extend_from_slice(&v.to_le_bytes());
+        }
+        push_chunk(&mut out, b"fade", &fade); // only 2 of 3
+        push_chunk(&mut out, b"plst", &[2, 0, 2]);
+        push_chunk(&mut out, b"DATA", &[0x60]);
+        push_chunk(&mut out, b"NEND", &[]);
+
+        let h = parse_nsf(&out).unwrap();
+        assert_eq!(h.track_count(), 3);
+
+        let t0 = h.track_info(0).unwrap();
+        assert_eq!(t0.index, 0);
+        assert_eq!(t0.number, 1);
+        assert_eq!(t0.label, Some("Overworld"));
+        assert_eq!(t0.author, Some("Composer A"));
+        assert_eq!(t0.time_ms, Some(120_000));
+        assert_eq!(t0.fade_ms, Some(3_000));
+
+        let t1 = h.track_info(1).unwrap();
+        assert_eq!(t1.label, Some("Boss"));
+        assert_eq!(t1.author, None);
+        assert_eq!(t1.time_ms, Some(-1)); // chunk's own default marker
+        assert_eq!(t1.fade_ms, Some(0)); // hard stop
+
+        let t2 = h.track_info(2).unwrap();
+        assert_eq!(t2.label, None);
+        assert_eq!(t2.author, None);
+        assert_eq!(t2.time_ms, Some(0)); // fade out immediately
+        assert_eq!(t2.fade_ms, None); // chunk too short -> default
+
+        // Out of range.
+        assert!(h.track_info(3).is_none());
+        assert_eq!(h.tracks().count(), 3);
+
+        // plst drives the playback order verbatim.
+        assert_eq!(h.playback_order(), vec![2, 0, 2]);
+    }
+
+    #[test]
+    fn playback_order_defaults_to_natural_order_without_plst() {
+        let h = parse_nsf(&fake_v1()).unwrap(); // 3 songs, no plst
+        assert_eq!(h.playback_order(), vec![0, 1, 2]);
     }
 
     #[test]

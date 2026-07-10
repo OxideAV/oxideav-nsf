@@ -182,12 +182,12 @@ impl Decoder for NsfDecoder {
         }
         let header = parse_nsf(&packet.data).map_err(|e| Error::invalid(format!("NSF: {e}")))?;
         let mut player = NsfPlayer::new(header.clone(), OUTPUT_SAMPLE_RATE);
-        let song = if header.starting_song == 0 {
-            1
-        } else {
-            header.starting_song
-        };
-        player.start_song(song);
+        // `starting_song_number` resolves the container-dependent base
+        // (v1 header byte $07 is 1-based, NSFe INFO offset 9 is
+        // 0-based) into the 1-based convention `start_song` expects.
+        // The old `== 0` special-case treated an NSFe starting song of
+        // e.g. 1 (meaning the SECOND track) as track 1.
+        player.start_song(header.starting_song_number());
         self.state = DecoderState::Playing {
             player: Box::new(player),
             pts: 0,

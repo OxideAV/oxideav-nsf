@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Typed per-track metadata API** on `NsfHeader`: `track_count()`,
+  `track_info(index)` / `tracks()` returning the new `NsfTrackInfo`
+  view (0-based `index`, 1-based `number`, `tlbl` label, `taut`
+  author, raw `time`/`fade` schedule entries with the spec's
+  negative-default semantics), and `playback_order()` (the `plst`
+  playlist verbatim, else natural order).
+- **`NsfHeader::starting_song_number()` / `starting_song_index()`**:
+  normalized 1-based/0-based starting-song accessors that resolve the
+  container base difference — the v1 header byte `$07` counts from 1
+  while the NSFe `INFO` offset-9 byte counts from 0.
+
 ### Fixed
+
+- **Registry decoder started the wrong track on NSFe files with a
+  non-zero starting song**: it treated the raw `starting_song` field
+  as 1-based for both containers, so an NSFe starting song of 1
+  (meaning the *second* track) played track 1. It now routes through
+  `starting_song_number()`.
 
 - **NSFe well-formedness per the staged container layout**
   (`docs/audio/nsf/nsf-container-layout.md` + the NSFe wiki snapshot):
