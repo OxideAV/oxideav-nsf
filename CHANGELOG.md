@@ -91,6 +91,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Hostile-input battery for the container layer**
+  (`tests/container_hostile.rs`, 19 tests): truncated chunk headers
+  at every dangling length, `u32::MAX` / past-buffer declared sizes,
+  boundary-exact chunk lengths, duplicate `INFO`/`DATA` (pinned
+  last-wins), 5000-chunk skip chains, non-letter-leading FourCCs,
+  `BANK` short/long tolerance, malformed `mixe`/`RATE`/`regn`/`VRC7`
+  payloads surfacing exact errors through the full container, v1
+  header-length and NSF2 24-bit-length boundaries, hostile/forbidden
+  NSF2 appended metadata, `RATE`+`regn` legality in NSF2 metadata,
+  and writer limits — plus a deterministic single-byte-mutation sweep
+  (every offset of a v1 header and a chunk-rich NSFe, 3 mutations
+  each) upholding the write → parse → write byte-idempotence
+  contract.
+- **New `roundtrip` fuzz target**: any input `parse_nsf` accepts must
+  serialize through `write_nsfe` (and, minus the two documented
+  lenient-parse artefacts, `write_nsf`), re-parse, and re-serialize
+  byte-identically. Bounded runs: 37.8M execs (roundtrip), 18.9M
+  (nsfe_metadata), 22.0M (parse_nsf) — zero findings.
+
 - **DMA-heavy directed robustness battery** in `tests/parse_fuzz.rs`
   (`dma_heavy_programs_never_panic_or_hang`): rips that loop `$4014`
   OAM DMAs (non-returning PLAY included), churn the DMC on/off across

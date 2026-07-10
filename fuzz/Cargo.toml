@@ -30,6 +30,10 @@ cargo-fuzz = true
 #   (`auth`/`time`/`fade`/`plst`/`psfx`/`mixe`/`regn`/`RATE`/`VRC7`)
 #   exercised directly through a synthesised `NSFE` container so a
 #   hostile chunk payload can't panic the metadata sub-parsers.
+# - `roundtrip`        — the container writers: any input that parses
+#   must serialize through `write_nsfe` (and, minus two documented
+#   lenient-parse artefacts, `write_nsf`), re-parse, and re-serialize
+#   byte-identically.
 #
 # Every target's entry point is a public API already covered by the
 # in-tree harness, so a crash here is a real robustness bug in the
@@ -64,5 +68,11 @@ doc = false
 [[bin]]
 name = "nsfe_metadata"
 path = "fuzz_targets/nsfe_metadata.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false
