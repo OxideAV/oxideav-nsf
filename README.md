@@ -13,18 +13,39 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 
 * **Header parser** (`parse_nsf`):
   * **NSF v1.x** — full 128-byte header (magic `NESM\x1a`, version,
-    song count + start, load / init / play addresses, Latin-1
-    name / artist / copyright, NTSC + PAL period, region flags,
-    expansion-chip mask, bankswitch init).
+    song count + start, load / init / play addresses,
+    name / artist / copyright strings, NTSC + PAL period, region
+    flags, expansion-chip mask, bankswitch init).
   * **NSF v2** — `$7C` feature-flag byte decoded into `Nsf2Features`
     (IRQ support / non-returning INIT / suppressed PLAY / mandatory
     metadata), with the program block split from appended NSFe-style
     metadata via the 24-bit length at `$7D-$7F`.
-  * **NSFe** — chunk-based variant: `INFO` / `DATA` / `BANK` / `NSF2`
-    at the header layer plus the full extended-metadata decoder
-    (`auth` / `tlbl` / `taut` / `text` / `time` / `fade` / `plst` /
-    `psfx` / `mixe` / `regn` / `RATE` / `VRC7`). `NSFDRV` sound-driver
-    tag identification (`OFGS` / `FTDRV` / `NSDL`) is surfaced.
+  * **NSFe** — the chunk-based ("RIFF-NSF") variant per
+    `docs/audio/nsf/nsf-container-layout.md`: `INFO` / `DATA` /
+    `BANK` / `NSF2` at the header layer (well-formedness enforced —
+    `NEND` terminator required, `INFO` must precede `DATA`, ≥ 9-byte
+    `INFO`) plus the full extended-metadata decoder (`auth` / `tlbl` /
+    `taut` / `text` / `time` / `fade` / `plst` / `psfx` / `mixe` /
+    `regn` / `RATE` / `VRC7`). `NSFDRV` sound-driver tag
+    identification (`OFGS` / `FTDRV` / `NSDL`) is surfaced. Strings
+    decode UTF-8-first with a byte-map fallback for legacy 8-bit
+    text.
+  * Typed per-track metadata: `track_info()` / `tracks()` combine the
+    `tlbl` / `taut` / `time` / `fade` entries per track;
+    `playback_order()` resolves `plst`;
+    `starting_song_number()` / `starting_song_index()` normalize the
+    1-based (v1) vs 0-based (NSFe `INFO`) starting-song bases.
+
+* **Container writers** (`write_nsf` / `write_nsfe` /
+  `write_metadata_chunks`): serialize a header back into either shape
+  with canonical encodings (`write ∘ parse ∘ write` is
+  byte-idempotent). v1 ↔ NSFe conversion is lossless — fixed-header
+  fields re-home into synthesized `RATE` / `auth` chunks and vice
+  versa, extended metadata rides after the program as the NSF2
+  appended-chunk run, and a Dendy region synthesizes its `regn`
+  encoding. `NsfWriteError` rejects out-of-contract headers (zero
+  songs, > 31-byte v1 strings, interior NULs, > 24-bit program with
+  metadata, bad `VRC7` patch lengths).
 
 * **6502 CPU emulator** (`Cpu6502`) — all 256 opcodes (151 documented
   mnemonics across every legal addressing mode, plus the unofficial /
@@ -238,7 +259,6 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   `OpllNoiseLfsr`; the four noise/phase percussion voices still need
   their exact per-instrument phase formulas, which are not in the
   staged docs — DOCS-GAP #1786).
-* RIFF-NSF container variant.
 
 ## Verification
 
@@ -254,7 +274,16 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   bankswitching), random 6502 programs behind a valid header, and
   structured / random NSFe chunk streams. The matching coverage-guided
   `fuzz/` libfuzzer crate (targets `parse_nsf` / `parse_and_render` /
-  `nsfe_metadata`) explores the same surface under `cargo fuzz`.
+  `nsfe_metadata` / `roundtrip`) explores the same surface under
+  `cargo fuzz`.
+* `tests/container_hostile.rs` pins exact-error behavior on
+  adversarial container framing (truncated/oversized/duplicate/
+  boundary-exact chunks, hostile NSF2 appended metadata) and sweeps
+  single-byte mutations of both container shapes through the
+  write → parse → write byte-idempotence contract.
+* `tests/roundtrip.rs` proves `parse_nsf` ∘ `write_nsf` / `write_nsfe`
+  field preservation, byte-idempotence, and lossless v1 ↔ NSFe
+  conversion on kitchen-sink files.
 * Unit tests cover the CPU, APU, and each expansion chip's register
   decoding and signal generation.
 
