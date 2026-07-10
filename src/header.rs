@@ -342,6 +342,10 @@ pub enum NsfError {
     NsfeChunkOverflow,
     NsfeMissingRequired(&'static str),
     NsfeUnknownMandatory([u8; 4]),
+    /// A `DATA` chunk appeared before the `INFO` chunk. The spec
+    /// (`docs/audio/nsf/nsfe-nesdev-wiki.html` §Chunks) requires the
+    /// `INFO` chunk to precede `DATA`.
+    NsfeDataBeforeInfo,
     /// NSF2 declared a 24-bit data length at `$7D-$7F` that runs past
     /// the end of the file.
     Nsf2DataLengthOverflow {
@@ -372,6 +376,9 @@ impl fmt::Display for NsfError {
             NsfError::NsfeTruncatedChunk => f.write_str("NSFe: chunk header truncated"),
             NsfError::NsfeChunkOverflow => f.write_str("NSFe: chunk size overflows buffer"),
             NsfError::NsfeMissingRequired(name) => write!(f, "NSFe: missing required chunk {name}"),
+            NsfError::NsfeDataBeforeInfo => {
+                f.write_str("NSFe: DATA chunk appeared before the INFO chunk")
+            }
             NsfError::NsfeUnknownMandatory(fcc) => write!(
                 f,
                 "NSFe: unknown mandatory chunk {:?}",
@@ -543,6 +550,7 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
     let mut bank_init: Option<[u8; 8]> = None;
     let mut nsf2_features: Option<u8> = None;
     let mut meta_blob = Vec::<u8>::new();
+    let mut saw_nend = false;
 
     let mut cursor = 4usize;
     while cursor < bytes.len() {
@@ -568,7 +576,14 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
 
         match &fcc {
             b"INFO" => info = Some(parse_nsfe_info(body)?),
-            b"DATA" => data = Some(body.to_vec()),
+            b"DATA" => {
+                // "the 'INFO' chunk must precede the 'DATA' chunk"
+                // (docs/audio/nsf/nsfe-nesdev-wiki.html §Chunks).
+                if info.is_none() {
+                    return Err(NsfError::NsfeDataBeforeInfo);
+                }
+                data = Some(body.to_vec());
+            }
             b"BANK" => {
                 let mut b = [0u8; 8];
                 let n = body.len().min(8);
@@ -581,7 +596,12 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
                 // non-returning-INIT / suppressed-PLAY flags.
                 nsf2_features = Some(body.first().copied().unwrap_or(0));
             }
-            b"NEND" => break,
+            b"NEND" => {
+                // Terminator: "the 'NEND' chunk marks the end of the
+                // file; no further chunks should be read past 'NEND'".
+                saw_nend = true;
+                break;
+            }
             // Everything else gets re-emitted into the metadata
             // buffer for the extended parser, which knows the full
             // catalogue of optional chunks (`auth / tlbl / taut /
@@ -603,6 +623,12 @@ fn parse_nsfe(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
 
     let info = info.ok_or(NsfError::NsfeMissingRequired("INFO"))?;
     let program = data.ok_or(NsfError::NsfeMissingRequired("DATA"))?;
+    // "There are three chunks that are required for a well formed
+    // NSFe: 'INFO' ... 'DATA' ... 'NEND'" — a chunk run that simply
+    // hits end-of-buffer without the terminator is malformed.
+    if !saw_nend {
+        return Err(NsfError::NsfeMissingRequired("NEND"));
+    }
 
     let mut metadata = if meta_blob.is_empty() {
         NsfeMetadata::default()
@@ -672,8 +698,17 @@ struct NsfeInfo {
 }
 
 fn parse_nsfe_info(body: &[u8]) -> Result<NsfeInfo, NsfError> {
-    if body.len() < 8 {
+    // "This chunk must be at least 9 bytes long. If starting song is
+    // missing, 0 may be assumed. Any extra data in this chunk may be
+    // ignored." (docs/audio/nsf/nsfe-nesdev-wiki.html §INFO) — so the
+    // total-songs byte at offset 8 is mandatory, the starting-song
+    // byte at offset 9 is the only optional field.
+    if body.len() < 9 {
         return Err(NsfError::NsfeTruncatedChunk);
+    }
+    let total_songs = body[8];
+    if total_songs == 0 {
+        return Err(NsfError::NoSongs);
     }
     Ok(NsfeInfo {
         load_addr: u16::from_le_bytes([body[0], body[1]]),
@@ -681,7 +716,7 @@ fn parse_nsfe_info(body: &[u8]) -> Result<NsfeInfo, NsfError> {
         play_addr: u16::from_le_bytes([body[4], body[5]]),
         region: body[6],
         expansion: body[7],
-        total_songs: body.get(8).copied().unwrap_or(1),
+        total_songs,
         starting_song: body.get(9).copied().unwrap_or(0),
     })
 }
@@ -823,6 +858,118 @@ mod tests {
             h.track_labels,
             vec!["Track 1".to_string(), "Track 2".into()]
         );
+    }
+
+    /// Helper: emit one `[u32 len][fourcc][body]` chunk.
+    fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(body);
+    }
+
+    #[test]
+    fn nsfe_rejects_data_before_info() {
+        // "the 'INFO' chunk must precede the 'DATA' chunk".
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        push_chunk(&mut out, b"DATA", &[0xea, 0x60]);
+        let info: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 1, 0];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"NEND", &[]);
+        assert_eq!(parse_nsf(&out).unwrap_err(), NsfError::NsfeDataBeforeInfo);
+    }
+
+    #[test]
+    fn nsfe_requires_nend_terminator() {
+        // "There are three chunks that are required for a well formed
+        // NSFe" — INFO, DATA and NEND. A stream that just runs off the
+        // end of the buffer is malformed.
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        let info: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 1, 0];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"DATA", &[0xea, 0x60]);
+        assert_eq!(
+            parse_nsf(&out).unwrap_err(),
+            NsfError::NsfeMissingRequired("NEND")
+        );
+
+        // Appending the terminator fixes the same stream.
+        push_chunk(&mut out, b"NEND", &[]);
+        assert!(parse_nsf(&out).is_ok());
+    }
+
+    #[test]
+    fn nsfe_trailing_bytes_after_nend_are_ignored() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        let info: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 1, 0];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"DATA", &[0xea, 0x60]);
+        push_chunk(&mut out, b"NEND", &[]);
+        // Arbitrary garbage — including a truncated chunk header —
+        // must be ignored past NEND.
+        out.extend_from_slice(&[0xff, 0x00, 0xde]);
+        assert!(parse_nsf(&out).is_ok());
+    }
+
+    #[test]
+    fn nsfe_info_requires_nine_bytes() {
+        // "This chunk must be at least 9 bytes long" — the total-songs
+        // byte is mandatory; only starting-song (offset 9) may be
+        // omitted (defaulting to 0).
+        for len in 0..9usize {
+            let mut out = Vec::new();
+            out.extend_from_slice(&NSFE_MAGIC);
+            let full: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 1, 0];
+            push_chunk(&mut out, b"INFO", &full[..len]);
+            push_chunk(&mut out, b"DATA", &[0x60]);
+            push_chunk(&mut out, b"NEND", &[]);
+            assert_eq!(
+                parse_nsf(&out).unwrap_err(),
+                NsfError::NsfeTruncatedChunk,
+                "INFO length {len} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn nsfe_info_nine_bytes_defaults_starting_song_to_zero() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        // 9-byte INFO: no starting-song byte -> 0 assumed. Also
+        // exercise the "extra data may be ignored" rule with a
+        // 12-byte variant below.
+        let info: [u8; 9] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 4];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"DATA", &[0x60]);
+        push_chunk(&mut out, b"NEND", &[]);
+        let h = parse_nsf(&out).unwrap();
+        assert_eq!(h.total_songs, 4);
+        assert_eq!(h.starting_song, 0);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        let info: [u8; 12] = [
+            0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 4, 2, 0xAA, 0xBB,
+        ];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"DATA", &[0x60]);
+        push_chunk(&mut out, b"NEND", &[]);
+        let h = parse_nsf(&out).unwrap();
+        assert_eq!(h.total_songs, 4);
+        assert_eq!(h.starting_song, 2);
+    }
+
+    #[test]
+    fn nsfe_info_rejects_zero_total_songs() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&NSFE_MAGIC);
+        let info: [u8; 10] = [0x00, 0x80, 0x03, 0x80, 0x06, 0x80, 0x00, 0x00, 0, 0];
+        push_chunk(&mut out, b"INFO", &info);
+        push_chunk(&mut out, b"DATA", &[0x60]);
+        push_chunk(&mut out, b"NEND", &[]);
+        assert_eq!(parse_nsf(&out).unwrap_err(), NsfError::NoSongs);
     }
 
     #[test]

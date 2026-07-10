@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **NSFe well-formedness per the staged container layout**
+  (`docs/audio/nsf/nsf-container-layout.md` + the NSFe wiki snapshot):
+  the parser now enforces the three-required-chunks rule — a chunk
+  stream that runs off the end of the buffer without an `NEND`
+  terminator is rejected (`NsfeMissingRequired("NEND")`), a `DATA`
+  chunk appearing before `INFO` is rejected (new
+  `NsfError::NsfeDataBeforeInfo`), and the `INFO` chunk honours its
+  documented ≥ 9-byte minimum: the total-songs byte at offset 8 is
+  mandatory (8-byte `INFO` payloads were previously accepted with a
+  fabricated 1-song default) and only the starting-song byte at
+  offset 9 may be omitted (defaulting to 0). An `INFO` chunk declaring
+  zero total songs now fails with `NsfError::NoSongs`, matching the
+  v1 header check. Trailing bytes after `NEND` are still ignored per
+  spec.
+- **Empty `regn` payloads are rejected**
+  (`NsfeMetaError::BadChunkPayload`): the chunk is 1-2 bytes and its
+  supported-regions bitfield at byte 0 is not optional; a zero-length
+  `regn` previously decoded as an all-zero region mask.
+- The `nsfe_metadata` fuzz harness's synthetic `INFO` chunk mislabeled
+  its fields (it actually declared expansion=VRC6 and **zero total
+  songs**); rebuilt as a true minimal 9-byte `INFO`.
+
 ### Other
 
 - **DMA-heavy directed robustness battery** in `tests/parse_fuzz.rs`

@@ -15,10 +15,15 @@
 //! Mandatory-vs-optional rule: a chunk whose first FOURCC byte is an
 //! ASCII uppercase letter is mandatory — a parser that doesn't
 //! recognise it must reject the file. Lowercase-initial chunks are
-//! optional. The four uppercase-initial chunks reserved to the NSFe
-//! header (`INFO`, `DATA`, `BANK`, `NSF2`, `RATE`, `VRC7`) are handled
-//! separately; any other uppercase-initial chunk is unknown and is
-//! rejected here.
+//! optional. The uppercase-initial chunks reserved to the NSFe header
+//! layer (`INFO`, `DATA`, `NEND`, `BANK`, `NSF2`) are consumed by the
+//! `header` module before this parser runs (and are forbidden inside
+//! NSF2 appended metadata, where they surface as unknown mandatory
+//! chunks); `RATE` and `VRC7` are decoded here — both are legal in
+//! NSF2 appended metadata per `docs/audio/nsf/nsf2-nesdev-wiki.html`
+//! §Metadata (`RATE`/`regn` "may be included to provide additional
+//! Dendy region playback information"). Any other uppercase-initial
+//! chunk is unknown and is rejected here.
 
 use core::fmt;
 
@@ -206,7 +211,7 @@ pub fn parse_metadata_chunks(blob: &[u8]) -> Result<NsfeMetadata, NsfeMetaError>
             b"plst" => out.playlist = body.to_vec(),
             b"psfx" => out.sfx_playlist = body.to_vec(),
             b"mixe" => out.mixer = parse_mixer(body, tag)?,
-            b"regn" => out.regions = Some(parse_regions(body)),
+            b"regn" => out.regions = Some(parse_regions(body, tag)?),
             b"RATE" => out.rate = Some(parse_rate(body)),
             b"VRC7" => out.vrc7 = Some(parse_vrc7(body, tag)?),
             _ => {
@@ -274,11 +279,20 @@ fn parse_mixer(body: &[u8], tag: [u8; 4]) -> Result<Vec<NsfeMixerEntry>, NsfeMet
         .collect())
 }
 
-fn parse_regions(body: &[u8]) -> NsfeRegions {
-    NsfeRegions {
-        mask: body.first().copied().unwrap_or(0),
+fn parse_regions(body: &[u8], tag: [u8; 4]) -> Result<NsfeRegions, NsfeMetaError> {
+    // The chunk is 1-2 bytes: the supported-regions bitfield at byte 0
+    // is not optional (only the preferred-region byte 1 is), so an
+    // empty payload is malformed.
+    let Some(&mask) = body.first() else {
+        return Err(NsfeMetaError::BadChunkPayload {
+            tag,
+            len: body.len(),
+        });
+    };
+    Ok(NsfeRegions {
+        mask,
         preferred: body.get(1).copied(),
-    }
+    })
 }
 
 fn parse_rate(body: &[u8]) -> NsfeRate {
@@ -454,6 +468,20 @@ mod tests {
         let r = parse_metadata_chunks(&blob).unwrap().regions.unwrap();
         assert!(r.supports_ntsc() && !r.supports_pal() && !r.supports_dendy());
         assert_eq!(r.preferred, None);
+    }
+
+    #[test]
+    fn rejects_empty_regn_payload() {
+        // The supported-regions bitfield at byte 0 is not optional —
+        // the chunk is 1-2 bytes long.
+        let blob = pack(&[(b"regn", &[])]);
+        assert_eq!(
+            parse_metadata_chunks(&blob),
+            Err(NsfeMetaError::BadChunkPayload {
+                tag: *b"regn",
+                len: 0
+            })
+        );
     }
 
     #[test]

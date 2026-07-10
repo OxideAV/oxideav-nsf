@@ -30,14 +30,15 @@ fuzz_target!(|data: &[u8]| {
     let mut buf = b"NSFE".to_vec();
 
     // Minimal INFO: load/init/play addresses (LE u16 ×3), region byte,
-    // song count, start song. 9 bytes is the documented minimum.
+    // expansion byte, song count. 9 bytes is the documented minimum
+    // (the starting-song byte at offset 9 is optional, defaulting 0).
     let info: [u8; 9] = [
         0x00, 0x80, // load $8000
         0x00, 0x80, // init $8000
         0x03, 0x80, // play $8003
         0x00, // region (NTSC)
+        0x00, // expansion chips (none)
         0x01, // song count
-        0x00, // start song
     ];
     chunk(&mut buf, b"INFO", &info);
 
