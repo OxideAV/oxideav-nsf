@@ -42,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero total songs now fails with `NsfError::NoSongs`, matching the
   v1 header check. Trailing bytes after `NEND` are still ignored per
   spec.
+- **`RATE` chunks below the documented 4-byte minimum are rejected**
+  (`NsfeMetaError::BadChunkPayload`): the chunk is 4-6 bytes (NTSC +
+  PAL words mandatory, Dendy word optional); a 2-byte NTSC-only
+  payload previously decoded with a fabricated absent-PAL state. A
+  dangling 5th byte is ignored as trailing extra data.
+- **String fields now decode as UTF-8 first** ("UTF-8 encoding is
+  recommended for all strings used by this format" — NSFe wiki
+  §Structure; "UTF-8 is the standard for NSF2"), with the previous
+  1:1 byte-to-char mapping retained as a fallback for legacy 8-bit
+  text, so no input is rejected for its string contents. Applies to
+  the v1 fixed-header strings and every NSFe string chunk.
 - **Empty `regn` payloads are rejected**
   (`NsfeMetaError::BadChunkPayload`): the chunk is 1-2 bytes and its
   supported-regions bitfield at byte 0 is not optional; a zero-length

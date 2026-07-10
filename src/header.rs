@@ -841,14 +841,15 @@ fn is_known_extended(fcc: &[u8; 4]) -> bool {
     )
 }
 
+/// Decodes a fixed 32-byte v1 header string field: cut at the first
+/// NUL, trim trailing space/tab padding, then decode — UTF-8 when
+/// well-formed ("UTF-8 is the standard for NSF2" per
+/// `docs/audio/nsf/nsf2-nesdev-wiki.html` §Notes; v1 headers are
+/// plain ASCII, a strict subset), with a 1:1 byte-to-char fallback
+/// for legacy 8-bit text so no input is rejected.
 fn read_nsf_string(field: &[u8]) -> String {
     let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-    let trimmed = &field[..end];
-    let mut last = trimmed.len();
-    while last > 0 && (trimmed[last - 1] == b' ' || trimmed[last - 1] == b'\t') {
-        last -= 1;
-    }
-    trimmed[..last].iter().map(|&b| b as char).collect()
+    nsfe::read_string(&field[..end])
 }
 
 #[cfg(test)]

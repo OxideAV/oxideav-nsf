@@ -69,9 +69,11 @@ impl NsfeRegions {
     }
 }
 
-/// Decoded `RATE` chunk — one to three little-endian `u16` play
-/// periods in microseconds. Any sub-field unset by a too-short chunk
-/// is surfaced as `None`.
+/// Decoded `RATE` chunk — two or three little-endian `u16` play
+/// periods in microseconds. The chunk is 4-6 bytes: the NTSC and PAL
+/// words are always present in a valid chunk, the Dendy word is
+/// optional (`None` when the chunk is 4-5 bytes; a 5th dangling byte
+/// is ignored like any other trailing extra data).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NsfeRate {
     pub ntsc_us: Option<u16>,
@@ -212,7 +214,7 @@ pub fn parse_metadata_chunks(blob: &[u8]) -> Result<NsfeMetadata, NsfeMetaError>
             b"psfx" => out.sfx_playlist = body.to_vec(),
             b"mixe" => out.mixer = parse_mixer(body, tag)?,
             b"regn" => out.regions = Some(parse_regions(body, tag)?),
-            b"RATE" => out.rate = Some(parse_rate(body)),
+            b"RATE" => out.rate = Some(parse_rate(body, tag)?),
             b"VRC7" => out.vrc7 = Some(parse_vrc7(body, tag)?),
             _ => {
                 if tag[0].is_ascii_uppercase() {
@@ -295,7 +297,17 @@ fn parse_regions(body: &[u8], tag: [u8; 4]) -> Result<NsfeRegions, NsfeMetaError
     })
 }
 
-fn parse_rate(body: &[u8]) -> NsfeRate {
+fn parse_rate(body: &[u8], tag: [u8; 4]) -> Result<NsfeRate, NsfeMetaError> {
+    // "This chunk has 4 bytes" plus an optional third (Dendy) word —
+    // i.e. 4-6 bytes total. A chunk too short to carry the NTSC + PAL
+    // words is malformed; anything past the Dendy word is ignored
+    // trailing data.
+    if body.len() < 4 {
+        return Err(NsfeMetaError::BadChunkPayload {
+            tag,
+            len: body.len(),
+        });
+    }
     let read_u16 = |i: usize| -> Option<u16> {
         if body.len() >= i + 2 {
             Some(u16::from_le_bytes([body[i], body[i + 1]]))
@@ -303,11 +315,11 @@ fn parse_rate(body: &[u8]) -> NsfeRate {
             None
         }
     };
-    NsfeRate {
+    Ok(NsfeRate {
         ntsc_us: read_u16(0),
         pal_us: read_u16(2),
         dendy_us: read_u16(4),
-    }
+    })
 }
 
 fn parse_vrc7(body: &[u8], tag: [u8; 4]) -> Result<NsfeVrc7, NsfeMetaError> {
@@ -336,12 +348,22 @@ fn parse_vrc7(body: &[u8], tag: [u8; 4]) -> Result<NsfeVrc7, NsfeMetaError> {
     Ok(NsfeVrc7 { device, patches })
 }
 
-fn read_string(field: &[u8]) -> String {
+/// Decodes a string field. "UTF-8 encoding is recommended for all
+/// strings used by this format" (docs/audio/nsf/nsfe-nesdev-wiki.html
+/// §Structure), so well-formed UTF-8 is decoded as such; legacy
+/// non-UTF-8 byte runs fall back to a 1:1 byte-to-char mapping so no
+/// input is ever rejected for its string contents. Trailing
+/// space/tab padding is trimmed either way.
+pub(crate) fn read_string(field: &[u8]) -> String {
     let mut last = field.len();
     while last > 0 && (field[last - 1] == b' ' || field[last - 1] == b'\t') {
         last -= 1;
     }
-    field[..last].iter().map(|&b| b as char).collect()
+    let trimmed = &field[..last];
+    match core::str::from_utf8(trimmed) {
+        Ok(s) => s.to_owned(),
+        Err(_) => trimmed.iter().map(|&b| b as char).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -497,12 +519,46 @@ mod tests {
         assert_eq!(r.pal_us, Some(19997));
         assert_eq!(r.dendy_us, Some(19120));
 
-        // NTSC only.
-        let blob = pack(&[(b"RATE", &16639u16.to_le_bytes())]);
+        // Minimum 4-byte form: NTSC + PAL, no Dendy word.
+        let mut body = Vec::new();
+        body.extend_from_slice(&16639u16.to_le_bytes());
+        body.extend_from_slice(&19997u16.to_le_bytes());
+        let blob = pack(&[(b"RATE", &body)]);
         let r = parse_metadata_chunks(&blob).unwrap().rate.unwrap();
         assert_eq!(r.ntsc_us, Some(16639));
-        assert_eq!(r.pal_us, None);
+        assert_eq!(r.pal_us, Some(19997));
         assert_eq!(r.dendy_us, None);
+
+        // Below the documented 4-byte minimum -> malformed.
+        for len in 0..4usize {
+            let blob = pack(&[(b"RATE", &body[..len])]);
+            assert_eq!(
+                parse_metadata_chunks(&blob),
+                Err(NsfeMetaError::BadChunkPayload { tag: *b"RATE", len }),
+                "RATE length {len} must be rejected"
+            );
+        }
+
+        // A dangling 5th byte (partial Dendy word) is trailing extra
+        // data: ignored, Dendy stays unset.
+        let mut five = body.clone();
+        five.push(0xAB);
+        let blob = pack(&[(b"RATE", &five)]);
+        let r = parse_metadata_chunks(&blob).unwrap().rate.unwrap();
+        assert_eq!(r.dendy_us, None);
+    }
+
+    #[test]
+    fn strings_decode_utf8_with_byte_fallback() {
+        // Valid UTF-8 ("é" as C3 A9) decodes as UTF-8.
+        let blob = pack(&[(b"tlbl", b"caf\xc3\xa9\0")]);
+        let m = parse_metadata_chunks(&blob).unwrap();
+        assert_eq!(m.track_labels, vec!["café"]);
+
+        // Invalid UTF-8 (lone E9) falls back to the 1:1 byte map.
+        let blob = pack(&[(b"tlbl", b"caf\xe9\0")]);
+        let m = parse_metadata_chunks(&blob).unwrap();
+        assert_eq!(m.track_labels, vec!["café"]);
     }
 
     #[test]
