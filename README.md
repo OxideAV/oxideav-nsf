@@ -292,8 +292,11 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * `tests/roundtrip.rs` proves `parse_nsf` ∘ `write_nsf` / `write_nsfe`
   field preservation, byte-idempotence, and lossless v1 ↔ NSFe
   conversion on kitchen-sink files.
-* Unit tests cover the CPU, APU, and each expansion chip's register
-  decoding and signal generation.
+* Unit tests cover the CPU, APU, each expansion chip's register
+  decoding and signal generation, and the `oxideav-core` registry
+  glue (probe scoring, demuxer stream/metadata/packet contract,
+  scheduled-duration surfacing, decoder state machine, end-to-end
+  probe → demux → decode).
 
 ## License
 
