@@ -310,6 +310,109 @@ fn nsfe_structured_chunk_fuzz_never_panic() {
 }
 
 #[test]
+fn nsf2_random_appended_metadata_never_panic() {
+    // NSF v2 with the 24-bit `$7D-$7F` length delimiting the program,
+    // followed by fully-random appended-metadata bytes. The embedded
+    // chunk walker (no `NSFE` magic — the first byte begins a chunk
+    // header directly, per the layout doc §2.6) must reject or accept
+    // without panicking, whatever the bytes.
+    let mut rng = Lcg::new(0x4E53_4632); // "NSF2"
+    for _ in 0..4000 {
+        let mut buf = minimal_v1();
+        buf[0x05] = 0x02; // version 2
+        buf[0x7c] = rng.next_u8(); // random feature byte
+        buf[0x7d] = 0x04; // program is the 4-byte SEI;CLD;RTS;RTS
+        let len = (rng.next_u64() % 256) as usize;
+        let mut meta = vec![0u8; len];
+        rng.fill(&mut meta);
+        buf.extend_from_slice(&meta);
+        let _ = drive(&buf);
+    }
+}
+
+#[test]
+fn nsf2_structured_appended_metadata_fuzz_never_panic() {
+    // Syntactically-shaped chunk runs behind a valid v2 header: the
+    // embedded context's own catalogue — the four forbidden chunks
+    // (`INFO`/`DATA`/`BANK`/`NSF2`, must error, never panic), the
+    // permitted `RATE`/`regn` pair, the `NEND` terminator (sometimes
+    // mid-run, so trailing chunks must be ignored), unknown upper- and
+    // lowercase tags, and hostile declared sizes. Also randomises the
+    // `$7D-$7F` split point so the program/metadata boundary walks
+    // through the chunk run.
+    let tags: &[&[u8; 4]] = &[
+        b"INFO", b"DATA", b"BANK", b"NSF2", b"NEND", b"auth", b"time", b"fade", b"plst", b"psfx",
+        b"mixe", b"regn", b"RATE", b"VRC7", b"tlbl", b"taut", b"text", b"ZZZZ", b"zzzz",
+    ];
+    let mut rng = Lcg::new(0x0026_5F32);
+    for _ in 0..6000 {
+        let mut buf = minimal_v1();
+        buf[0x05] = 0x02;
+        buf[0x7c] = rng.next_u8();
+        let mut meta = Vec::new();
+        let n_chunks = (rng.next_u64() % 5) as usize + 1;
+        for _ in 0..n_chunks {
+            let tag = tags[(rng.next_u64() as usize) % tags.len()];
+            let body_len = (rng.next_u64() % 48) as usize;
+            let declared = if rng.next_u8() & 1 == 0 {
+                body_len as u32
+            } else {
+                rng.next_u64() as u32 // often huge → overflow guard
+            };
+            meta.extend_from_slice(&declared.to_le_bytes());
+            meta.extend_from_slice(tag);
+            let mut body = vec![0u8; body_len];
+            rng.fill(&mut body);
+            meta.extend_from_slice(&body);
+        }
+        // Split point: mostly the honest 4-byte program, sometimes a
+        // random offset inside the appended run (so chunk headers land
+        // in the "program" and mid-chunk bytes start the metadata).
+        let total_tail = 4 + meta.len();
+        let split = if rng.next_u8() & 3 == 0 {
+            (rng.next_u64() as usize % total_tail).max(1)
+        } else {
+            4
+        };
+        buf[0x7d] = (split & 0xFF) as u8;
+        buf[0x7e] = ((split >> 8) & 0xFF) as u8;
+        buf[0x7f] = ((split >> 16) & 0xFF) as u8;
+        buf.extend_from_slice(&meta);
+        let _ = drive(&buf);
+    }
+}
+
+#[test]
+fn nsf2_feature_bit_combinations_with_random_programs_never_panic() {
+    // Sweep every combination of the four defined `$7C` feature bits
+    // (IRQ support / non-returning INIT / suppressed PLAY / mandatory
+    // metadata) plus set reserved low-nibble bits, against random 6502
+    // programs. This drives the NSF2 IRQ timer device, the `$FFFA-
+    // $FFFF` vector overlay, the two-phase INIT and the no-PLAY
+    // paradigms on adversarial code — each must stay halt-guarded.
+    let mut rng = Lcg::new(0x7C7C_7C7C);
+    for hi in 0u8..16 {
+        for lo in [0x00u8, 0x0F] {
+            for _ in 0..8 {
+                let mut buf = minimal_v1();
+                buf[0x05] = 0x02;
+                buf[0x7c] = (hi << 4) | lo;
+                let prog_len = (rng.next_u64() % 512) as usize + 4;
+                let mut prog = vec![0u8; prog_len];
+                rng.fill(&mut prog);
+                buf.truncate(NSF_HEADER_LEN);
+                buf.extend_from_slice(&prog);
+                assert!(
+                    drive(&buf),
+                    "feature byte {:#04x} + random program must parse",
+                    (hi << 4) | lo
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn dma_heavy_programs_never_panic_or_hang() {
     // Directed battery for the DMA stall paths: programs that hammer
     // $4014 OAM DMA (each write steals a 513/514-cycle halt), churn

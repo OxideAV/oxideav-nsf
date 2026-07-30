@@ -276,8 +276,11 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   robustness battery: a self-contained LCG drives `parse_nsf` +
   `NsfPlayer` render through truncated prefixes, every single-byte
   header mutation, every `$7B` expansion-chip mask (with + without
-  bankswitching), random 6502 programs behind a valid header, and
-  structured / random NSFe chunk streams. The matching coverage-guided
+  bankswitching), random 6502 programs behind a valid header,
+  structured / random NSFe chunk streams, structured / random NSF2
+  appended-metadata runs (forbidden/permitted/terminator chunks,
+  hostile declared sizes, randomized `$7D-$7F` split points), and
+  every `$7C` feature-bit combination against random programs. The matching coverage-guided
   `fuzz/` libfuzzer crate (targets `parse_nsf` / `parse_and_render` /
   `nsfe_metadata` / `roundtrip`) explores the same surface under
   `cargo fuzz`.

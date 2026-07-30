@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$7C` bit-7 mandatory-chunk semantics (an understood mandatory
   `VRC7` chunk is applied; an unknown one still rejects the file)
   and the 4-byte-`RATE` + Dendy-`regn` PAL-fallback chain.
+- **NSF2-focused hardening sweeps in `tests/parse_fuzz.rs`**:
+  structured + fully-random appended-metadata chunk runs behind a
+  valid v2 header (forbidden/permitted/terminator tags, hostile
+  declared sizes, randomized `$7D-$7F` program/metadata split
+  points) and every `$7C` feature-bit combination — reserved
+  low-nibble included — rendered against random 6502 programs, so
+  the IRQ timer / vector-overlay / non-returning-INIT /
+  suppressed-PLAY paradigms stay on the never-panic,
+  always-terminate contract. Complemented by a clean bounded
+  coverage-guided campaign over all four libfuzzer targets
+  (~380M execs, zero findings).
 
 - **Container writers** (`src/writer.rs`): `NsfHeader::write_nsf()`
   serializes the classic `NESM\x1a` fixed-header shape (v1/v2),
