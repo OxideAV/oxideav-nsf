@@ -104,14 +104,17 @@ impl ExpansionChips {
 }
 
 /// NSF2 feature-flag byte at offset `$7C`. Bits per
-/// `docs/audio/nsf/nsf2-nesdev-wiki.html`:
+/// `docs/audio/nsf/nsf2-nesdev-wiki.html` (mirrored in the
+/// `docs/audio/nsf/nsf-container-layout.md` §1 bit table):
 ///
 /// * bits 0..=3: reserved, must be 0.
 /// * bit 4: IRQ support (`$401B/C/D` timer + vector overlay).
 /// * bit 5: non-returning INIT (two-phase INIT + NMI-driven PLAY).
 /// * bit 6: suppressed PLAY (PLAY subroutine will never be called).
-/// * bit 7: appended NSFe metadata is mandatory (chunk-name-uppercase
-///   semantics — player must succeed at parsing).
+/// * bit 7: the appended NSFe metadata may contain a **mandatory**
+///   chunk (uppercase-initial FourCC) that a player must understand
+///   in order to play the file correctly; when clear, a player may
+///   skip the metadata region entirely (§2.6).
 ///
 /// On v1 files this byte MUST be ignored per the spec.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -570,11 +573,16 @@ fn parse_nsf_v1(bytes: &[u8]) -> Result<NsfHeader, NsfError> {
         )
     };
 
-    // Parse the appended NSF2 metadata blob (a bare chunk run with no
-    // `NSFE` magic and no INFO/DATA/BANK/NSF2 chunks per spec). Empty
-    // blobs decode to a defaulted `NsfeMetadata`. Lift extended
-    // strings into the legacy v1 string fields when the v1 fields are
-    // unset and the metadata supplied them.
+    // Parse the appended NSF2 metadata blob — the NSFe chunk format
+    // with the §2.6 deltas: no `NSFE` magic (the first byte begins the
+    // first chunk header directly), exactly four forbidden chunks
+    // (INFO/DATA/BANK/NSF2), RATE/regn permitted, NEND expected as
+    // terminator. Empty blobs decode to a defaulted `NsfeMetadata`.
+    // Note: `$7C` bit 7 clear permits a *player* to skip this region
+    // entirely; this parser still walks it and reports malformation
+    // (a present-but-corrupt chunk run is out of spec either way).
+    // Lift extended strings into the legacy v1 string fields when the
+    // v1 fields are unset and the metadata supplied them.
     let mut metadata = if nsf2_metadata.is_empty() {
         NsfeMetadata::default()
     } else {

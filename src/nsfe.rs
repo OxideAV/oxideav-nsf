@@ -15,15 +15,28 @@
 //! Mandatory-vs-optional rule: a chunk whose first FOURCC byte is an
 //! ASCII uppercase letter is mandatory — a parser that doesn't
 //! recognise it must reject the file. Lowercase-initial chunks are
-//! optional. The uppercase-initial chunks reserved to the NSFe header
-//! layer (`INFO`, `DATA`, `NEND`, `BANK`, `NSF2`) are consumed by the
-//! `header` module before this parser runs (and are forbidden inside
-//! NSF2 appended metadata, where they surface as unknown mandatory
-//! chunks); `RATE` and `VRC7` are decoded here — both are legal in
-//! NSF2 appended metadata per `docs/audio/nsf/nsf2-nesdev-wiki.html`
-//! §Metadata (`RATE`/`regn` "may be included to provide additional
-//! Dendy region playback information"). Any other uppercase-initial
-//! chunk is unknown and is rejected here.
+//! optional.
+//!
+//! NSF2 embedded-metadata chunk rules, per
+//! `docs/audio/nsf/nsf-container-layout.md` §2.6 (reconciled with
+//! `docs/audio/nsf/nsf2-nesdev-wiki.html` §Metadata):
+//!
+//! * Exactly **four** chunks are forbidden in the embedded context —
+//!   `INFO`, `DATA`, `BANK`, `NSF2` — because the fixed header
+//!   already carries their content. They are rejected here with
+//!   [`NsfeMetaError::ForbiddenChunk`]. (In a standalone NSFe file
+//!   the `header` module consumes those four before this parser
+//!   runs.)
+//! * `RATE` and `regn` are explicitly **permitted** — they carry the
+//!   Dendy playback information the fixed header cannot express, and
+//!   the header's `$6E`/`$78`/`$7A` fields act as the
+//!   backward-compatible fallback.
+//! * `NEND` is not forbidden either: the metadata "should end with an
+//!   NEND chunk", the same terminator as standalone NSFe — nothing is
+//!   read past it.
+//!
+//! Any other uppercase-initial chunk is unknown-mandatory and is
+//! rejected here.
 
 use core::fmt;
 
@@ -138,6 +151,11 @@ pub enum NsfeMetaError {
     TruncatedChunk,
     ChunkOverflow,
     UnknownMandatory([u8; 4]),
+    /// One of the exactly four chunks the NSF2 embedded-metadata
+    /// context forbids (`INFO` / `DATA` / `BANK` / `NSF2` — the fixed
+    /// header already carries their content), per
+    /// `docs/audio/nsf/nsf-container-layout.md` §2.6.
+    ForbiddenChunk([u8; 4]),
     /// A chunk's payload was a length the spec rejects (e.g. a `mixe`
     /// chunk whose length isn't a multiple of 3, or a `VRC7` chunk
     /// with a patch-table length other than 128 or 152).
@@ -157,6 +175,12 @@ impl fmt::Display for NsfeMetaError {
                 "NSFe metadata: unknown mandatory chunk {:?}",
                 core::str::from_utf8(fcc).unwrap_or("????")
             ),
+            NsfeMetaError::ForbiddenChunk(fcc) => write!(
+                f,
+                "NSFe metadata: chunk {:?} is forbidden in the embedded context \
+                 (the fixed header already carries it)",
+                core::str::from_utf8(fcc).unwrap_or("????")
+            ),
             NsfeMetaError::BadChunkPayload { tag, len } => write!(
                 f,
                 "NSFe metadata: chunk {:?} has invalid payload length {len}",
@@ -173,11 +197,15 @@ impl std::error::Error for NsfeMetaError {}
 /// magic before calling in here, and the NSF2 file parser hands the
 /// appended bytes straight through.
 ///
-/// `acceptable` controls which header-style chunks the caller wants
-/// surfaced as unknowns vs silently swallowed. NSF2 metadata blobs
-/// per spec **forbid** `INFO`/`DATA`/`BANK`/`NSF2`; the NSFe header
-/// parser pre-consumes those four chunks before calling here so they
-/// shouldn't appear either way.
+/// The exactly-four forbidden chunks of the embedded context
+/// (`INFO`/`DATA`/`BANK`/`NSF2`, per
+/// `docs/audio/nsf/nsf-container-layout.md` §2.6) are rejected with
+/// [`NsfeMetaError::ForbiddenChunk`]; the NSFe header parser
+/// pre-consumes those four before calling here, so on that path they
+/// never reach this function. An `NEND` chunk terminates the walk —
+/// nothing is read past it — but a blob that simply ends without one
+/// is tolerated (the spec's "should end with an NEND chunk" is
+/// advisory).
 pub fn parse_metadata_chunks(blob: &[u8]) -> Result<NsfeMetadata, NsfeMetaError> {
     let mut out = NsfeMetadata::default();
     let mut cursor = 0usize;
@@ -204,6 +232,9 @@ pub fn parse_metadata_chunks(blob: &[u8]) -> Result<NsfeMetadata, NsfeMetaError>
 
         match &tag {
             b"NEND" => return Ok(out),
+            b"INFO" | b"DATA" | b"BANK" | b"NSF2" => {
+                return Err(NsfeMetaError::ForbiddenChunk(tag));
+            }
             b"auth" => out.auth = Some(parse_auth(body)),
             b"tlbl" => out.track_labels = split_null_strings(body),
             b"taut" => out.track_authors = split_null_strings(body),
@@ -592,6 +623,31 @@ mod tests {
             parse_metadata_chunks(&blob).unwrap_err(),
             NsfeMetaError::BadChunkPayload { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_exactly_the_four_forbidden_embedded_chunks() {
+        // nsf-container-layout.md §2.6: "Four chunks must not be used
+        // — INFO, DATA, BANK, NSF2". Each gets the dedicated
+        // ForbiddenChunk error, not UnknownMandatory.
+        for tag in [b"INFO", b"DATA", b"BANK", b"NSF2"] {
+            let blob = pack(&[(tag, &[0u8; 10])]);
+            assert_eq!(
+                parse_metadata_chunks(&blob),
+                Err(NsfeMetaError::ForbiddenChunk(*tag)),
+                "{} must be forbidden in embedded metadata",
+                core::str::from_utf8(tag).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_nend_terminator_is_tolerated() {
+        // §2.6: metadata "should end with an NEND chunk" — advisory,
+        // so a blob that runs to its end without one still parses.
+        let blob = pack(&[(b"auth", b"Title\0\0\0\0")]);
+        let m = parse_metadata_chunks(&blob).unwrap();
+        assert_eq!(m.auth.unwrap().title, "Title");
     }
 
     #[test]

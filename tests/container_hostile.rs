@@ -278,18 +278,102 @@ fn nsf2_hostile_appended_metadata_is_rejected() {
         NsfError::Metadata(NsfeMetaError::TruncatedChunk)
     );
 
-    // Appended metadata containing a chunk forbidden in the embedded
-    // context (INFO) — uppercase-unknown to the metadata parser.
+    // Appended metadata containing the chunks forbidden in the
+    // embedded context. Per nsf-container-layout.md §2.6 the list is
+    // exactly four — INFO, DATA, BANK, NSF2 — and each gets the
+    // dedicated ForbiddenChunk error.
+    for tag in [b"INFO", b"DATA", b"BANK", b"NSF2"] {
+        let mut buf = minimal_v1();
+        buf[0x05] = 2;
+        buf[0x7d] = 4;
+        let mut meta = Vec::new();
+        push_chunk(&mut meta, tag, &[0u8; 10]);
+        push_chunk(&mut meta, b"NEND", &[]);
+        buf.extend_from_slice(&meta);
+        assert_eq!(
+            parse_nsf(&buf).unwrap_err(),
+            NsfError::Metadata(NsfeMetaError::ForbiddenChunk(*tag)),
+            "{} must be forbidden in NSF2 embedded metadata",
+            core::str::from_utf8(tag).unwrap()
+        );
+    }
+
+    // An uppercase chunk that is merely *unknown* (not on the
+    // forbidden-four list) keeps the distinct unknown-mandatory error.
     let mut buf = minimal_v1();
     buf[0x05] = 2;
     buf[0x7d] = 4;
     let mut meta = Vec::new();
-    push_chunk(&mut meta, b"INFO", &[0u8; 10]);
+    push_chunk(&mut meta, b"QQQQ", &[]);
     push_chunk(&mut meta, b"NEND", &[]);
     buf.extend_from_slice(&meta);
     assert_eq!(
         parse_nsf(&buf).unwrap_err(),
-        NsfError::Metadata(NsfeMetaError::UnknownMandatory(*b"INFO"))
+        NsfError::Metadata(NsfeMetaError::UnknownMandatory(*b"QQQQ"))
+    );
+}
+
+#[test]
+fn nsf2_metadata_nend_semantics() {
+    // §2.6: NEND is not forbidden — it is the expected terminator,
+    // and nothing is read past it. A truncated chunk header after
+    // NEND must therefore be ignored, not rejected.
+    let mut buf = minimal_v1();
+    buf[0x05] = 2;
+    buf[0x7d] = 4;
+    let mut meta = Vec::new();
+    push_chunk(&mut meta, b"auth", b"Embedded\0\0\0\0");
+    push_chunk(&mut meta, b"NEND", &[]);
+    meta.extend_from_slice(&[0xff, 0x01, 0xde]); // hostile trailing bytes
+    buf.extend_from_slice(&meta);
+    let h = parse_nsf(&buf).unwrap();
+    assert_eq!(h.song_name, "Embedded");
+
+    // "Should end with an NEND chunk" is advisory: a chunk run that
+    // simply ends at the file boundary still parses.
+    let mut buf = minimal_v1();
+    buf[0x05] = 2;
+    buf[0x7d] = 4;
+    let mut meta = Vec::new();
+    push_chunk(&mut meta, b"auth", b"NoNend\0\0\0\0");
+    buf.extend_from_slice(&meta);
+    let h = parse_nsf(&buf).unwrap();
+    assert_eq!(h.song_name, "NoNend");
+}
+
+#[test]
+fn nsf2_mandatory_metadata_bit_with_known_mandatory_chunk() {
+    // §2.6 mandatory chunks: header byte $7C bit 7 declares the
+    // appended metadata may contain a mandatory (uppercase-initial)
+    // chunk required for playback — the wiki's worked example is a
+    // VRC7 chunk substituting YM2413 for VRC7. A player that
+    // understands it (we do) plays the file; the chunk's payload must
+    // be applied, not merely tolerated.
+    let mut buf = minimal_v1();
+    buf[0x05] = 2;
+    buf[0x7c] = 0x80; // mandatory-metadata feature bit
+    buf[0x7d] = 4;
+    let mut meta = Vec::new();
+    push_chunk(&mut meta, b"VRC7", &[1u8]); // device 1 = YM2413
+    push_chunk(&mut meta, b"NEND", &[]);
+    buf.extend_from_slice(&meta);
+    let h = parse_nsf(&buf).unwrap();
+    assert!(h.nsf2.mandatory_metadata());
+    assert_eq!(h.metadata.vrc7.as_ref().unwrap().device, 1);
+
+    // The same file with a mandatory chunk we do NOT understand must
+    // be rejected — bit 7 says it is required for correct playback.
+    let mut buf = minimal_v1();
+    buf[0x05] = 2;
+    buf[0x7c] = 0x80;
+    buf[0x7d] = 4;
+    let mut meta = Vec::new();
+    push_chunk(&mut meta, b"XSND", &[0u8; 3]);
+    push_chunk(&mut meta, b"NEND", &[]);
+    buf.extend_from_slice(&meta);
+    assert_eq!(
+        parse_nsf(&buf).unwrap_err(),
+        NsfError::Metadata(NsfeMetaError::UnknownMandatory(*b"XSND"))
     );
 }
 
@@ -313,6 +397,28 @@ fn nsf2_rate_and_regn_are_legal_in_appended_metadata() {
     assert_eq!(h.region, oxideav_nsf::NsfRegion::Dendy);
     assert_eq!(h.metadata.rate.unwrap().dendy_us, Some(19120));
     assert_eq!(h.play_period_us(), 19120);
+    // §2.6: the embedded RATE is partially redundant with the header
+    // $6E/$78 words — the chunk overrides them when present.
+    assert_eq!(h.ntsc_speed_us, 16666);
+    assert_eq!(h.pal_speed_us, 19997);
+
+    // Minimum 4-byte RATE (no Dendy word) + Dendy regn: the region
+    // sticks, and the play period falls back to the PAL word per the
+    // documented Dendy fallback chain.
+    let mut buf = minimal_v1();
+    buf[0x05] = 2;
+    buf[0x7d] = 4;
+    let mut meta = Vec::new();
+    let mut rate = Vec::new();
+    rate.extend_from_slice(&16666u16.to_le_bytes());
+    rate.extend_from_slice(&19997u16.to_le_bytes());
+    push_chunk(&mut meta, b"RATE", &rate);
+    push_chunk(&mut meta, b"regn", &[0x07, 0x02]);
+    push_chunk(&mut meta, b"NEND", &[]);
+    buf.extend_from_slice(&meta);
+    let h = parse_nsf(&buf).unwrap();
+    assert_eq!(h.region, oxideav_nsf::NsfRegion::Dendy);
+    assert_eq!(h.play_period_us(), 19997);
 }
 
 // ----- writer hostility --------------------------------------------------

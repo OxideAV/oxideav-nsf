@@ -19,7 +19,12 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   * **NSF v2** — `$7C` feature-flag byte decoded into `Nsf2Features`
     (IRQ support / non-returning INIT / suppressed PLAY / mandatory
     metadata), with the program block split from appended NSFe-style
-    metadata via the 24-bit length at `$7D-$7F`.
+    metadata via the 24-bit length at `$7D-$7F`. The embedded chunk
+    run follows the layout doc's reconciled §2.6 rules: exactly four
+    forbidden chunks (`INFO`/`DATA`/`BANK`/`NSF2`, rejected with a
+    dedicated error), `RATE`/`regn` permitted (header fields as the
+    backward-compatible fallback), `NEND` the expected — advisory —
+    terminator with nothing read past it.
   * **NSFe** — the chunk-based ("RIFF-NSF") variant per
     `docs/audio/nsf/nsf-container-layout.md`: `INFO` / `DATA` /
     `BANK` / `NSF2` at the header layer (well-formedness enforced —

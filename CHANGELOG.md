@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NSF2 embedded-metadata rules per the reconciled
+  `docs/audio/nsf/nsf-container-layout.md` §2.6** (the staged-docs
+  contradiction this crate reported is now resolved in the wiki's
+  favor — the rules the parser already implemented): the forbidden
+  list is exactly four chunks (`INFO`/`DATA`/`BANK`/`NSF2`), now
+  rejected with the dedicated `NsfeMetaError::ForbiddenChunk` error
+  instead of surfacing as "unknown mandatory"; `RATE`/`regn` stay
+  permitted (Dendy playback info, header `$6E`/`$78`/`$7A` fields as
+  the backward-compatible fallback); `NEND` is the expected — but
+  advisory — terminator, with nothing read past it. New unit +
+  hostile-container tests lock each resolved point, including the
+  `$7C` bit-7 mandatory-chunk semantics (an understood mandatory
+  `VRC7` chunk is applied; an unknown one still rejects the file)
+  and the 4-byte-`RATE` + Dendy-`regn` PAL-fallback chain.
+
 - **Container writers** (`src/writer.rs`): `NsfHeader::write_nsf()`
   serializes the classic `NESM\x1a` fixed-header shape (v1/v2),
   appending any extended metadata after the program as an NSFe-style
