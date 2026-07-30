@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always-terminate contract. Complemented by a clean bounded
   coverage-guided campaign over all four libfuzzer targets
   (~380M execs, zero findings).
+- **Registry-glue test battery** (`src/registry.rs`): the previously
+  untested `oxideav-core` integration surface now has direct
+  coverage — probe scoring (both magics, truncated/case-mangled
+  rejections), extension mapping, cursor restoration after
+  `probe_input`, the demuxer contract (stream params, `title` /
+  `artist` / `track_N` / `extra_info` metadata rows, single
+  whole-file packet then `Eof`, hostile-input open rejection), the
+  decoder state machine (`NeedMore` before a packet, one packet per
+  song, monotone sample-count pts, `reset()` round-trip,
+  hostile-payload rejection), and an end-to-end
+  probe → demux → decode run asserting non-silent PCM.
 
 - **Container writers** (`src/writer.rs`): `NsfHeader::write_nsf()`
   serializes the classic `NESM\x1a` fixed-header shape (v1/v2),
