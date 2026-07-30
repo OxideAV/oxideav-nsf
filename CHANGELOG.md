@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always-terminate contract. Complemented by a clean bounded
   coverage-guided campaign over all four libfuzzer targets
   (~380M execs, zero findings).
+- **Demuxer surfaces the scheduled starting-track duration**: when
+  the NSFe `time` chunk declares a non-negative play length for the
+  starting track, `Demuxer::duration_micros()` and
+  `StreamInfo::duration` now report `time + fade` (µs / stream
+  ticks) instead of always `None` — matching where the decoder's
+  render actually EOFs. Negative ("player default") or absent
+  entries still yield `None` (the common looping-rip case), and a
+  negative/absent `fade` contributes 0, mirroring the player's
+  shipped default.
 - **Registry-glue test battery** (`src/registry.rs`): the previously
   untested `oxideav-core` integration surface now has direct
   coverage — probe scoring (both magics, truncated/case-mangled

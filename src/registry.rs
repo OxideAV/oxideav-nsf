@@ -61,10 +61,11 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     params.sample_format = Some(SampleFormat::S16);
     params.extradata = blob.clone();
 
+    let duration_ms = scheduled_duration_ms(&header);
     let stream = StreamInfo {
         index: 0,
         time_base: TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
-        duration: None,
+        duration: duration_ms.map(|ms| (ms as i64) * (OUTPUT_SAMPLE_RATE as i64) / 1000),
         start_time: Some(0),
         params,
     };
@@ -76,7 +77,28 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         blob,
         consumed: false,
         metadata,
+        duration_micros: duration_ms.map(|ms| (ms as i64) * 1000),
     }))
+}
+
+/// Scheduled duration of the starting track in milliseconds, when the
+/// NSFe `time` chunk declares one for it: play length + fadeout, per
+/// §time/§fade of `docs/audio/nsf/nsfe-nesdev-wiki.html`. A negative
+/// `time` entry is the chunk's own "player default" marker and an
+/// absent/short chunk declares nothing — both yield `None` (the
+/// common case: NSF rips loop forever). A negative/absent `fade`
+/// entry contributes 0, matching the player's shipped default.
+fn scheduled_duration_ms(h: &NsfHeader) -> Option<u64> {
+    let idx = h.starting_song_index() as usize;
+    let time = match h.metadata.track_times_ms.get(idx).copied() {
+        Some(t) if t >= 0 => t as u64,
+        _ => return None,
+    };
+    let fade = match h.metadata.track_fades_ms.get(idx).copied() {
+        Some(f) if f >= 0 => f as u64,
+        _ => 0,
+    };
+    Some(time + fade)
 }
 
 fn build_metadata(h: &NsfHeader) -> Vec<(String, String)> {
@@ -111,6 +133,9 @@ struct NsfDemuxer {
     blob: Vec<u8>,
     consumed: bool,
     metadata: Vec<(String, String)>,
+    /// Scheduled starting-track duration (`time` + `fade`) in
+    /// microseconds, when the metadata declares one.
+    duration_micros: Option<i64>,
 }
 
 impl Demuxer for NsfDemuxer {
@@ -141,7 +166,7 @@ impl Demuxer for NsfDemuxer {
     }
 
     fn duration_micros(&self) -> Option<i64> {
-        None
+        self.duration_micros
     }
 }
 
@@ -269,19 +294,26 @@ mod tests {
         buf
     }
 
-    /// The same file as NSF2 with appended `tlbl` metadata, so the
-    /// demuxer's track_N metadata rows are exercised.
-    fn synth_nsf2_with_labels() -> Vec<u8> {
+    /// The synth file as NSF2 with the given appended-metadata chunks
+    /// (an `NEND` terminator is added).
+    fn synth_nsf2_with_meta(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
         let mut buf = synth_nsf();
         buf[0x05] = 2;
         buf[0x7d] = PROGRAM.len() as u8;
-        let body = b"Overworld\0Boss\0";
-        buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        buf.extend_from_slice(b"tlbl");
-        buf.extend_from_slice(body);
+        for (tag, body) in chunks {
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(*tag);
+            buf.extend_from_slice(body);
+        }
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(b"NEND");
         buf
+    }
+
+    /// The same file as NSF2 with appended `tlbl` metadata, so the
+    /// demuxer's track_N metadata rows are exercised.
+    fn synth_nsf2_with_labels() -> Vec<u8> {
+        synth_nsf2_with_meta(&[(b"tlbl", b"Overworld\0Boss\0")])
     }
 
     fn registries() -> (CodecRegistry, ContainerRegistry) {
@@ -423,6 +455,58 @@ mod tests {
                 "hostile packet {bad:02X?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn demuxer_surfaces_scheduled_starting_track_duration() {
+        let (codecs, containers) = registries();
+
+        // No time/fade metadata: the common looping rip declares no
+        // end.
+        let demux = containers
+            .open_demuxer("nsf", Box::new(Cursor::new(synth_nsf())), &codecs)
+            .unwrap();
+        assert_eq!(demux.duration_micros(), None);
+        assert_eq!(demux.streams()[0].duration, None);
+
+        // time = 120 s + fade = 3 s for the starting track (song 1 of
+        // 2): 123 s total, in µs and in 1/44100 stream ticks.
+        let time: Vec<u8> = [120_000i32, 45_000]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let fade: Vec<u8> = [3_000i32, -1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let blob = synth_nsf2_with_meta(&[(b"time", &time), (b"fade", &fade)]);
+        let demux = containers
+            .open_demuxer("nsf", Box::new(Cursor::new(blob.clone())), &codecs)
+            .unwrap();
+        assert_eq!(demux.duration_micros(), Some(123_000_000));
+        assert_eq!(
+            demux.streams()[0].duration,
+            Some(123 * OUTPUT_SAMPLE_RATE as i64)
+        );
+
+        // The starting-song byte selects which entry counts: song 2
+        // has a negative fade entry (player default = 0), so its
+        // duration is the bare 45 s time.
+        let mut blob2 = blob;
+        blob2[0x07] = 2;
+        let demux = containers
+            .open_demuxer("nsf", Box::new(Cursor::new(blob2)), &codecs)
+            .unwrap();
+        assert_eq!(demux.duration_micros(), Some(45_000_000));
+
+        // A negative time entry is the chunk's own "player default"
+        // marker — the container declares nothing.
+        let neg: Vec<u8> = (-1i32).to_le_bytes().to_vec();
+        let blob = synth_nsf2_with_meta(&[(b"time", &neg)]);
+        let demux = containers
+            .open_demuxer("nsf", Box::new(Cursor::new(blob)), &codecs)
+            .unwrap();
+        assert_eq!(demux.duration_micros(), None);
     }
 
     #[test]
