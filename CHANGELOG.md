@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.4...v0.0.5) - 2026-08-18
+
+### Other
+
+- nsf cpu: a KIL jam stops instruction sequencing, not the machine clock
+- nsf apu: defer time-sensitive register writes to their true write cycles
+- nsf dma: cycle-accounting integration battery for the sub-instruction engine
+- nsf dma: sub-instruction DMA engine — halt-cycle-exact DMC/OAM timing + stop bugs
+- note registry-glue coverage in the verification section
+- surface the scheduled starting-track duration on the demuxer
+- registry glue: direct test battery for the core integration surface
+- NSF2 appended-metadata + $7C feature-bit fuzz sweeps
+- nsf2 metadata: consume the reconciled §2.6 embedded-chunk rules
+- README — container/metadata subsystem coverage
+- nsf container: hostile-input battery + roundtrip fuzz target
+- nsf container: NSF/NSF2/NSFe writers + round-trip battery
+- nsf container: RATE 4-byte minimum + UTF-8-first string decoding
+- nsf container: normalized starting-song accessors + typed per-track info
+- nsf container: enforce NSFe well-formedness per staged layout doc
+- nsf tests: DMA-heavy directed robustness battery
+- nsf apu: $4015 disable cancels an armed DMC fetch
+- nsf tests: end-to-end bottom-octave sweep mute + $4014 PLAY-routine coverage
+- nsf bus: $4014 OAM DMA CPU halt + DMC-during-OAM 2-cycle overlap
+- nsf apu: DMC DMA load/reload stall cadence from the DMA page
+- nsf apu: sweep unit per the dedicated APU Sweep page
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Added
 
 - **Sub-instruction DMA timing — the per-cycle bus engine** closes
