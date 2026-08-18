@@ -99,21 +99,35 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   * `$4015` honours the documented IRQ-flag contract: a **write**
     clears the DMC interrupt flag; a **read** clears the frame
     interrupt flag but *not* the DMC flag.
-  * **DMC DMA steals CPU time per the DMA page's get/put cadence**:
-    the post-`$4015` "load" DMA (scheduled to halt on a get cycle)
-    steals 3 CPU cycles — halt + dummy + sample read — while every
-    buffer-emptied "reload" DMA (scheduled to halt on a put cycle)
-    steals 4, the extra being the documented alignment cycle. The APU
-    runs on through the stall, so PLAY cadence tracks the DMA-stretched
-    wall clock; the DMC output unit powers up silent, keeping `$4011`
-    direct-load PCM levels rock-steady until a sample actually plays.
+  * **DMC/OAM DMA timing is sub-instruction cycle-exact**: the CPU
+    hands the bus every instruction's per-cycle read/write pattern and
+    the DMA engine places each halt on its true CPU cycle per the DMA
+    page — halts fail on write cycles and retry ("Delays of up to 3
+    cycles are possible, with read-modify-write instructions having 2
+    consecutive writes and interrupts having 3"), so an odd delay
+    flips the get/put parity and toggles the DMC stall between the
+    load DMA's 3 cycles (halt + dummy + sample get) and the reload
+    DMA's 4 (extra alignment cycle). Load DMAs halt on the documented
+    3rd/4th CPU cycle after the `$4015` write; reloads on the first
+    put after the buffer empties. The APU runs on through every
+    stall, so PLAY cadence tracks the DMA-stretched wall clock; the
+    DMC output unit powers up silent, keeping `$4011` direct-load PCM
+    levels rock-steady until a sample actually plays. The DMA page's
+    stop-timing bugs are modelled on NTSC-class CPUs: an explicit
+    `$4015` stop in the APU cycle before a reload schedules yields
+    the 1-cycle **aborted DMA** (or none when write-delayed), and an
+    implicit sample end on the schedule's own APU cycle yields the
+    RP2A03H **unexpected DMA** from the same address (PAL is skipped
+    — the doc marks 2A07 behaviour unknown).
   * **`$4014` OAM DMA halts the CPU** for the documented 513/514
-    cycles (put-half writes spend the alignment cycle) even though the
-    NSF machine has no PPU to receive the 256 bytes — game rips
-    frequently keep their engine's sprite-DMA write in the PLAY
-    routine, and the halt is real wall-clock time on hardware. A DMC
-    fetch colliding with the OAM window costs the documented 2-cycle
-    overlap instead of its usual 4-cycle reload.
+    cycles — decided by the actual halt cycle's parity, with an
+    `INC $4014`-style RMW delaying the halt past its second write
+    into the next instruction — even though the NSF machine has no
+    PPU to receive the 256 bytes; game rips frequently keep their
+    engine's sprite-DMA write in the PLAY routine, and the halt is
+    real wall-clock time on hardware. A DMC fetch colliding with the
+    OAM window costs the documented 2-cycle overlap mid-window, 1
+    cycle on the second-to-last put, and 3 on the last put.
 
 * **Output conditioning** (`NsfPlayer`) — the rendered stream passes
   through the documented post-DAC analog filter chain (two first-order
@@ -228,16 +242,17 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
 * The 2A03 frame counter + channel timers are now cycle-exact, but
   the *expansion chips'* internal envelope/LFO timers still step in
   CPU-cycle batches — adequate for music, not cycle-exact.
-* DMC DMA stalls account each fetch at its scheduled parity's cycle
-  count (3-cycle load / 4-cycle reload). The DMA page's write-cycle
-  halt delays (up to 3 cycles on RMW stores / interrupts, which flip
-  the halt parity when odd and toggle the 3/4 count) are not modelled
-  because the 6502 core executes instructions atomically; the
-  aborted-DMA / unexpected-DMA stop bugs need the same
-  sub-instruction bus timing. DMC-during-OAM overlap uses the
-  documented 2-cycle common case; the 1-/3-cycle end-of-window
-  special cases are not modelled, and the 256 OAM source reads are
-  not replayed through the bus (CPU-time cost only).
+* DMA timing is sub-instruction cycle-exact (write-cycle halt delays,
+  3/4-cycle parity flips, OAM halt placement, end-of-window DMC
+  collisions, aborted/unexpected stop bugs), but the 6502 still
+  executes each instruction's *bus accesses* atomically at its start:
+  register reads/writes other than the DMA-relevant `$4014`/`$4015`
+  triggers land up to ~3 cycles early relative to their hardware
+  cycle, dummy reads (indexed page-cross, RMW write-back) are not
+  replayed through the bus, the halted read is not repeated on no-op
+  DMA cycles (the DMA page's register-conflict extra reads), and the
+  256 OAM source reads are not replayed (CPU-time cost only). A full
+  per-access core would close these.
 * OPLL envelope *attack*: the live **Attack** path is now §7-driven —
   its transition *timing* uses the silicon-measured global-counter
   `eg_shift`/`eg_select` duty (the same model as decay) and each step

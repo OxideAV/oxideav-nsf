@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sub-instruction DMA timing — the per-cycle bus engine** closes
+  the README's "needs per-cycle 6502" lacks-tail item
+  (`docs/audio/nsf/apu-dma-wiki.html` §Behavior / §"DMC DMA" /
+  §"OAM DMA" / §"DMC DMA during OAM DMA"). The 6502 core still
+  executes each instruction's *state* atomically, but `Cpu6502::step`
+  now hands the bus the instruction's per-cycle read/write pattern
+  (new `cpu::write_cycle_mask` — stores write on their final cycle,
+  RMW ops on their final two, `JSR` on cycles 3-4, `BRK`/IRQ/NMI on
+  cycles 2-4), and the new bus DMA engine
+  (`NesBus::begin_instruction` / `run_instruction`) walks machine
+  time one CPU cycle at a time whenever DMC DMA activity is possible,
+  placing every DMA halt on its true cycle:
+  * **Write-cycle halt delays** — "DMA can only halt on CPU read
+    cycles […] Delays of up to 3 cycles are possible, with
+    read-modify-write instructions having 2 consecutive writes and
+    interrupts having 3." An odd delay flips the halt's get/put
+    parity, toggling the DMC stall between 3 and 4 cycles; the engine
+    now computes the stall from the actual halt cycle instead of the
+    DMA type's scheduled parity.
+  * **Exact DMA schedule points** — the load DMA halts on "a get
+    cycle during the 2nd APU cycle after the write (that is, the 3rd
+    or 4th CPU cycle)" instead of on the first APU tick after the
+    `$4015` write; reloads halt on the first put cycle after the
+    buffer empties. The `$4015` D4 enable/disable itself now lands on
+    the write's true cycle offset within its instruction.
+  * **`$4014` OAM DMA is halt-cycle-exact**: the halt is "scheduled
+    … on the first cycle after the register write", so an `INC $4014`
+    style RMW delays it past the second write into the next
+    instruction, and the 513/514 alignment split is decided by the
+    actual halt cycle's parity (previously the executing
+    instruction's *start* parity). The stall now lands on the step
+    that actually contains the halt.
+  * **DMC-during-OAM end-of-window cases** — the cycle-stepped window
+    walk reproduces all three documented costs: the common 2-cycle
+    overlap, 1 cycle on the second-to-last put, 3 cycles on the last
+    put (previously the flat 2-cycle common case).
+  * **§Bugs stop-timing** (NTSC-class CPUs; "It is not known whether
+    2A07 CPUs are affected", so PAL skips them): an explicit `$4015`
+    stop during the APU cycle before a reload would schedule now
+    yields the documented **aborted DMA** — a single stolen halt
+    cycle, or nothing at all when the halt attempt lands on a write
+    cycle; an implicit sample end on the schedule's own APU cycle
+    yields the RP2A03H **unexpected DMA**, a full reload "from the
+    same address" whose byte lands in the sample buffer. (With this
+    machine's pinned power-up alignment the implicit stop always
+    lands on a get, selecting the unexpected-DMA arm.)
+  The DMA-inactive path still ticks in the old 8-cycle chunks, so
+  DMC-free rips render byte-identically. 12 new unit tests pin the
+  delayed/undelayed 3/4 reload+load splits, the RMW-delayed OAM halt
+  (bus- and CPU-level), the 1/2/3-cycle OAM collision costs, the
+  aborted/unexpected stop bugs, and the PAL gate; the 4 pre-engine
+  stall tests were rewritten to the doc's exact schedule points.
+
 - **NSF2 embedded-metadata rules per the reconciled
   `docs/audio/nsf/nsf-container-layout.md` §2.6** (the staged-docs
   contradiction this crate reported is now resolved in the wiki's

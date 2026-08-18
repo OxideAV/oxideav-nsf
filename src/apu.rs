@@ -537,12 +537,12 @@ impl NoiseChannel {
 /// sample read lands on the very next get — no alignment cycle is
 /// needed, so "load DMAs take 3 cycles".
 ///
-/// The §Behavior write-cycle halt delays ("Delays of up to 3 cycles
-/// are possible, with read-modify-write instructions having 2
-/// consecutive writes and interrupts having 3") — which flip the halt
-/// parity when odd and toggle the 3/4 count — are not modelled: the
-/// 6502 core here executes instructions atomically, so each DMA
-/// accounts the cycle count of its documented scheduled parity.
+/// This is the *undelayed* count. The bus DMA engine places every
+/// halt on its exact CPU cycle: §Behavior write-cycle halt delays
+/// ("Delays of up to 3 cycles are possible, with read-modify-write
+/// instructions having 2 consecutive writes and interrupts having 3")
+/// flip the halt parity when odd, and the live stall then becomes 4
+/// (see `crate::bus::NesBus::run_instruction`).
 pub const DMC_DMA_LOAD_STALL_CYCLES: u32 = 3;
 
 /// CPU cycles a **"reload" DMC DMA** steals from the CPU — every fetch
@@ -553,8 +553,8 @@ pub const DMC_DMA_LOAD_STALL_CYCLES: u32 = 3;
 /// scheduled to halt the CPU on a put cycle", so the halt occupies a
 /// put, the dummy the following get, an alignment cycle the next put,
 /// and the sample read the get after that — "reload DMAs take 4"
-/// cycles. See [`DMC_DMA_LOAD_STALL_CYCLES`] for the un-modelled
-/// write-delay parity flips.
+/// cycles. This is the *undelayed* count; an odd write-cycle halt
+/// delay flips it to 3 (see [`DMC_DMA_LOAD_STALL_CYCLES`]).
 pub const DMC_DMA_RELOAD_STALL_CYCLES: u32 = 4;
 
 /// Historical flat per-fetch stall estimate from
@@ -613,6 +613,25 @@ struct DmcChannel {
     /// after each `tick_cpu_cycles` chunk.
     pending_fetch: bool,
     pending_fetch_addr: u16,
+    /// True while the bus-side DMA engine has taken the pending fetch
+    /// (via [`Apu2A03::dmc_take_fetch`]) but the DMA read has not yet
+    /// completed ([`DmcChannel::supply_byte`]). While a fetch is in
+    /// flight the sample buffer stays empty — exactly as on hardware,
+    /// where the byte only arrives on the DMA's get cycle — and
+    /// `tick_one` must not arm a duplicate fetch.
+    fetch_in_flight: bool,
+    /// Address of the most recent fetch handed to the DMA engine.
+    /// Needed by the apu-dma-wiki §Bugs "unexpected DMA" modelling:
+    /// the extra reload DMA "occurs from the same address" as the
+    /// sample's final fetch.
+    last_fetch_addr: u16,
+    /// Latched when the sample ends implicitly: the output cycle whose
+    /// end moves the final buffered byte into the shift register (the
+    /// moment a reload DMA "would schedule" per apu-dma-wiki §Bugs,
+    /// except bytes remaining is zero). Drained by the bus DMA engine,
+    /// which decides between the aborted-DMA and unexpected-DMA bug
+    /// outcomes from the cycle's get/put parity.
+    implicit_stop_event: bool,
     /// True when the *next* fetch to arm is a "load" DMA — i.e. it was
     /// initiated by a `$4015` D4 write with the sample buffer empty,
     /// rather than by the buffer emptying at the end of an output
@@ -670,6 +689,9 @@ impl DmcChannel {
             timer_period: 0,
             pending_fetch: false,
             pending_fetch_addr: 0,
+            fetch_in_flight: false,
+            last_fetch_addr: 0,
+            implicit_stop_event: false,
             next_fetch_is_load: false,
             pending_fetch_is_load: false,
             irq_flag: false,
@@ -744,20 +766,31 @@ impl DmcChannel {
     }
 
     /// Drain one CPU cycle's worth of DMC progress.
+    ///
+    /// The output unit steps *before* the fetch-need check so that an
+    /// output cycle whose end empties the sample buffer arms its
+    /// reload fetch on this same CPU cycle — the bus DMA engine
+    /// derives the reload halt attempt ("scheduled to halt the CPU on
+    /// a put cycle", apu-dma-wiki §"DMC DMA") from the cycle the
+    /// buffer emptied, so the arm must not lag it.
     fn tick_one(&mut self) {
-        // Fetcher: re-fill the sample buffer if it's empty + bytes remain.
-        if !self.sample_buffer_filled && self.bytes_remaining > 0 && !self.pending_fetch {
-            self.pending_fetch = true;
-            self.pending_fetch_addr = self.current_addr;
-            self.pending_fetch_is_load = self.next_fetch_is_load;
-            self.next_fetch_is_load = false;
-        }
         // Output unit: counts down `timer_period` then shifts a bit out.
         if self.timer == 0 {
             self.timer = self.timer_period.saturating_sub(1);
             self.shift_one_bit();
         } else {
             self.timer -= 1;
+        }
+        // Fetcher: re-fill the sample buffer if it's empty + bytes remain.
+        if !self.sample_buffer_filled
+            && self.bytes_remaining > 0
+            && !self.pending_fetch
+            && !self.fetch_in_flight
+        {
+            self.pending_fetch = true;
+            self.pending_fetch_addr = self.current_addr;
+            self.pending_fetch_is_load = self.next_fetch_is_load;
+            self.next_fetch_is_load = false;
         }
     }
 
@@ -782,6 +815,15 @@ impl DmcChannel {
                 self.output_silence = false;
                 self.output_shift = self.sample_buffer;
                 self.sample_buffer_filled = false;
+                if self.bytes_remaining == 0 && self.enabled {
+                    // The final buffered byte just moved into the
+                    // shift register: sample playback stops implicitly
+                    // at this output-cycle end — the exact moment
+                    // apu-dma-wiki §Bugs says a reload DMA "would
+                    // schedule". Latch the event for the bus DMA
+                    // engine's aborted-/unexpected-DMA modelling.
+                    self.implicit_stop_event = true;
+                }
             }
         }
     }
@@ -806,6 +848,7 @@ impl DmcChannel {
     /// Bus calls this to deliver the byte that was at `pending_fetch_addr`.
     fn supply_byte(&mut self, byte: u8) {
         self.pending_fetch = false;
+        self.fetch_in_flight = false;
         self.sample_buffer = byte;
         self.sample_buffer_filled = true;
         self.current_addr = if self.current_addr == 0xFFFF {
@@ -1053,12 +1096,14 @@ impl Apu2A03 {
         self.expansion.observe_prg_read(addr, byte);
     }
 
-    /// Bus pulls this every tick to see if a DMC sample byte is
-    /// needed. Returns the fetch address and the CPU cycles the DMA
-    /// steals for this fetch: [`DMC_DMA_LOAD_STALL_CYCLES`] for the
-    /// post-`$4015` "load" DMA, [`DMC_DMA_RELOAD_STALL_CYCLES`] for a
-    /// buffer-emptied "reload" DMA
-    /// (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA").
+    /// Whether a DMC sample byte is needed. Returns the fetch address
+    /// and the *undelayed* CPU-cycle cost of the DMA:
+    /// [`DMC_DMA_LOAD_STALL_CYCLES`] for the post-`$4015` "load" DMA,
+    /// [`DMC_DMA_RELOAD_STALL_CYCLES`] for a buffer-emptied "reload"
+    /// DMA (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA"). The bus
+    /// DMA engine consumes fetches through [`Apu2A03::dmc_take_fetch`]
+    /// instead and computes the live stall from the actual halt
+    /// cycle's parity; this accessor remains for direct APU users.
     pub fn dmc_pending_fetch(&self) -> Option<(u16, u32)> {
         self.dmc.pending_fetch()
     }
@@ -1066,6 +1111,77 @@ impl Apu2A03 {
     /// Bus calls this with the byte that was at the pending address.
     pub fn dmc_supply_byte(&mut self, byte: u8) {
         self.dmc.supply_byte(byte);
+    }
+
+    /// Bus DMA engine: take ownership of the armed DMC fetch, marking
+    /// it in flight (the sample buffer stays empty until the engine
+    /// completes the DMA read and calls [`Apu2A03::dmc_supply_byte`],
+    /// exactly as on hardware). Returns `(address, is_load_dma)`.
+    #[doc(hidden)]
+    pub fn dmc_take_fetch(&mut self) -> Option<(u16, bool)> {
+        if self.dmc.pending_fetch {
+            self.dmc.pending_fetch = false;
+            self.dmc.fetch_in_flight = true;
+            self.dmc.last_fetch_addr = self.dmc.pending_fetch_addr;
+            Some((self.dmc.pending_fetch_addr, self.dmc.pending_fetch_is_load))
+        } else {
+            None
+        }
+    }
+
+    /// Bus DMA engine: drain the implicit-stop latch (the output-cycle
+    /// end that moved the sample's final byte into the shift register
+    /// — apu-dma-wiki §Bugs' "reload DMA would schedule" moment).
+    #[doc(hidden)]
+    pub fn dmc_take_implicit_stop(&mut self) -> bool {
+        std::mem::take(&mut self.dmc.implicit_stop_event)
+    }
+
+    /// Address of the most recent DMA fetch — the apu-dma-wiki §Bugs
+    /// "unexpected DMA" reloads "from the same address".
+    #[doc(hidden)]
+    pub fn dmc_last_fetch_addr(&self) -> u16 {
+        self.dmc.last_fetch_addr
+    }
+
+    /// Bus DMA engine: cancel an in-flight/armed fetch whose DMA was
+    /// aborted or cancelled before its read cycle (apu-dma-wiki §Bugs
+    /// — the aborted DMA never performs its read, so the sample
+    /// buffer must stay empty).
+    #[doc(hidden)]
+    pub fn dmc_cancel_in_flight(&mut self) {
+        self.dmc.fetch_in_flight = false;
+        self.dmc.pending_fetch = false;
+    }
+
+    /// Bus DMA engine: deliver the apu-dma-wiki §Bugs "unexpected DMA"
+    /// byte. It only fills the sample buffer ("This extra byte goes
+    /// into the sample buffer and is played after the current byte
+    /// finishes") — the address/bytes-remaining bookkeeping already
+    /// finished with the sample's real final fetch.
+    #[doc(hidden)]
+    pub fn dmc_supply_unexpected_byte(&mut self, byte: u8) {
+        self.dmc.sample_buffer = byte;
+        self.dmc.sample_buffer_filled = true;
+    }
+
+    /// True while DMC DMA activity is possible — the bus uses this to
+    /// drop from its cycle-exact walk into the cheap chunked tick when
+    /// no fetch can arm.
+    #[doc(hidden)]
+    pub fn dmc_activity_possible(&self) -> bool {
+        self.dmc.pending_fetch
+            || self.dmc.fetch_in_flight
+            || (self.dmc.enabled && (self.dmc.bytes_remaining > 0 || self.dmc.sample_buffer_filled))
+    }
+
+    /// True when the machine uses the PAL (2A07-class) CPU/APU. The
+    /// apu-dma-wiki §Bugs stop-timing quirks are gated off for PAL
+    /// ("It is not known whether 2A07 CPUs are affected by these
+    /// bugs").
+    #[doc(hidden)]
+    pub fn is_pal(&self) -> bool {
+        self.pal
     }
 
     pub fn cpu_hz(&self) -> u32 {
@@ -1105,19 +1221,35 @@ impl Apu2A03 {
     /// cleared only by a `$4015` read or by setting the `$4017`
     /// interrupt-inhibit flag.)
     pub fn write_status(&mut self, value: u8) {
+        self.write_status_except_dmc_enable(value);
+        self.dmc_set_enabled(value & 0x10 != 0);
+    }
+
+    /// The `$4015` write minus the DMC-enable side effect. The bus
+    /// applies the DMC enable/disable at the write's exact CPU cycle
+    /// (via [`Apu2A03::dmc_set_enabled`]) so the DMA engine's load
+    /// scheduling and §Bugs stop-timing see the true write cycle
+    /// rather than the executing instruction's first cycle.
+    #[doc(hidden)]
+    pub fn write_status_except_dmc_enable(&mut self, value: u8) {
         self.dmc.irq_flag = false;
         self.pulse1.enabled = value & 0x01 != 0;
         self.pulse2.enabled = value & 0x02 != 0;
         self.triangle.enabled = value & 0x04 != 0;
         self.noise.enabled = value & 0x08 != 0;
-        let dmc_enable = value & 0x10 != 0;
-        self.dmc.enable(dmc_enable);
         self.pulse1.length.silence_if_disabled(self.pulse1.enabled);
         self.pulse2.length.silence_if_disabled(self.pulse2.enabled);
         self.triangle
             .length
             .silence_if_disabled(self.triangle.enabled);
         self.noise.length.silence_if_disabled(self.noise.enabled);
+    }
+
+    /// Apply the `$4015` D4 DMC enable/disable (see
+    /// [`Apu2A03::write_status_except_dmc_enable`]).
+    #[doc(hidden)]
+    pub fn dmc_set_enabled(&mut self, on: bool) {
+        self.dmc.enable(on);
     }
 
     /// `$4015` read — status: which channel length counters are non-zero,

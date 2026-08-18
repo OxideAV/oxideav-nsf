@@ -159,19 +159,131 @@ pub const BANK_SIZE: usize = 0x1000;
 /// Number of windows that tile `$8000..=$FFFF` at 4 KiB each.
 pub const NUM_BANK_WINDOWS: usize = 8;
 
-/// Base CPU cycles a `$4014` OAM DMA steals when the write lands on a
-/// get cycle: the halt cycle + 256 get/put pairs. A put-half write
+/// Base CPU cycles a `$4014` OAM DMA steals when its halt lands on a
+/// put cycle: the halt cycle + 256 get/put pairs. A get-half halt
 /// adds one alignment cycle for the documented 514-cycle case
 /// (`docs/audio/nsf/apu-dma-wiki.html` §"OAM DMA": "taking 513 or 514
 /// cycles, depending on whether alignment is needed").
 pub const OAM_DMA_BASE_STALL_CYCLES: u32 = 513;
 
 /// Extra CPU cycles a DMC sample fetch costs when it collides with an
-/// in-progress OAM DMA: "DMC DMA occurring during OAM DMA will cost
-/// only 2 cycles: 1 cycle for the DMC DMA get and then 1 cycle for
-/// OAM DMA to align back to a get"
+/// in-progress OAM DMA in the common (mid-window) case: "DMC DMA
+/// occurring during OAM DMA will cost only 2 cycles: 1 cycle for the
+/// DMC DMA get and then 1 cycle for OAM DMA to align back to a get"
 /// (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA during OAM DMA").
+/// The end-of-window special cases cost 1 (second-to-last put) or 3
+/// (last put) cycles instead and fall out of the cycle-stepped window
+/// walk in [`NesBus::run_oam_window`].
 pub const DMC_DMA_DURING_OAM_STALL_CYCLES: u32 = 2;
+
+// =====================================================================
+// Sub-instruction DMA engine
+// =====================================================================
+//
+// `docs/audio/nsf/apu-dma-wiki.html`:
+//
+// * §Cadence — "The CPU alternates between cycles on which DMA can get
+//   (read) and cycles on which DMA can put (write). These are the
+//   first and second halves of APU cycles, respectively." This crate
+//   pins the power-up alignment (random on hardware) to even CPU
+//   cycles = get, matching the frame counter's event tables.
+// * §Behavior — "DMA can only halt on CPU read cycles. On write
+//   cycles, the halt fails and the DMA unit tries again next CPU
+//   cycle, repeating until successful. […] Delays of up to 3 cycles
+//   are possible, with read-modify-write instructions having 2
+//   consecutive writes and interrupts having 3."
+// * §"DMC DMA" — load DMAs "are scheduled to halt the CPU on a get
+//   cycle during the 2nd APU cycle after the write (that is, the 3rd
+//   or 4th CPU cycle)"; reload DMAs "attempt to halt on a put cycle".
+//   "load DMAs take 3 cycles and reload DMAs take 4 unless the halt
+//   is delayed by an odd number of cycles" — i.e. the stall is
+//   3 cycles for a get-cycle halt (halt + dummy + sample get) and 4
+//   for a put-cycle halt (an alignment cycle lands between the dummy
+//   and the get).
+//
+// The 6502 core executes each instruction's *state* atomically, but
+// hands the bus the instruction's per-cycle read/write pattern
+// ([`crate::cpu::write_cycle_mask`]); the engine walks the pattern one
+// CPU cycle at a time and places every DMA halt on its true cycle, so
+// write-cycle halt delays — and the get/put parity flips they cause —
+// are modelled exactly.
+
+/// Which flavour of DMC DMA is scheduled
+/// (`docs/audio/nsf/apu-dma-wiki.html` §"DMC DMA" + §Bugs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DmcDmaKind {
+    /// Post-`$4015` load DMA (halt scheduled on a get cycle).
+    Load,
+    /// Buffer-emptied reload DMA (halt scheduled on a put cycle).
+    Reload,
+    /// §Bugs aborted DMA: playback stopped during the APU cycle
+    /// before the reload would schedule — the DMA "is aborted after a
+    /// single cycle" (its halt cycle), or skipped entirely when the
+    /// halt attempt falls on a write cycle.
+    Aborted,
+    /// §Bugs unexpected DMA (RP2A03H / late RP2A03G): playback stopped
+    /// implicitly on the same APU cycle the reload would schedule — a
+    /// full reload runs anyway "from the same address" and its byte
+    /// "goes into the sample buffer".
+    Unexpected,
+}
+
+/// A DMC DMA whose halt attempts begin at `halt_from`.
+#[derive(Clone, Copy, Debug)]
+struct ScheduledDmcDma {
+    addr: u16,
+    kind: DmcDmaKind,
+    /// Absolute CPU cycle of the first halt attempt. Attempts repeat
+    /// every cycle until they land on a CPU read cycle (§Behavior),
+    /// except for [`DmcDmaKind::Aborted`], which only exists at its
+    /// scheduled attempt.
+    halt_from: u64,
+}
+
+/// First get (even) cycle at or after `c`.
+fn first_get(c: u64) -> u64 {
+    if c & 1 == 0 {
+        c
+    } else {
+        c + 1
+    }
+}
+
+/// First put (odd) cycle at or after `c`.
+fn first_put(c: u64) -> u64 {
+    if c & 1 == 1 {
+        c
+    } else {
+        c + 1
+    }
+}
+
+/// Whether cycle `offset` of an instruction with write-cycle bitmask
+/// `write_mask` is a CPU read cycle.
+fn is_read_cycle(write_mask: u32, offset: u32) -> bool {
+    offset >= u32::BITS || (write_mask >> offset) & 1 == 0
+}
+
+/// Cycle offset of the `n`-th (0-based) write cycle in `write_mask`.
+/// The CPU performs its bus-write calls in the same order as the
+/// hardware's write cycles, so the n-th `NesBus::write` of an
+/// instruction happened on the n-th set bit. (An RMW instruction
+/// models one write call for the hardware's two write cycles; mapping
+/// it to the FIRST write cycle is exactly right for `$4014`/`$4015`
+/// triggers — the halt attempt then starts on the second write cycle
+/// and is delayed past it, the doc's `INC $4014` behaviour.)
+fn nth_write_offset(write_mask: u32, n: u32, len: u32) -> u32 {
+    let mut seen = 0u32;
+    for o in 0..u32::BITS {
+        if (write_mask >> o) & 1 == 1 {
+            if seen == n {
+                return o;
+            }
+            seen += 1;
+        }
+    }
+    len.saturating_sub(1)
+}
 
 /// 64 KiB CPU view of the NES bus.
 pub struct NesBus {
@@ -223,6 +335,33 @@ pub struct NesBus {
     /// CPU cycles stolen by DMA (DMC sample-byte fetches + `$4014`
     /// OAM DMA) since the last [`NesBus::take_dma_stall`].
     pending_dma_stall: u32,
+
+    // ---- Sub-instruction DMA engine ----
+    /// Scheduled DMC DMA, if any. Serviced during the per-cycle walk.
+    dmc_dma: Option<ScheduledDmcDma>,
+    /// Absolute CPU cycle from which a pending `$4014` OAM DMA
+    /// attempts to halt the CPU ("scheduled to halt the CPU on the
+    /// first cycle after the register write").
+    oam_halt_from: Option<u64>,
+    /// Halt-attempt cycle for the next load DMA, latched when `$4015`
+    /// D4 is set: "a get cycle during the 2nd APU cycle after the
+    /// write (that is, the 3rd or 4th CPU cycle)".
+    dmc_load_halt_from: Option<u64>,
+    /// True between [`NesBus::begin_instruction`] and
+    /// [`NesBus::run_instruction`] — bus writes are counted so the
+    /// `$4014`/`$4015` triggers can be mapped to their true cycle
+    /// offsets within the instruction.
+    in_instruction: bool,
+    /// Number of `NesBus::write` calls made by the current instruction.
+    instr_write_calls: u32,
+    /// Write-call index of the `$4014` OAM DMA trigger, if the current
+    /// instruction wrote it.
+    oam_trigger_call: Option<u32>,
+    /// Write-call index + D4 value of a `$4015` write by the current
+    /// instruction. The DMC enable/disable is applied at the write's
+    /// true cycle during the walk so load scheduling and the §Bugs
+    /// stop-timing see the hardware write cycle.
+    dmc_enable_call: Option<(u32, bool)>,
 }
 
 impl Default for NesBus {
@@ -249,6 +388,13 @@ impl NesBus {
             vector_overlay: [0u8; 6],
             nmi_pending: false,
             pending_dma_stall: 0,
+            dmc_dma: None,
+            oam_halt_from: None,
+            dmc_load_halt_from: None,
+            in_instruction: false,
+            instr_write_calls: 0,
+            oam_trigger_call: None,
+            dmc_enable_call: None,
         }
     }
 
@@ -540,12 +686,36 @@ impl NesBus {
     }
 
     pub fn write(&mut self, addr: u16, value: u8) {
+        if self.in_instruction {
+            self.instr_write_calls = self.instr_write_calls.wrapping_add(1);
+        }
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize] = value,
             0x2000..=0x3FFF => {}
             0x4000..=0x4013 => self.apu.write_register(addr, value),
-            0x4014 => self.oam_dma(),
-            0x4015 => self.apu.write_status(value),
+            0x4014 => {
+                if self.in_instruction {
+                    // Replayed at the write's true cycle offset by
+                    // `run_instruction` — the halt is "scheduled …
+                    // on the first cycle after the register write".
+                    self.oam_trigger_call = Some(self.instr_write_calls - 1);
+                } else {
+                    // Direct (CPU-less) write, e.g. from tests: the
+                    // write occupies the current cycle and the halt
+                    // lands on the next one.
+                    self.tick_machine(1);
+                    self.run_oam_window();
+                }
+            }
+            0x4015 => {
+                self.apu.write_status_except_dmc_enable(value);
+                let on = value & 0x10 != 0;
+                if self.in_instruction {
+                    self.dmc_enable_call = Some((self.instr_write_calls - 1, on));
+                } else {
+                    self.apply_dmc_enable(on);
+                }
+            }
             0x4016 => {}
             0x4017 => self.apu.write_frame_counter(value),
             // NSF2 IRQ-timer writes. When disabled, fall through to
@@ -607,89 +777,330 @@ impl NesBus {
     /// to the APU so the frame counter advances. The DMC fetcher pulls
     /// bytes back through this same bus on demand.
     ///
-    /// Every DMC sample-byte fetch also *stalls the CPU* per
-    /// `docs/audio/nsf/apu-dmc-wiki.html` §"Memory reader" ("The CPU
-    /// is stalled for 1-4 CPU cycles to read a sample byte"): the
-    /// stolen cycles are real wall-clock time, so the APU + NSF2 timer
-    /// keep running through them here, and the total is accumulated
-    /// for [`NesBus::take_dma_stall`] so the CPU/player can extend the
-    /// current instruction's cycle count accordingly.
+    /// All cycles are treated as CPU *read* cycles (the sentinel-idle
+    /// spin has no writes), so a scheduled DMA halts at its earliest
+    /// documented attempt. CPU-executed instructions instead go
+    /// through [`NesBus::run_instruction`], which carries the
+    /// instruction's true read/write cycle pattern.
     pub fn tick_cycles(&mut self, cycles: u32) {
-        self.cycles = self.cycles.wrapping_add(cycles as u64);
-        // Run the APU; whenever the DMC needs a sample byte, fetch it
-        // through this bus's read path. Doing this in two passes keeps
-        // the borrow checker happy.
-        let mut remaining = cycles;
-        const CHUNK: u32 = 8;
-        while remaining > 0 {
-            let n = remaining.min(CHUNK);
-            self.apu.tick_cpu_cycles(n);
-            self.nsf2_timer.tick(n);
-            // Drain pending DMC fetches; each one halts the CPU for
-            // its DMA type's cycle count (3-cycle load / 4-cycle
-            // reload, per docs/audio/nsf/apu-dma-wiki.html §"DMC DMA")
-            // while the rest of the machine runs on.
-            while let Some((addr, stall)) = self.apu.dmc_pending_fetch() {
-                let byte = self.read(addr);
-                self.apu.dmc_supply_byte(byte);
-                self.pending_dma_stall = self.pending_dma_stall.saturating_add(stall);
-                self.cycles = self.cycles.wrapping_add(stall as u64);
-                self.apu.tick_cpu_cycles(stall);
-                self.nsf2_timer.tick(stall);
+        self.walk_pattern(cycles, 0, None, None);
+    }
+
+    /// Mark the start of a CPU instruction (or interrupt dispatch):
+    /// bus writes are counted from here so `$4014`/`$4015` triggers
+    /// can be replayed at their true cycle offsets by
+    /// [`NesBus::run_instruction`].
+    pub fn begin_instruction(&mut self) {
+        self.in_instruction = true;
+        self.instr_write_calls = 0;
+        self.oam_trigger_call = None;
+        self.dmc_enable_call = None;
+    }
+
+    /// Advance machine time for one executed instruction of `cycles`
+    /// CPU cycles whose write cycles are the set bits of `write_mask`
+    /// ([`crate::cpu::write_cycle_mask`]). DMA halts land on their
+    /// exact cycles: attempts fail on write cycles and retry next
+    /// cycle (`docs/audio/nsf/apu-dma-wiki.html` §Behavior), flipping
+    /// the get/put parity — and with it the 3/4-cycle DMC stall and
+    /// the 513/514-cycle OAM window — when the delay is odd.
+    pub fn run_instruction(&mut self, cycles: u32, write_mask: u32) {
+        self.in_instruction = false;
+        let oam = self
+            .oam_trigger_call
+            .take()
+            .map(|k| nth_write_offset(write_mask, k, cycles));
+        let dmc = self
+            .dmc_enable_call
+            .take()
+            .map(|(k, on)| (nth_write_offset(write_mask, k, cycles), on));
+        self.walk_pattern(cycles, write_mask, oam, dmc);
+    }
+
+    /// Walk `len` CPU cycles with the given write-cycle mask, applying
+    /// deferred `$4015`/`$4014` triggers at their true offsets and
+    /// servicing scheduled DMAs on their exact halt cycles.
+    fn walk_pattern(
+        &mut self,
+        len: u32,
+        write_mask: u32,
+        oam_trigger: Option<u32>,
+        dmc_enable: Option<(u32, bool)>,
+    ) {
+        let mut o: u32 = 0;
+        while o < len {
+            let read_cycle = is_read_cycle(write_mask, o);
+            // Deferred $4015 DMC enable/disable lands on its write cycle.
+            if let Some((eo, on)) = dmc_enable {
+                if eo == o {
+                    self.apply_dmc_enable(on);
+                }
             }
-            remaining -= n;
+            // A $4014 write schedules the OAM halt for the next cycle.
+            if let Some(to) = oam_trigger {
+                if to == o {
+                    self.oam_halt_from = Some(self.cycles + 1);
+                }
+            }
+            // Service any DMC DMA due before this CPU cycle executes:
+            // the stall inserts ahead of the halted read, which the
+            // CPU then performs ("When the DMA process completes, the
+            // CPU performs the read it attempted when halted").
+            self.service_dmc_dma(read_cycle);
+            // OAM DMA halts on the first read cycle at/after its
+            // schedule point.
+            if let Some(hf) = self.oam_halt_from {
+                if read_cycle && self.cycles >= hf {
+                    self.oam_halt_from = None;
+                    self.run_oam_window();
+                    // The window may have left a DMC DMA scheduled
+                    // right past its end.
+                    self.service_dmc_dma(read_cycle);
+                }
+            }
+            self.tick_machine(1);
+            o += 1;
         }
     }
 
-    /// `$4014` OAM DMA — the CPU halt is real even though the NSF
-    /// machine has no PPU to receive the 256 bytes.
+    /// Apply a `$4015` D4 write at the current cycle. Enables latch
+    /// the load-DMA halt schedule; disables run the apu-dma-wiki
+    /// §Bugs stop rules against any scheduled reload DMA.
+    fn apply_dmc_enable(&mut self, on: bool) {
+        if on {
+            self.apu.dmc_set_enabled(true);
+            // §"DMC DMA": the load DMA is "scheduled to halt the CPU
+            // on a get cycle during the 2nd APU cycle after the write
+            // (that is, the 3rd or 4th CPU cycle)".
+            self.dmc_load_halt_from = Some(first_get(self.cycles + 3));
+        } else {
+            match self.dmc_dma {
+                Some(s) if s.kind == DmcDmaKind::Reload => {
+                    let x_apu = self.cycles >> 1;
+                    let s_apu = s.halt_from >> 1;
+                    if x_apu + 1 >= s_apu {
+                        // "When sample playback is stopped during the
+                        // APU cycle before a reload DMA would schedule
+                        // […] the DMA starts, but is aborted after a
+                        // single cycle." (A stop on the schedule's own
+                        // APU cycle is not pinned for explicit stops;
+                        // the abort is the closest documented shape.)
+                        self.dmc_dma = Some(ScheduledDmcDma {
+                            kind: DmcDmaKind::Aborted,
+                            ..s
+                        });
+                    } else {
+                        // Stopped earlier: the memory reader only
+                        // fetches while "bytes remaining is not zero"
+                        // — no DMA at all.
+                        self.dmc_dma = None;
+                        self.apu.dmc_cancel_in_flight();
+                    }
+                }
+                Some(s) if s.kind == DmcDmaKind::Load => {
+                    self.dmc_dma = None;
+                    self.apu.dmc_cancel_in_flight();
+                }
+                _ => {}
+            }
+            self.apu.dmc_set_enabled(false);
+            self.dmc_load_halt_from = None;
+        }
+    }
+
+    /// Service a scheduled DMC DMA whose halt lands on the current
+    /// cycle boundary. `read_cycle` is whether the CPU cycle about to
+    /// execute is a read — halts only succeed on read cycles.
+    fn service_dmc_dma(&mut self, read_cycle: bool) {
+        let Some(s) = self.dmc_dma else { return };
+        let now = self.cycles;
+        let due = match s.kind {
+            DmcDmaKind::Aborted => now >= s.halt_from,
+            _ => read_cycle && now >= s.halt_from,
+        };
+        if !due {
+            return;
+        }
+        self.dmc_dma = None;
+        match s.kind {
+            DmcDmaKind::Aborted => {
+                // §Bugs: "aborted after a single cycle" — but "if the
+                // halt is delayed due to a write cycle, the aborted
+                // DMA doesn't occur at all".
+                if now == s.halt_from && read_cycle {
+                    self.stall_ticks(1);
+                }
+                self.apu.dmc_cancel_in_flight();
+            }
+            _ => {
+                // Halt on this cycle: halt + dummy + get for a
+                // get-cycle halt (3), plus an alignment cycle for a
+                // put-cycle halt (4).
+                let stall = if now & 1 == 0 { 3 } else { 4 };
+                self.stall_ticks(stall);
+                let byte = self.read(s.addr);
+                if s.kind == DmcDmaKind::Unexpected {
+                    self.apu.dmc_supply_unexpected_byte(byte);
+                } else {
+                    self.apu.dmc_supply_byte(byte);
+                }
+            }
+        }
+    }
+
+    /// `$4014` OAM DMA window, entered on its halt cycle — the CPU
+    /// halt is real even though the NSF machine has no PPU to receive
+    /// the 256 bytes.
     ///
     /// `docs/audio/nsf/apu-dma-wiki.html` §"OAM DMA": the DMA "halts
     /// the CPU, performs an optional alignment cycle, and then gets
     /// and puts 256 times, taking 513 or 514 cycles" — 513 when the
-    /// `$4014` write lands on a get cycle (per the doc's first
-    /// example, the halt occupies the put half and the first read
-    /// starts on the next get), 514 when it lands on a put (an
-    /// alignment cycle is spent before the first get). Get/put parity
-    /// uses the same pinned power-up alignment as the frame counter's
-    /// PUT-half events: even CPU cycles are the get half. Game rips
-    /// frequently keep their engine's sprite-DMA write in the PLAY
-    /// routine, so this ~513-cycle bite out of the frame is real
-    /// wall-clock time on hardware.
+    /// halt lands on a put (the first read starts on the next get),
+    /// 514 when it lands on a get (an alignment cycle is spent before
+    /// the first read). Game rips frequently keep their engine's
+    /// sprite-DMA write in the PLAY routine, so this ~513-cycle bite
+    /// out of the frame is real wall-clock time on hardware.
     ///
-    /// §"DMC DMA during OAM DMA": a DMC fetch colliding with the OAM
-    /// window "will cost only 2 cycles: 1 cycle for the DMC DMA get
-    /// and then 1 cycle for OAM DMA to align back to a get" — the
-    /// common mid-window case ([`DMC_DMA_DURING_OAM_STALL_CYCLES`]);
-    /// the 1-/3-cycle end-of-window special cases are not modelled.
+    /// §"DMC DMA during OAM DMA": "When accesses collide, DMC DMA is
+    /// allowed to run and OAM DMA is paused". The cycle walk below
+    /// reproduces the doc's three costs exactly: 2 extra cycles in
+    /// the common case ("1 cycle for the DMC DMA get and then 1 cycle
+    /// for OAM DMA to align back to a get"), 1 when the DMC halt
+    /// lands on the second-to-last OAM put (the dummy + alignment
+    /// overlap OAM's final pair and no realign is needed), and 3 on
+    /// the last put (dummy + alignment + get all extend the window).
     ///
     /// The 256 OAM source reads are not replayed through the bus (no
     /// PPU, and replaying them could spuriously trigger read-side
     /// register effects the real DMA would only cause for exotic
     /// source pages); only the CPU-time cost is modelled, with the
     /// APU + NSF2 timer running on through the halt.
-    fn oam_dma(&mut self) {
-        let alignment = (self.cycles & 1) as u32; // put-half write → +1
-        let mut remaining = OAM_DMA_BASE_STALL_CYCLES + alignment;
-        let mut total = 0u32;
+    fn run_oam_window(&mut self) {
+        let start = self.cycles;
+        // Halt cycle.
+        self.tick_machine(1);
+        if start & 1 == 0 {
+            // Halt landed on a get: alignment before the first read.
+            self.tick_machine(1);
+        }
+        let mut remaining: u32 = 512;
         while remaining > 0 {
-            let n = remaining.min(8);
-            self.apu.tick_cpu_cycles(n);
-            self.nsf2_timer.tick(n);
-            total += n;
-            remaining -= n;
-            // DMC fetches landing inside the OAM window overlap with
-            // it at the documented 2-cycle cost, stretching the halt.
-            while let Some((addr, _)) = self.apu.dmc_pending_fetch() {
-                let byte = self.read(addr);
-                self.apu.dmc_supply_byte(byte);
-                self.apu.tick_cpu_cycles(DMC_DMA_DURING_OAM_STALL_CYCLES);
-                self.nsf2_timer.tick(DMC_DMA_DURING_OAM_STALL_CYCLES);
-                total += DMC_DMA_DURING_OAM_STALL_CYCLES;
+            let dmc_due = match self.dmc_dma {
+                Some(s) => {
+                    s.kind != DmcDmaKind::Aborted
+                        && self.cycles >= s.halt_from
+                        && self.cycles & 1 == 1
+                }
+                None => false,
+            };
+            if dmc_due {
+                let s = self.dmc_dma.take().expect("checked above");
+                // DMC halt overlaps this OAM put; its dummy and
+                // alignment cycles overlap the next OAM pair (when
+                // one remains).
+                self.tick_machine(1);
+                remaining -= 1;
+                self.tick_machine(1);
+                remaining = remaining.saturating_sub(1);
+                self.tick_machine(1);
+                remaining = remaining.saturating_sub(1);
+                // The DMC get takes precedence for its sample read.
+                let byte = self.read(s.addr);
+                if s.kind == DmcDmaKind::Unexpected {
+                    self.apu.dmc_supply_unexpected_byte(byte);
+                } else {
+                    self.apu.dmc_supply_byte(byte);
+                }
+                self.tick_machine(1);
+                if remaining > 0 {
+                    // OAM re-aligns back to a get.
+                    self.tick_machine(1);
+                }
+                continue;
+            }
+            self.tick_machine(1);
+            remaining -= 1;
+        }
+        let total = (self.cycles - start) as u32;
+        self.pending_dma_stall = self.pending_dma_stall.saturating_add(total);
+    }
+
+    /// Insert `n` DMA-stolen cycles: the APU + NSF2 timer run on
+    /// through the stall and the total is accumulated for
+    /// [`NesBus::take_dma_stall`].
+    fn stall_ticks(&mut self, n: u32) {
+        self.pending_dma_stall = self.pending_dma_stall.saturating_add(n);
+        self.tick_machine(n);
+    }
+
+    /// Advance machine time by `n` CPU cycles. While DMC DMA activity
+    /// is possible the walk is cycle-exact (arm events must be
+    /// observed on their true cycles); otherwise ticks run in cheap
+    /// 8-cycle chunks exactly as before the sub-instruction engine.
+    fn tick_machine(&mut self, n: u32) {
+        let mut rem = n;
+        while rem > 0 {
+            if self.apu.dmc_activity_possible() {
+                self.apu.tick_cpu_cycles(1);
+                self.nsf2_timer.tick(1);
+                self.cycles = self.cycles.wrapping_add(1);
+                rem -= 1;
+                self.observe_dmc_events();
+            } else {
+                let k = rem.min(8);
+                self.apu.tick_cpu_cycles(k);
+                self.nsf2_timer.tick(k);
+                self.cycles = self.cycles.wrapping_add(k as u64);
+                rem -= k;
             }
         }
-        self.cycles = self.cycles.wrapping_add(total as u64);
-        self.pending_dma_stall = self.pending_dma_stall.saturating_add(total);
+    }
+
+    /// Pick up DMC events that fired on the cycle just ticked: a
+    /// newly armed fetch becomes a scheduled load/reload DMA, and an
+    /// implicit sample end becomes the apu-dma-wiki §Bugs
+    /// aborted-/unexpected-DMA outcome (NTSC-class CPUs only — "It is
+    /// not known whether 2A07 CPUs are affected by these bugs").
+    fn observe_dmc_events(&mut self) {
+        let e = self.cycles.wrapping_sub(1); // the cycle just ticked
+        if let Some((addr, is_load)) = self.apu.dmc_take_fetch() {
+            let (kind, halt_from) = if is_load {
+                let hf = self
+                    .dmc_load_halt_from
+                    .take()
+                    .unwrap_or_else(|| first_get(e + 3));
+                (DmcDmaKind::Load, hf.max(first_get(e)))
+            } else {
+                // Reloads "are scheduled to halt the CPU on a put
+                // cycle" — the first put after the buffer emptied.
+                (DmcDmaKind::Reload, first_put(e + 1))
+            };
+            self.dmc_dma = Some(ScheduledDmcDma {
+                addr,
+                kind,
+                halt_from,
+            });
+        }
+        if self.apu.dmc_take_implicit_stop() && !self.apu.is_pal() && self.dmc_dma.is_none() {
+            self.dmc_dma = Some(if e & 1 == 0 {
+                // Stop on the same APU cycle the reload would schedule
+                // ("the 1st CPU cycle before the halt attempt"): the
+                // RP2A03H unexpected DMA runs "from the same address".
+                ScheduledDmcDma {
+                    addr: self.apu.dmc_last_fetch_addr(),
+                    kind: DmcDmaKind::Unexpected,
+                    halt_from: e + 1,
+                }
+            } else {
+                // Stop during the APU cycle before the schedule: the
+                // DMA starts but "is aborted after a single cycle".
+                ScheduledDmcDma {
+                    addr: 0,
+                    kind: DmcDmaKind::Aborted,
+                    halt_from: e + 2,
+                }
+            });
+        }
     }
 
     /// Drain the CPU cycles stolen by DMA (DMC sample-byte fetches +
@@ -1063,7 +1474,13 @@ mod tests {
         bus.write(0x4013, 0x00); // 1-byte sample
         bus.write(0x4015, 0x10); // enable DMC → arms the first fetch
         assert_eq!(bus.take_dma_stall(), 0, "no fetch before ticking");
+        // §"DMC DMA": the load DMA halts "on a get cycle during the
+        // 2nd APU cycle after the write (that is, the 3rd or 4th CPU
+        // cycle)" — the write landed on cycle 0 (get), so the halt is
+        // at cycle 4, not immediately.
         bus.tick_cycles(1);
+        assert_eq!(bus.take_dma_stall(), 0, "no halt before its schedule");
+        bus.tick_cycles(6);
         assert_eq!(
             bus.take_dma_stall(),
             crate::apu::DMC_DMA_LOAD_STALL_CYCLES,
@@ -1094,14 +1511,18 @@ mod tests {
         // needed" — no alignment for a get-half write, one alignment
         // cycle for a put-half write.
         let mut bus = NesBus::new();
-        // Fresh bus: cycle 0 = get half of the first APU cycle.
+        // Fresh bus: cycle 0 = get half of the first APU cycle. The
+        // write occupies cycle 0; the halt lands on cycle 1 — a put —
+        // so the first read starts on the next get with no alignment.
         bus.write(0x4014, 0x02);
         assert_eq!(
             bus.take_dma_stall(),
             OAM_DMA_BASE_STALL_CYCLES,
             "get-half $4014 write needs no alignment cycle"
         );
-        // The 513-cycle DMA leaves the clock on an odd (put) cycle.
+        // Move to a put-half cycle: the halt then lands on a get and
+        // the doc's alignment cycle is spent before the first read.
+        bus.tick_cycles(1);
         bus.write(0x4014, 0x02);
         assert_eq!(
             bus.take_dma_stall(),
@@ -1123,9 +1544,9 @@ mod tests {
         bus.write(0x4012, 0x00);
         bus.write(0x4013, 0x00); // 1-byte sample
         bus.write(0x4015, 0x10); // enable DMC
-        bus.tick_cycles(1); // service the 3-cycle load DMA
+        bus.tick_cycles(7); // past the cycle-4 load-DMA halt
         assert_eq!(bus.take_dma_stall(), crate::apu::DMC_DMA_LOAD_STALL_CYCLES);
-        // Clock now at 1 + 3 = 4 CPU cycles (a get half).
+        // Clock now at 7 + 3 = 10 CPU cycles (a get half).
         bus.write(0x4014, 0x02);
         assert_eq!(
             bus.take_dma_stall(),
@@ -1135,6 +1556,220 @@ mod tests {
         assert!(
             bus.apu.dmc_pending_fetch().is_none(),
             "the in-window refetch must have been serviced"
+        );
+    }
+
+    // ------- Sub-instruction DMA timing (apu-dma-wiki §Behavior) -------
+
+    /// Inject a scheduled reload DMA directly (unit-testing the halt
+    /// placement without arranging the DMC timer phase).
+    fn inject_reload(bus: &mut NesBus, halt_from: u64) {
+        bus.dmc_dma = Some(ScheduledDmcDma {
+            addr: 0xC000,
+            kind: DmcDmaKind::Reload,
+            halt_from,
+        });
+    }
+
+    #[test]
+    fn reload_halt_on_put_costs_four_on_get_costs_three() {
+        // §"DMC DMA": "load DMAs take 3 cycles and reload DMAs take 4
+        // unless the halt is delayed by an odd number of cycles."
+        // Undelayed reload: halt on its scheduled put → 4 cycles.
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 1);
+        bus.tick_cycles(3);
+        assert_eq!(bus.take_dma_stall(), 4, "put-cycle halt: 4-cycle reload");
+        // Delayed by one write cycle: §Behavior "DMA can only halt on
+        // CPU read cycles" — the halt slips to the following get and
+        // the alignment cycle is saved.
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 1);
+        bus.begin_instruction();
+        // 3-cycle instruction whose cycle 1 (the scheduled put) writes.
+        bus.run_instruction(3, 0b010);
+        assert_eq!(
+            bus.take_dma_stall(),
+            3,
+            "halt delayed 1 cycle onto a get: the reload costs 3"
+        );
+    }
+
+    #[test]
+    fn reload_halt_delayed_two_cycles_stays_at_four() {
+        // Two consecutive write cycles (the RMW shape): the delay is
+        // even, parity is preserved, and the reload still costs 4.
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 1);
+        bus.begin_instruction();
+        bus.run_instruction(4, 0b0110); // writes on cycles 1-2
+        assert_eq!(bus.take_dma_stall(), 4, "even delay keeps the put halt");
+    }
+
+    #[test]
+    fn load_dma_delayed_by_write_cycle_costs_four() {
+        // §"DMC DMA": a load DMA normally halts on its scheduled get
+        // (3 cycles); a write cycle there delays it onto a put and the
+        // alignment cycle brings it to 4.
+        let mut bus = NesBus::new();
+        bus.write(0x4010, 0x0F);
+        bus.write(0x4012, 0x00);
+        bus.write(0x4013, 0x00);
+        bus.write(0x4015, 0x10); // cycle-0 write → halt scheduled at 4
+        bus.tick_cycles(4); // cycles 0-3: before the halt
+        assert_eq!(bus.take_dma_stall(), 0);
+        bus.begin_instruction();
+        bus.run_instruction(3, 0b001); // cycle 4 is a write cycle
+        assert_eq!(
+            bus.take_dma_stall(),
+            4,
+            "get-halt delayed onto a put: load DMA costs 4"
+        );
+    }
+
+    #[test]
+    fn oam_halt_delayed_past_rmw_second_write() {
+        // §"OAM DMA": "read-modify-write instructions such as INC
+        // $4014 […] are able to perform a second write before the CPU
+        // can be halted" — the halt slips past the instruction into
+        // the next one's first (read) cycle.
+        let mut bus = NesBus::new();
+        bus.begin_instruction();
+        bus.write(0x4014, 0x02); // the RMW's (first) write
+        bus.run_instruction(6, 0b110000); // INC abs: writes on cycles 4-5
+        assert_eq!(
+            bus.take_dma_stall(),
+            0,
+            "no room for the halt inside the RMW instruction"
+        );
+        // Next CPU cycle (6 — a get) takes the halt; get-half halts
+        // spend the alignment cycle (514 total).
+        bus.tick_cycles(1);
+        assert_eq!(bus.take_dma_stall(), OAM_DMA_BASE_STALL_CYCLES + 1);
+    }
+
+    #[test]
+    fn dmc_during_oam_end_of_window_costs_one_or_three() {
+        // §"DMC DMA during OAM DMA": "if DMC DMA occurs at the end of
+        // OAM DMA, it can take 1 or 3 cycles" instead of the common 2.
+        // Window for a cycle-0 (get) $4014 write: halt at 1 (put),
+        // transfers on cycles 2..=513, last put = 513.
+        // DMC halt on the second-to-last put (511): +1.
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 511);
+        bus.write(0x4014, 0x02);
+        assert_eq!(
+            bus.take_dma_stall(),
+            OAM_DMA_BASE_STALL_CYCLES + 1,
+            "second-to-last-put collision costs 1 extra cycle"
+        );
+        // DMC halt on the last put (513): +3.
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 513);
+        bus.write(0x4014, 0x02);
+        assert_eq!(
+            bus.take_dma_stall(),
+            OAM_DMA_BASE_STALL_CYCLES + 3,
+            "last-put collision costs 3 extra cycles"
+        );
+        // Mid-window control: the common 2-cycle overlap.
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 101);
+        bus.write(0x4014, 0x02);
+        assert_eq!(
+            bus.take_dma_stall(),
+            OAM_DMA_BASE_STALL_CYCLES + DMC_DMA_DURING_OAM_STALL_CYCLES,
+            "mid-window collision costs the common 2 cycles"
+        );
+    }
+
+    // --------------- apu-dma-wiki §Bugs stop timing ---------------
+
+    #[test]
+    fn explicit_stop_in_apu_cycle_before_schedule_aborts_after_one_cycle() {
+        // "When sample playback is stopped during the APU cycle before
+        // a reload DMA would schedule […] the DMA starts, but is
+        // aborted after a single cycle."
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 3); // halt attempt on the APU-1 put
+        bus.write(0x4015, 0x00); // stop at cycle 0 — APU cycle 0
+        bus.tick_cycles(5);
+        assert_eq!(bus.take_dma_stall(), 1, "aborted DMA steals its halt cycle");
+        assert!(
+            !bus.apu.dmc_activity_possible(),
+            "the aborted DMA never performs its read"
+        );
+    }
+
+    #[test]
+    fn explicit_stop_earlier_cancels_without_any_dma() {
+        // A stop before the APU cycle preceding the schedule point
+        // yields no DMA at all — the memory reader only fetches while
+        // "bytes remaining is not zero".
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 5); // halt attempt on the APU-2 put
+        bus.write(0x4015, 0x00); // stop at cycle 0 — two APU cycles early
+        bus.tick_cycles(8);
+        assert_eq!(bus.take_dma_stall(), 0, "stop-early: no DMA, no stall");
+    }
+
+    #[test]
+    fn aborted_dma_skipped_when_halt_attempt_lands_on_write_cycle() {
+        // "If the halt is delayed due to a write cycle, the aborted
+        // DMA doesn't occur at all."
+        let mut bus = NesBus::new();
+        inject_reload(&mut bus, 3);
+        bus.write(0x4015, 0x00); // abort window: DMA becomes a 1-cycle stub
+        bus.begin_instruction();
+        bus.run_instruction(5, 0b01000); // cycle 3 (the halt attempt) writes
+        assert_eq!(bus.take_dma_stall(), 0, "write-delayed abort vanishes");
+    }
+
+    #[test]
+    fn implicit_stop_triggers_unexpected_reload_from_same_address() {
+        // §Bugs: "when playback is stopped implicitly on the same APU
+        // cycle that a reload DMA would schedule […] an unexpected
+        // reload DMA occurs from the same address. This extra byte
+        // goes into the sample buffer". With this machine's pinned
+        // power-up alignment the DMC output-cycle boundary always
+        // lands on a get, selecting exactly this arm of the bug.
+        let mut bus = NesBus::new();
+        // A 1-byte non-looping sample at the fastest rate, enabled at
+        // cycle 0: the load DMA halts at cycle 4, and the 8th
+        // output-unit shift (cycle 7 × 54 = 378) moves the final byte
+        // into the shift register — the implicit stop. The unexpected
+        // DMA halts on the very next cycle (379, put).
+        bus.write(0x4010, 0x0F);
+        bus.write(0x4012, 0x00);
+        bus.write(0x4013, 0x00);
+        bus.write(0x4015, 0x10);
+        bus.tick_cycles(385);
+        assert_eq!(
+            bus.take_dma_stall(),
+            3 + 4,
+            "3-cycle load + 4-cycle unexpected reload"
+        );
+        assert!(
+            bus.apu.dmc_activity_possible(),
+            "the unexpected byte sits in the sample buffer"
+        );
+    }
+
+    #[test]
+    fn implicit_stop_bugs_gated_off_on_pal() {
+        // "It is not known whether 2A07 CPUs are affected by these
+        // bugs" — the PAL machine skips them.
+        let mut bus = NesBus::new();
+        bus.apu.set_cpu_hz(1_662_607);
+        bus.write(0x4010, 0x0F);
+        bus.write(0x4012, 0x00);
+        bus.write(0x4013, 0x00);
+        bus.write(0x4015, 0x10);
+        bus.tick_cycles(500);
+        assert_eq!(
+            bus.take_dma_stall(),
+            3,
+            "PAL: only the load DMA, no unexpected reload"
         );
     }
 

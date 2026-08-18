@@ -25,8 +25,72 @@
 //! write unofficial ops (DCP / ISB / SLO / RLA / SRE / RRA) follow the
 //! 6502's published RMW timing — abs,X / abs,Y / (zp),Y always pay the
 //! 7-cycle penalty even when no page crossing occurred.
+//!
+//! Instruction *state* executes atomically, but every step hands the
+//! bus its per-cycle read/write pattern ([`write_cycle_mask`]) so the
+//! sub-instruction DMA engine can place DMC/OAM DMA halts on their
+//! exact CPU cycles — including the write-cycle halt delays of
+//! `docs/audio/nsf/apu-dma-wiki.html` §Behavior.
 
 use crate::bus::NesBus;
+
+/// Write-cycle bitmask for an IRQ/NMI dispatch: 7 cycles with the
+/// three stack pushes (PCH, PCL, P) on cycles 2-4 — the "interrupts
+/// having 3 [consecutive writes]" case of
+/// `docs/audio/nsf/apu-dma-wiki.html` §Behavior's DMA-halt delays.
+pub const INTERRUPT_WRITE_MASK: u32 = 0b001_1100;
+
+/// Bitmask of which cycles of the instruction `opcode` (taking
+/// `cycles` total) are CPU **write** cycles — bit `i` set means cycle
+/// offset `i` writes. Everything else is a read; the 6502 performs a
+/// bus access on every cycle.
+///
+/// This is the per-cycle bus behaviour the DMA engine needs:
+/// `docs/audio/nsf/apu-dma-wiki.html` §Behavior — "DMA can only halt
+/// on CPU read cycles. On write cycles, the halt fails and the DMA
+/// unit tries again next CPU cycle […] Delays of up to 3 cycles are
+/// possible, with read-modify-write instructions having 2 consecutive
+/// writes and interrupts having 3." Stores (official and unofficial)
+/// write on their final cycle; read-modify-write instructions spend
+/// their final two cycles writing (old value, then new); `PHA`/`PHP`
+/// push on their final cycle; `JSR` pushes the return address on
+/// cycles 3-4; `BRK` pushes PCH/PCL/P on cycles 2-4 (the interrupt
+/// shape). All other opcodes only read.
+pub fn write_cycle_mask(opcode: u8, cycles: u32) -> u32 {
+    match opcode {
+        // BRK: fetch, pad fetch, push PCH/PCL/P, vector lo, vector hi.
+        0x00 => 0b001_1100,
+        // JSR: fetch, operand lo, internal, push PCH, push PCL,
+        // operand hi.
+        0x20 => 0b001_1000,
+        // Single-write stores + stack pushes: the write is the final
+        // cycle. STA/STX/STY, unofficial SAX/SHA/SHX/SHY/TAS, PHA/PHP.
+        0x85 | 0x95 | 0x8D | 0x9D | 0x99 | 0x81 | 0x91 // STA
+        | 0x86 | 0x96 | 0x8E // STX
+        | 0x84 | 0x94 | 0x8C // STY
+        | 0x87 | 0x97 | 0x8F | 0x83 // SAX
+        | 0x9F | 0x93 | 0x9E | 0x9C | 0x9B // SHA/SHX/SHY/TAS
+        | 0x48 | 0x08 // PHA/PHP
+            => 1u32 << (cycles - 1),
+        // Read-modify-write: the final two cycles write (the 6502
+        // writes the unmodified value back, then the new one).
+        // ASL/LSR/ROL/ROR/INC/DEC + unofficial SLO/RLA/SRE/RRA/DCP/ISB.
+        0x06 | 0x16 | 0x0E | 0x1E // ASL
+        | 0x46 | 0x56 | 0x4E | 0x5E // LSR
+        | 0x26 | 0x36 | 0x2E | 0x3E // ROL
+        | 0x66 | 0x76 | 0x6E | 0x7E // ROR
+        | 0xE6 | 0xF6 | 0xEE | 0xFE // INC
+        | 0xC6 | 0xD6 | 0xCE | 0xDE // DEC
+        | 0x07 | 0x17 | 0x0F | 0x1F | 0x1B | 0x03 | 0x13 // SLO
+        | 0x27 | 0x37 | 0x2F | 0x3F | 0x3B | 0x23 | 0x33 // RLA
+        | 0x47 | 0x57 | 0x4F | 0x5F | 0x5B | 0x43 | 0x53 // SRE
+        | 0x67 | 0x77 | 0x6F | 0x7F | 0x7B | 0x63 | 0x73 // RRA
+        | 0xC7 | 0xD7 | 0xCF | 0xDF | 0xDB | 0xC3 | 0xD3 // DCP
+        | 0xE7 | 0xF7 | 0xEF | 0xFF | 0xFB | 0xE3 | 0xF3 // ISB
+            => 0b11u32 << (cycles - 2),
+        _ => 0,
+    }
+}
 
 const FLAG_C: u8 = 1 << 0;
 const FLAG_Z: u8 = 1 << 1;
@@ -90,8 +154,9 @@ impl Cpu6502 {
         // before any pending IRQ check (the NSF2 non-returning-INIT
         // path uses NMI to interrupt INIT and run PLAY).
         if bus.take_nmi() {
+            bus.begin_instruction();
             let cy = self.service_interrupt(bus, 0xFFFA);
-            bus.tick_cycles(cy);
+            bus.run_instruction(cy, INTERRUPT_WRITE_MASK);
             return cy + bus.take_dma_stall();
         }
         // IRQ is level-triggered: serviced whenever the I flag is
@@ -99,13 +164,18 @@ impl Cpu6502 {
         // device — see `docs/audio/nsf/nsf2-nesdev-wiki.html` §IRQ
         // Support).
         if (self.p & FLAG_I) == 0 && bus.irq_line() {
+            bus.begin_instruction();
             let cy = self.service_interrupt(bus, 0xFFFE);
-            bus.tick_cycles(cy);
+            bus.run_instruction(cy, INTERRUPT_WRITE_MASK);
             return cy + bus.take_dma_stall();
         }
+        bus.begin_instruction();
         let opcode = self.fetch_byte(bus);
         let cycles = self.dispatch(bus, opcode);
-        bus.tick_cycles(cycles);
+        // Hand the bus the instruction's per-cycle read/write pattern
+        // so DMA halts land on their true cycles (apu-dma-wiki
+        // §Behavior write-cycle halt delays).
+        bus.run_instruction(cycles, write_cycle_mask(opcode, cycles));
         cycles + bus.take_dma_stall()
     }
 
@@ -2040,21 +2110,89 @@ mod tests {
         bus.write(0x4010, 0x4F); // loop, fastest rate
         bus.write(0x4012, 0x00);
         bus.write(0x4013, 0x00); // 1-byte sample
-        bus.write(0x4015, 0x10); // enable → fetch arms on next tick
+        bus.write(0x4015, 0x10); // enable → load DMA halts at cycle 4
         let mut cpu = Cpu6502::new();
         bus.ram[0x0200] = 0xEA; // NOP
+        bus.ram[0x0201] = 0xEA;
+        bus.ram[0x0202] = 0xEA;
         cpu.pc = 0x0200;
         cpu.p = FLAG_U | FLAG_I;
+        // §"DMC DMA": the load DMA is scheduled for "a get cycle
+        // during the 2nd APU cycle after the write" — cycle 4 for the
+        // cycle-0 write above. The first two NOPs (cycles 0-3) run
+        // unstalled; the third begins on cycle 4 and eats the stall.
+        assert_eq!(cpu.step(&mut bus), 2, "cycles 0-1: before the halt");
+        assert_eq!(cpu.step(&mut bus), 2, "cycles 2-3: before the halt");
         let cy = cpu.step(&mut bus);
         assert_eq!(
             cy,
             2 + crate::apu::DMC_DMA_LOAD_STALL_CYCLES,
-            "NOP (2 cycles) + the first DMC fetch's 3-cycle load-DMA stall"
+            "NOP (2 cycles) + the cycle-4 3-cycle load-DMA stall"
         );
         // With the buffer full, the next instruction runs unstalled.
-        bus.ram[0x0201] = 0xEA;
+        bus.ram[0x0203] = 0xEA;
         let cy2 = cpu.step(&mut bus);
         assert_eq!(cy2, 2, "no fetch pending → no stall");
+    }
+
+    #[test]
+    fn write_cycle_mask_matches_documented_shapes() {
+        // apu-dma-wiki §Behavior: stores write on their final cycle,
+        // "read-modify-write instructions having 2 consecutive writes
+        // and interrupts having 3".
+        assert_eq!(write_cycle_mask(0x8D, 4), 0b1000, "STA abs");
+        assert_eq!(write_cycle_mask(0x9D, 5), 0b10000, "STA abs,X");
+        assert_eq!(write_cycle_mask(0x91, 6), 0b100000, "STA (zp),Y");
+        assert_eq!(write_cycle_mask(0x48, 3), 0b100, "PHA");
+        assert_eq!(write_cycle_mask(0xEE, 6), 0b110000, "INC abs (RMW)");
+        assert_eq!(write_cycle_mask(0x1E, 7), 0b1100000, "ASL abs,X (RMW)");
+        assert_eq!(write_cycle_mask(0x03, 8), 0b11000000, "SLO (zp,X) (RMW)");
+        assert_eq!(write_cycle_mask(0x00, 7), 0b0011100, "BRK pushes on 2-4");
+        assert_eq!(write_cycle_mask(0x20, 6), 0b011000, "JSR pushes on 3-4");
+        assert_eq!(write_cycle_mask(0xAD, 4), 0, "LDA abs never writes");
+        assert_eq!(write_cycle_mask(0xEA, 2), 0, "NOP never writes");
+        assert_eq!(INTERRUPT_WRITE_MASK, 0b0011100, "IRQ/NMI pushes on 2-4");
+    }
+
+    #[test]
+    fn rmw_4014_write_delays_oam_halt_into_next_instruction() {
+        // apu-dma-wiki §"OAM DMA": "read-modify-write instructions
+        // such as INC $4014 […] are able to perform a second write
+        // before the CPU can be halted" — the OAM halt slips past the
+        // RMW's back-to-back write cycles onto the next instruction's
+        // opcode fetch, and the stall lands on THAT step's cycle
+        // count.
+        let mut bus = NesBus::new();
+        let mut cpu = Cpu6502::new();
+        bus.ram[0x0200] = 0xEE; // INC $4014
+        bus.ram[0x0201] = 0x14;
+        bus.ram[0x0202] = 0x40;
+        bus.ram[0x0203] = 0xEA; // NOP
+        cpu.pc = 0x0200;
+        cpu.p = FLAG_U | FLAG_I;
+        let cy = cpu.step(&mut bus);
+        assert_eq!(cy, 6, "the RMW itself finishes unstalled");
+        // Halt lands on cycle 6 (a get) → alignment → 514 cycles.
+        let cy2 = cpu.step(&mut bus);
+        assert_eq!(cy2, 2 + 514, "NOP + the write-delayed 514-cycle OAM DMA");
+    }
+
+    #[test]
+    fn sta_4014_stall_lands_on_following_instruction() {
+        // The plain-store case for contrast: STA $4014's write is its
+        // final cycle, the halt is "scheduled … on the first cycle
+        // after the register write" — the next instruction's fetch.
+        let mut bus = NesBus::new();
+        let mut cpu = Cpu6502::new();
+        bus.ram[0x0200] = 0x8D; // STA $4014
+        bus.ram[0x0201] = 0x14;
+        bus.ram[0x0202] = 0x40;
+        bus.ram[0x0203] = 0xEA; // NOP
+        cpu.pc = 0x0200;
+        cpu.p = FLAG_U | FLAG_I;
+        assert_eq!(cpu.step(&mut bus), 4, "the store itself is unstalled");
+        // Halt on cycle 4 (a get) → alignment cycle → 514.
+        assert_eq!(cpu.step(&mut bus), 2 + 514, "NOP + 514-cycle OAM DMA");
     }
 
     #[test]
