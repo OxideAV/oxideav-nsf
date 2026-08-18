@@ -148,7 +148,15 @@ impl Cpu6502 {
     /// off the return value see the DMA-stretched wall-clock time.
     pub fn step(&mut self, bus: &mut NesBus) -> u32 {
         if self.halted {
-            return 1;
+            // A KIL/JAM opcode stops the CPU's instruction sequencing,
+            // not the machine clock: the APU (frame counter, length
+            // counters, DMC fetches) keeps running while the jammed
+            // CPU holds the bus. Previously a jam froze the whole
+            // machine, so a jammed rip held its last mixer state
+            // forever instead of letting envelopes decay and length
+            // counters silence the channels.
+            bus.tick_cycles(1);
+            return 1 + bus.take_dma_stall();
         }
         // NMI is edge-triggered and ignores the I flag — service it
         // before any pending IRQ check (the NSF2 non-returning-INIT
@@ -2133,6 +2141,37 @@ mod tests {
         bus.ram[0x0203] = 0xEA;
         let cy2 = cpu.step(&mut bus);
         assert_eq!(cy2, 2, "no fetch pending → no stall");
+    }
+
+    #[test]
+    fn jammed_cpu_keeps_the_apu_clock_running() {
+        // KIL stops instruction sequencing, not the machine: the frame
+        // counter must keep clocking length counters while the CPU is
+        // jammed, so an armed pulse eventually silences instead of
+        // droning forever on the frozen mixer state.
+        let mut bus = NesBus::new();
+        bus.write(0x4015, 0x01); // pulse 1 on
+        bus.write(0x4000, 0x1F); // constant volume, length halt CLEAR
+        bus.write(0x4002, 0x50);
+        bus.write(0x4003, 0x00); // period hi + length load (index 0 = 10)
+        assert_eq!(bus.read(0x4015) & 0x01, 0x01, "length counter armed");
+        let mut cpu = Cpu6502::new();
+        bus.ram[0x0200] = 0x02; // KIL
+        cpu.pc = 0x0200;
+        cpu.p = FLAG_U | FLAG_I;
+        // 10 length-counter decrements need ~150k CPU cycles of
+        // half-frame clocks; each jammed step ticks one cycle.
+        let mut spent = 0u64;
+        for _ in 0..160_000 {
+            spent += cpu.step(&mut bus) as u64;
+        }
+        assert!(cpu.halted, "KIL must have latched the jam");
+        assert!(spent >= 160_000, "each jammed step is at least one cycle");
+        assert_eq!(
+            bus.read(0x4015) & 0x01,
+            0,
+            "length counter must have expired while the CPU was jammed"
+        );
     }
 
     #[test]

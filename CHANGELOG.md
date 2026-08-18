@@ -166,6 +166,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A KIL/JAM-halted CPU no longer freezes the whole machine.** The
+  jam stops the 6502's instruction sequencing, not the machine clock:
+  `Cpu6502::step` on a halted CPU now ticks the bus one cycle (APU
+  frame counter, length counters, DMC fetches and their DMA stalls
+  all keep running) instead of returning without advancing time — a
+  jammed rip previously droned its last mixer state forever, where
+  hardware lets envelopes decay and length counters silence the
+  channels. New `jammed_cpu_keeps_the_apu_clock_running` test pins a
+  length-counter expiry across a jam.
+
 - **Registry decoder started the wrong track on NSFe files with a
   non-zero starting song**: it treated the raw `starting_song` field
   as 1-based for both containers, so an NSFe starting song of 1
