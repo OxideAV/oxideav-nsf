@@ -420,7 +420,7 @@ fn dma_heavy_programs_never_panic_or_hang() {
     // run DPCM at the fastest rate so reload DMAs land inside OAM
     // windows. All the stolen cycles count toward the render budget,
     // so render() must still converge on every variant.
-    let variants: [&[u8]; 4] = [
+    let variants: [&[u8]; 6] = [
         // PLAY: STA $4014 in an infinite loop (non-returning PLAY).
         &[0xA9, 0x02, 0x8D, 0x14, 0x40, 0x4C, 0x03, 0x80],
         // PLAY: enable DMC, immediately disable (cancel armed fetch),
@@ -438,6 +438,28 @@ fn dma_heavy_programs_never_panic_or_hang() {
         // PLAY: read $4015 between OAM DMAs (status read on the
         // stall-stretched clock).
         &[0x8D, 0x14, 0x40, 0xAD, 0x15, 0x40, 0x8D, 0x14, 0x40, 0x60],
+        // PLAY: RMW on $4014 over live fastest-rate DPCM — the
+        // write-delayed OAM halt slips into the following
+        // instruction (apu-dma-wiki §"OAM DMA" INC $4014 case).
+        &[
+            0xA9, 0x4F, 0x8D, 0x10, 0x40, // loop, fastest rate
+            0xA9, 0x10, 0x8D, 0x15, 0x40, // DMC on
+            0xEE, 0x14, 0x40, // INC $4014 (RMW OAM trigger)
+            0x60,
+        ],
+        // PLAY: non-looping 1-byte sample restarted every call — each
+        // restart ends in the §Bugs implicit-stop path (the
+        // unexpected/aborted DMA arm depending on parity), plus an
+        // RMW $4015 disable racing the armed fetch.
+        &[
+            0xA9, 0x0F, 0x8D, 0x10, 0x40, // no loop, fastest rate
+            0xA9, 0x00, 0x8D, 0x12, 0x40, // sample addr $C000
+            0x8D, 0x13, 0x40, // 1-byte sample
+            0xA9, 0x10, 0x8D, 0x15, 0x40, // DMC on (load DMA)
+            0xCE, 0x15, 0x40, // DEC $4015 (RMW disable mid-stream)
+            0xA9, 0x10, 0x8D, 0x15, 0x40, // DMC on again
+            0x60,
+        ],
     ];
     for (i, play) in variants.iter().enumerate() {
         let mut buf = vec![0u8; NSF_HEADER_LEN];

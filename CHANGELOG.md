@@ -190,6 +190,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **DMA cycle-accounting integration battery** (`tests/dma_timing.rs`
+  + two new `parse_fuzz` DMA-heavy variants): real instruction
+  streams hammering RMW `$4014` OAM triggers, `$4015` RMW disables
+  racing armed fetches, non-looping-sample implicit stops, and
+  IRQ-dispatch write runs over live DPCM must keep the bus clock and
+  the summed `Cpu6502::step` returns equal cycle-for-cycle — pinning
+  that the sub-instruction DMA engine never drops or double-counts a
+  stolen cycle — and every variant still parses + renders within the
+  fuzz battery's budget.
+
 - **Hostile-input battery for the container layer**
   (`tests/container_hostile.rs`, 19 tests): truncated chunk headers
   at every dangling length, `u32::MAX` / past-buffer declared sizes,
