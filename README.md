@@ -244,15 +244,18 @@ vector overlay, non-returning INIT, and suppressed-PLAY paradigms.
   CPU-cycle batches — adequate for music, not cycle-exact.
 * DMA timing is sub-instruction cycle-exact (write-cycle halt delays,
   3/4-cycle parity flips, OAM halt placement, end-of-window DMC
-  collisions, aborted/unexpected stop bugs), but the 6502 still
-  executes each instruction's *bus accesses* atomically at its start:
-  register reads/writes other than the DMA-relevant `$4014`/`$4015`
-  triggers land up to ~3 cycles early relative to their hardware
-  cycle, dummy reads (indexed page-cross, RMW write-back) are not
-  replayed through the bus, the halted read is not repeated on no-op
-  DMA cycles (the DMA page's register-conflict extra reads), and the
-  256 OAM source reads are not replayed (CPU-time cost only). A full
-  per-access core would close these.
+  collisions, aborted/unexpected stop bugs), and writes to the
+  time-sensitive 2A03 + NSF2-timer registers (`$4000-$4013`, `$4015`,
+  `$4017`, `$401B-$401D`) are deferred to their true write-cycle
+  offsets — the `$4017` phase-dependent 3/4-cycle reset delay now
+  keys off the hardware write cycle. Still instruction-atomic:
+  register *reads* and expansion-chip register writes land up to ~3
+  cycles early relative to their hardware cycle, dummy reads (indexed
+  page-cross, RMW write-back) are not replayed through the bus, the
+  halted read is not repeated on no-op DMA cycles (the DMA page's
+  register-conflict extra reads), and the 256 OAM source reads are
+  not replayed (CPU-time cost only). A full per-access core would
+  close these.
 * OPLL envelope *attack*: the live **Attack** path is now §7-driven —
   its transition *timing* uses the silicon-measured global-counter
   `eg_shift`/`eg_select` duty (the same model as decay) and each step

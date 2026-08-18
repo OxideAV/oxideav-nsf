@@ -55,6 +55,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     same address" whose byte lands in the sample buffer. (With this
     machine's pinned power-up alignment the implicit stop always
     lands on a get, selecting the unexpected-DMA arm.)
+- **Time-sensitive register writes land on their true write cycles**:
+  CPU stores to `$4000-$4013`, `$4015`, `$4017` and the NSF2 timer's
+  `$401B-$401D` are deferred from the executing instruction's first
+  cycle to the write's exact cycle offset (a store writes on its
+  final cycle; an RMW on its final two). Most visibly, the `$4017`
+  frame-counter reset delay — "After 3 or 4 CPU clock cycles*, the
+  timer is reset", 3 vs 4 depending on the write's CPU/APU phase —
+  now keys off the hardware write cycle instead of the instruction
+  boundary, which previously evaluated the wrong parity roughly half
+  the time; `$4011` DAC levels, channel enables, and NSF2 IRQ-timer
+  reprogramming shift to their hardware cycles the same way. Memory-
+  class writes (RAM / cart RAM / FDS RAM / bank selects) still apply
+  atomically with the instruction, and expansion-chip registers stay
+  immediate (their internal clocks are batch-stepped — a known gap).
+  New `deferred_4017_write_keys_reset_delay_off_the_write_cycle` test
+  pins the parity flip through real store instructions.
+
   The DMA-inactive path still ticks in the old 8-cycle chunks, so
   DMC-free rips render byte-identically. 12 new unit tests pin the
   delayed/undelayed 3/4 reload+load splits, the RMW-delayed OAM halt

@@ -357,11 +357,13 @@ pub struct NesBus {
     /// Write-call index of the `$4014` OAM DMA trigger, if the current
     /// instruction wrote it.
     oam_trigger_call: Option<u32>,
-    /// Write-call index + D4 value of a `$4015` write by the current
-    /// instruction. The DMC enable/disable is applied at the write's
-    /// true cycle during the walk so load scheduling and the §Bugs
-    /// stop-timing see the hardware write cycle.
-    dmc_enable_call: Option<(u32, bool)>,
+    /// Time-sensitive register writes made by the current instruction,
+    /// as `(write-call index, addr, value)`. Applied at their true
+    /// cycle offsets during the walk so the `$4017` phase-dependent
+    /// frame-reset delay, the `$4015` D4 DMA scheduling / §Bugs
+    /// stop-timing, and the cycle-counting NSF2 timer all see the
+    /// hardware write cycle instead of the instruction's first cycle.
+    deferred_writes: Vec<(u32, u16, u8)>,
 }
 
 impl Default for NesBus {
@@ -394,7 +396,7 @@ impl NesBus {
             in_instruction: false,
             instr_write_calls: 0,
             oam_trigger_call: None,
-            dmc_enable_call: None,
+            deferred_writes: Vec::new(),
         }
     }
 
@@ -688,33 +690,57 @@ impl NesBus {
     pub fn write(&mut self, addr: u16, value: u8) {
         if self.in_instruction {
             self.instr_write_calls = self.instr_write_calls.wrapping_add(1);
+            match addr {
+                // Replayed at the write's true cycle offset by
+                // `run_instruction` — the halt is "scheduled … on the
+                // first cycle after the register write".
+                0x4014 => {
+                    self.oam_trigger_call = Some(self.instr_write_calls - 1);
+                    return;
+                }
+                // Time-sensitive 2A03 APU + NSF2-timer registers are
+                // deferred to the write's true cycle offset: on
+                // hardware the register changes on the store's final
+                // cycle, not on the instruction's first — the `$4017`
+                // frame-reset delay is phase-dependent, the `$4015`
+                // D4 edge schedules the load DMA, and the NSF2 timer
+                // counts CPU cycles. Memory-class writes (RAM, cart
+                // RAM, FDS RAM, bank selects) apply immediately so
+                // the instruction-atomic core stays self-consistent;
+                // expansion-chip registers also stay immediate —
+                // their internal clocks are documented as
+                // batch-stepped in the README's known gaps.
+                0x4000..=0x4013 | 0x4015 | 0x4017 | 0x401B..=0x401D => {
+                    self.deferred_writes
+                        .push((self.instr_write_calls - 1, addr, value));
+                    return;
+                }
+                _ => {}
+            }
+        } else if addr == 0x4014 {
+            // Direct (CPU-less) write, e.g. from tests: the write
+            // occupies the current cycle and the halt lands on the
+            // next one.
+            self.tick_machine(1);
+            self.run_oam_window();
+            return;
         }
+        self.apply_write(addr, value);
+    }
+
+    /// Apply a bus write's side effects (see [`NesBus::write`] for the
+    /// deferral rules — this runs either immediately or at the write's
+    /// true cycle offset during the instruction walk).
+    fn apply_write(&mut self, addr: u16, value: u8) {
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize] = value,
             0x2000..=0x3FFF => {}
             0x4000..=0x4013 => self.apu.write_register(addr, value),
-            0x4014 => {
-                if self.in_instruction {
-                    // Replayed at the write's true cycle offset by
-                    // `run_instruction` — the halt is "scheduled …
-                    // on the first cycle after the register write".
-                    self.oam_trigger_call = Some(self.instr_write_calls - 1);
-                } else {
-                    // Direct (CPU-less) write, e.g. from tests: the
-                    // write occupies the current cycle and the halt
-                    // lands on the next one.
-                    self.tick_machine(1);
-                    self.run_oam_window();
-                }
-            }
+            // Handled in `write` / the walk — never deferred here.
+            0x4014 => {}
             0x4015 => {
                 self.apu.write_status_except_dmc_enable(value);
-                let on = value & 0x10 != 0;
-                if self.in_instruction {
-                    self.dmc_enable_call = Some((self.instr_write_calls - 1, on));
-                } else {
-                    self.apply_dmc_enable(on);
-                }
+                self.apply_dmc_enable(value & 0x10 != 0);
             }
             0x4016 => {}
             0x4017 => self.apu.write_frame_counter(value),
@@ -783,7 +809,7 @@ impl NesBus {
     /// through [`NesBus::run_instruction`], which carries the
     /// instruction's true read/write cycle pattern.
     pub fn tick_cycles(&mut self, cycles: u32) {
-        self.walk_pattern(cycles, 0, None, None);
+        self.walk_pattern(cycles, 0, None, &[]);
     }
 
     /// Mark the start of a CPU instruction (or interrupt dispatch):
@@ -794,7 +820,7 @@ impl NesBus {
         self.in_instruction = true;
         self.instr_write_calls = 0;
         self.oam_trigger_call = None;
-        self.dmc_enable_call = None;
+        self.deferred_writes.clear();
     }
 
     /// Advance machine time for one executed instruction of `cycles`
@@ -810,11 +836,15 @@ impl NesBus {
             .oam_trigger_call
             .take()
             .map(|k| nth_write_offset(write_mask, k, cycles));
-        let dmc = self
-            .dmc_enable_call
-            .take()
-            .map(|(k, on)| (nth_write_offset(write_mask, k, cycles), on));
-        self.walk_pattern(cycles, write_mask, oam, dmc);
+        // Map each deferred register write's call index onto its true
+        // cycle offset within the instruction.
+        let mut deferred = std::mem::take(&mut self.deferred_writes);
+        for entry in deferred.iter_mut() {
+            entry.0 = nth_write_offset(write_mask, entry.0, cycles);
+        }
+        self.walk_pattern(cycles, write_mask, oam, &deferred);
+        deferred.clear();
+        self.deferred_writes = deferred;
     }
 
     /// Walk `len` CPU cycles with the given write-cycle mask, applying
@@ -825,15 +855,15 @@ impl NesBus {
         len: u32,
         write_mask: u32,
         oam_trigger: Option<u32>,
-        dmc_enable: Option<(u32, bool)>,
+        deferred: &[(u32, u16, u8)],
     ) {
         let mut o: u32 = 0;
         while o < len {
             let read_cycle = is_read_cycle(write_mask, o);
-            // Deferred $4015 DMC enable/disable lands on its write cycle.
-            if let Some((eo, on)) = dmc_enable {
-                if eo == o {
-                    self.apply_dmc_enable(on);
+            // Deferred register writes land on their write cycles.
+            for &(off, addr, value) in deferred {
+                if off == o {
+                    self.apply_write(addr, value);
                 }
             }
             // A $4014 write schedules the OAM halt for the next cycle.
@@ -1680,6 +1710,47 @@ mod tests {
             bus.take_dma_stall(),
             OAM_DMA_BASE_STALL_CYCLES + DMC_DMA_DURING_OAM_STALL_CYCLES,
             "mid-window collision costs the common 2 cycles"
+        );
+    }
+
+    #[test]
+    fn deferred_4017_write_keys_reset_delay_off_the_write_cycle() {
+        // apu-frame-counter §"Side effects": the $4017 sequence reset
+        // lands "after 3 or 4 CPU clock cycles" measured from the
+        // WRITE cycle's CPU/APU phase. The write is a store's final
+        // cycle, so shifting the store by a 3-cycle instruction moves
+        // the write cycle by 3 and — because the delay flips 3↔4 with
+        // the parity — the reset (and the whole 4-step IRQ schedule
+        // behind it) by exactly 4 CPU cycles.
+        fn first_frame_irq_cycle(with_prefix: bool) -> u64 {
+            let mut bus = NesBus::new();
+            let mut cpu = crate::cpu::Cpu6502::new();
+            let mut prog: Vec<u8> = vec![0xA9, 0x00]; // LDA #$00
+            if with_prefix {
+                prog.extend([0xA5, 0x00]); // LDA $00 (3 cycles)
+            }
+            prog.extend([0x8D, 0x17, 0x40]); // STA $4017 (4-step, IRQ on)
+            bus.ram[0x0200..0x0200 + prog.len()].copy_from_slice(&prog);
+            cpu.pc = 0x0200;
+            cpu.p = 0x24;
+            let steps = if with_prefix { 3 } else { 2 };
+            for _ in 0..steps {
+                cpu.step(&mut bus);
+            }
+            for _ in 0..40_000u32 {
+                if bus.irq_line() {
+                    return bus.cycles;
+                }
+                bus.tick_cycles(1);
+            }
+            panic!("frame IRQ never asserted");
+        }
+        let base = first_frame_irq_cycle(false);
+        let shifted = first_frame_irq_cycle(true);
+        assert_eq!(
+            shifted - base,
+            4,
+            "3-cycle-later write cycle flips the 3/4 delay: schedule moves by 4"
         );
     }
 
