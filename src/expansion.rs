@@ -1978,16 +1978,16 @@ impl Vrc7 {
     /// no rhythm DAC, so they are accepted and ignored.
     pub fn apply_nsfe_chunk(&mut self, device: u8, patches: Option<&[u8]>) {
         self.ym2413_variant = device == 1;
-        if let Some(bytes) = patches {
-            if bytes.len() >= 128 {
-                let mut table = [[0u8; 8]; 16];
-                for (i, row) in table.iter_mut().enumerate() {
-                    row.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
-                }
-                // Slot 0 stays live user-patch territory regardless of
-                // what the table carried; `patch()` never reads it.
-                self.patch_override = Some(table);
+        if let Some(bytes) = patches
+            && bytes.len() >= 128
+        {
+            let mut table = [[0u8; 8]; 16];
+            for (i, row) in table.iter_mut().enumerate() {
+                row.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
             }
+            // Slot 0 stays live user-patch territory regardless of
+            // what the table carried; `patch()` never reads it.
+            self.patch_override = Some(table);
         }
     }
 
@@ -2416,11 +2416,7 @@ impl Fds {
             return 0;
         }
         let c = 8 * (e as u32 + 1) * (m as u32 + 1);
-        if fast {
-            (c / 4).max(1)
-        } else {
-            c
-        }
+        if fast { (c / 4).max(1) } else { c }
     }
 
     /// Stage a volume-gain change. The §"Unit tick" PWM unit only commits
@@ -2437,10 +2433,10 @@ impl Fds {
 
     /// Commit a staged volume-gain change once the wave position reaches 0.
     fn commit_pending_volume(&mut self) {
-        if self.wave_pos == 0 {
-            if let Some(g) = self.vol_pending.take() {
-                self.volume = g;
-            }
+        if self.wave_pos == 0
+            && let Some(g) = self.vol_pending.take()
+        {
+            self.volume = g;
         }
     }
 
@@ -2572,11 +2568,7 @@ impl Fds {
     fn step_volume_env(&mut self) {
         let cur = self.vol_pending.unwrap_or(self.volume);
         let next = if self.vol_env_increase {
-            if cur < 32 {
-                cur + 1
-            } else {
-                cur
-            }
+            if cur < 32 { cur + 1 } else { cur }
         } else if cur > 0 {
             cur - 1
         } else {
@@ -2884,9 +2876,9 @@ mod tests {
         chip.write(0xB000, 0x08); // A = $08
         chip.write(0xB001, 0x10); // period low
         chip.write(0xB002, 0x80); // E=1, period high = 0
-                                  // The chip starts on step 0 — the first tick we observe
-                                  // advances to step 1 (no-op), so we read $00. Walk 14 clocks
-                                  // to reach the full cycle plus the reset wrap.
+        // The chip starts on step 0 — the first tick we observe
+        // advances to step 1 (no-op), so we read $00. Walk 14 clocks
+        // to reach the full cycle plus the reset wrap.
         let walk = vrc6_saw_walk(&mut chip, 14);
         // step 1=odd→$00, 2=add→$08, 3=$08, 4=$10, 5=$10, 6=$18,
         // 7=$18, 8=$20, 9=$20, 10=$28, 11=$28, 12=$30, 13=$30,
@@ -2950,7 +2942,7 @@ mod tests {
         chip.write(0xB000, 0x08);
         chip.write(0xB001, 0x04);
         chip.write(0xB002, 0x80); // E=1
-                                  // Drive a few clocks to put the accumulator above zero.
+        // Drive a few clocks to put the accumulator above zero.
         let _ = vrc6_saw_walk(&mut chip, 4);
         assert!(
             chip.saw.accum > 0,
@@ -2974,7 +2966,7 @@ mod tests {
         chip.write(0xB000, 0x08);
         chip.write(0xB001, 0xFF);
         chip.write(0xB002, 0x80); // E=1, period = $0FF
-                                  // Tick partway through the timer so the divider is mid-count.
+        // Tick partway through the timer so the divider is mid-count.
         chip.tick(50);
         let timer_before = chip.saw.timer;
         assert!(timer_before > 0 && timer_before < chip.saw.timer_period);
@@ -3179,7 +3171,7 @@ mod tests {
         chip.write(0xB001, 0xFF); // period low = $FF
         chip.write(0xB002, 0x80); // E=1, period high = 0
         chip.write(0x9003, 0b0000_0010); // 16x
-                                         // Walk exactly one full 14-step cycle: 14 * 16 = 224 cycles.
+        // Walk exactly one full 14-step cycle: 14 * 16 = 224 cycles.
         chip.tick(224);
         assert_eq!(chip.saw.step, 0, "14 steps in 224 cycles at 16x");
         // Accumulator was reset on re-reaching step 0.
@@ -3287,7 +3279,7 @@ mod tests {
         chip.write(0x9000, 0x7F); // M=0, duty=7 (50 %), vol=15
         chip.write(0x9001, 0x04);
         chip.write(0x9002, 0x80); // E=1
-                                  // Walk a few steps so the generator is mid-countdown.
+        // Walk a few steps so the generator is mid-countdown.
         for _ in 0..5 {
             let _ = vrc6_pulse_step_once(&mut chip, 0);
         }
@@ -3670,7 +3662,7 @@ mod tests {
         chip.write(0x5015, 0x01);
         chip.write(0x5000, 0x00); // constant CLEAR, halt CLEAR, env period (volume)=0
         chip.write(0x5003, 0x08); // env_start + long length
-                                  // First clock consumes env_start (decay→15).
+        // First clock consumes env_start (decay→15).
         mmc5_frame_steps(&mut chip, 1);
         assert_eq!(chip.pulse[0].env_decay, 15);
         mmc5_frame_steps(&mut chip, 1);
@@ -3704,7 +3696,7 @@ mod tests {
         chip.write(0x5015, 0x01);
         chip.write(0x5000, 0x20); // constant CLEAR, halt/loop SET, period 0
         chip.write(0x5003, 0x08); // env_start
-                                  // Walk decay down to 0 (15 steps after the start-consuming one).
+        // Walk decay down to 0 (15 steps after the start-consuming one).
         mmc5_frame_steps(&mut chip, 1 + 15);
         assert_eq!(chip.pulse[0].env_decay, 0);
         mmc5_frame_steps(&mut chip, 1); // loop wraps back to 15
@@ -3718,7 +3710,7 @@ mod tests {
         let mut chip = Mmc5::new();
         chip.write(0x5015, 0x01);
         chip.write(0x5002, 0x40); // non-zero period
-                                  // Constant volume 7.
+        // Constant volume 7.
         chip.write(0x5000, 0x17); // constant SET, volume 7
         chip.write(0x5003, 0x08); // arm length (resets duty step to 0)
         chip.pulse[0].step = 1; // a high step for duty 0
@@ -4266,8 +4258,8 @@ mod tests {
         // (bit 0 tone-dis + bit 3 noise-dis).
         s5b_write_reg(&mut chip, 7, 0b0011_1111);
         s5b_write_reg(&mut chip, 8, 0x0F); // channel A volume = 15
-                                           // Channels B and C: tone disabled AND noise disabled both
-                                           // (constant signal), volume = 0 so they contribute zero.
+        // Channels B and C: tone disabled AND noise disabled both
+        // (constant signal), volume = 0 so they contribute zero.
         s5b_write_reg(&mut chip, 9, 0x00);
         s5b_write_reg(&mut chip, 0x0A, 0x00);
         // Regardless of how we tick the chip, channel A's signal is
@@ -4338,7 +4330,7 @@ mod tests {
         assert_eq!(chip.mod_table[0], 0x05);
         assert_eq!(chip.mod_table[1], 0x02);
         assert_eq!(chip.mod_pos, 4); // advanced by 2 per write
-                                     // Enabling the mod unit blocks further table writes.
+        // Enabling the mod unit blocks further table writes.
         chip.write(0x4087, 0x00); // mod_freq hi = 0, clears disable bit
         assert!(!chip.mod_disabled);
         let before = chip.mod_table[2];
@@ -4479,7 +4471,7 @@ mod tests {
         chip.wave_pos = 0;
         chip.volume = 20;
         chip.master_env_speed = 1; // small master speed
-                                   // $4080: M=0 (envelope on), D=0 (decrease), speed=0 -> c = 8*1*2 = 16.
+        // $4080: M=0 (envelope on), D=0 (decrease), speed=0 -> c = 8*1*2 = 16.
         chip.write(0x4080, 0x00);
         assert!(!chip.vol_env_disabled);
         assert!(!chip.vol_env_increase);
@@ -4549,14 +4541,14 @@ mod tests {
         chip.volume = 20;
         chip.master_env_speed = 1;
         chip.write(0x4080, 0x00); // decrease, c = 16
-                                  // $4083 bit 6 set: halt both envelopes (and reset their timers).
+        // $4083 bit 6 set: halt both envelopes (and reset their timers).
         chip.write(0x4083, 0x40);
         assert!(chip.env_halt);
         for _ in 0..50 {
             chip.tick(16);
         }
         assert_eq!(chip.volume, 20); // frozen while halted
-                                     // Clear the halt: the envelope resumes ramping.
+        // Clear the halt: the envelope resumes ramping.
         chip.write(0x4083, 0x00);
         chip.tick(16);
         assert_eq!(chip.volume, 19);
@@ -4758,7 +4750,7 @@ mod tests {
     fn fds_4023_sound_disable_halts_wave_and_freezes_position() {
         let mut chip = Fds::new();
         chip.freq = 0x200; // non-zero so the wave unit would advance
-                           // Advance a bit so the position is non-zero, then disable sound.
+        // Advance a bit so the position is non-zero, then disable sound.
         for _ in 0..32 {
             chip.tick(16);
         }
@@ -4803,13 +4795,13 @@ mod tests {
         chip.volume = 20;
         chip.master_env_speed = 1;
         chip.write(0x4080, 0x00); // decrease envelope, c = 16
-                                  // Disable sound: the envelopes must not tick.
+        // Disable sound: the envelopes must not tick.
         chip.write(0x4023, 0x00);
         for _ in 0..50 {
             chip.tick(16);
         }
         assert_eq!(chip.volume, 20); // frozen while halted
-                                     // Re-enable: the envelope resumes ramping.
+        // Re-enable: the envelope resumes ramping.
         chip.write(0x4023, 0x82);
         chip.tick(16);
         assert_eq!(chip.volume, 19);
@@ -4824,7 +4816,7 @@ mod tests {
         chip.wave_pos = 0;
         chip.write(0x4089, 0x00); // master volume full, write-protect RAM
         chip.write(0x4023, 0x00); // halt
-                                  // Direct volume write (M=1) sets the gain immediately.
+        // Direct volume write (M=1) sets the gain immediately.
         chip.write(0x4080, 0x80 | 0x20); // gain 32
         let loud = chip.output();
         chip.write(0x4080, 0x80 | 0x08); // gain 8
@@ -5165,7 +5157,7 @@ mod tests {
     fn fds_4096_reads_current_wavetable_sample() {
         let mut chip = Fds::new();
         chip.write(0x4089, 0x80); // arm wave-RAM write
-                                  // Fill a recognisable pattern at position 0 + position 7.
+        // Fill a recognisable pattern at position 0 + position 7.
         chip.write(0x4040, 0x2A);
         chip.write(0x4047, 0x15);
         chip.wave_pos = 0;
@@ -5219,7 +5211,7 @@ mod tests {
         let mut x = Expansion::new();
         x.set_flags(ExpansionChips(0)); // no chips enabled
         assert_eq!(x.read(0x4090), 0xFF); // open bus when FDS off
-                                          // Enable FDS and prime a volume gain readback.
+        // Enable FDS and prime a volume gain readback.
         x.set_flags(ExpansionChips(0x04)); // FDS flag bit
         x.fds.volume = 0x12;
         assert_eq!(x.read(0x4090), 0x40 | 0x12);
@@ -5322,7 +5314,7 @@ mod tests {
         let phase_low = chip.ram[0x40 + 7 * 8 + 1]; // ch8 phase low @ $79
         assert_eq!(phase_low, 0);
         chip.tick(1); // total 15 — one tick triggers
-                      // After one update: phase = (0 + 0x100) mod (4<<16) = 0x100.
+        // After one update: phase = (0 + 0x100) mod (4<<16) = 0x100.
         let p_lo = chip.ram[0x79];
         let p_mid = chip.ram[0x7B];
         let p_hi = chip.ram[0x7D];
@@ -5361,8 +5353,8 @@ mod tests {
         n163_write_channel8(&mut chip, 0x10000, 0, 63, 0, 0x01, 0);
         chip.ram[0x00] = 0xA9; // low nibble = 9, high nibble = A
         chip.ram[0x01] = 0xC8; // low nibble = 8, high nibble = C
-                               // First tick brings phase to 0x10000 → high byte = 1 → sample
-                               // index 1 → high nibble of $00 = 0xA = 10 → (10 - 8) * 1 = +2.
+        // First tick brings phase to 0x10000 → high byte = 1 → sample
+        // index 1 → high nibble of $00 = 0xA = 10 → (10 - 8) * 1 = +2.
         chip.tick(15);
         let out_after_first = chip.output();
         // Expected: signed=2, volume=1, normalised by /128 = 2/128.
@@ -5396,7 +5388,7 @@ mod tests {
         chip.write(0x4800, 0x00); // $75 high phase
         chip.write(0x4800, 0x00); // $76 wave address
         chip.write(0x4800, 0x00); // $77 volume (channel-7 volume)
-                                  // Channel 8: freq=0x222, two enabled channels (C=1).
+        // Channel 8: freq=0x222, two enabled channels (C=1).
         n163_write_channel8(&mut chip, 0x222, 0, 63, 0, 0x0F, 1);
         assert_eq!(chip.channels_active, 2);
         // First tick: slot 0 = channel 7 should advance.
@@ -5870,8 +5862,8 @@ mod tests {
         vrc7_write_reg(&mut chip, 0x30, 0x00);
         vrc7_write_reg(&mut chip, 0x10, 0x00); // fnum low = 0x00
         vrc7_write_reg(&mut chip, 0x20, 0x19); // key-on, block 4, fnum-high bit = 1 → fnum = 0x100
-                                               // Accumulate a baseline peak across many ticks so we don't
-                                               // catch a zero-crossing latched value.
+        // Accumulate a baseline peak across many ticks so we don't
+        // catch a zero-crossing latched value.
         let mut baseline_peak: i32 = 0;
         for _ in 0..500 {
             chip.tick(50);
@@ -6082,8 +6074,8 @@ mod tests {
         // (fnum_msb=1, fnum_low=0).
         vrc7_write_reg(&mut chip, 0x30, 0x40); // patch=4, vol=0
         vrc7_write_reg(&mut chip, 0x10, 0x00); // fnum low = 0
-                                               // $20 layout: ---STBBB H. Want key-on, block=2 (BBB=010),
-                                               // fnum-high=1 (H=1) → 0b0001_0101 = 0x15.
+        // $20 layout: ---STBBB H. Want key-on, block=2 (BBB=010),
+        // fnum-high=1 (H=1) → 0b0001_0101 = 0x15.
         vrc7_write_reg(&mut chip, 0x20, 0x15);
         let pre_mod_rks = chip.opll_channels[0].modulator.env.rks;
         let pre_car_rks = chip.opll_channels[0].carrier.env.rks;
@@ -6325,7 +6317,7 @@ mod tests {
     fn expansion_aggregate_state_is_invariant_to_batch_chunking() {
         let setup = |exp: &mut Expansion| {
             exp.set_flags(ExpansionChips(0x3F)); // all six chips
-                                                 // VRC6: pulse 1 + saw.
+            // VRC6: pulse 1 + saw.
             exp.write(0x9000, 0x0F);
             exp.write(0x9001, 0x37);
             exp.write(0x9002, 0x80);

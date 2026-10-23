@@ -109,9 +109,9 @@ fn program_pure_carrier(chip: &mut Vrc7, fnum: u16, block: u8, mul: u8) {
     write_reg(chip, 0x04, 0xF0); // mod AR=F (instant), DR=0
     write_reg(chip, 0x05, 0xF0); // car AR=F (instant), DR=0
     write_reg(chip, 0x06, 0x00); // mod SL=0, RR=0
-                                 // car SL=0, RR=F (fast release): the EGT-sustained carrier holds at
-                                 // full level until key-off, then this release rate quiets it within
-                                 // the rendered window.
+    // car SL=0, RR=F (fast release): the EGT-sustained carrier holds at
+    // full level until key-off, then this release rate quiets it within
+    // the rendered window.
     write_reg(chip, 0x07, 0x0F);
 
     // Channel 0: select patch 0 (custom), volume 0 (loudest). The

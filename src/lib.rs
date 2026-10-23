@@ -27,17 +27,17 @@ pub use apu::Apu2A03;
 pub use bus::NesBus;
 pub use cpu::Cpu6502;
 pub use header::{
-    parse_nsf, ExpansionChips, Nsf2Features, NsfDrvId, NsfDrvTag, NsfError, NsfHeader, NsfRegion,
-    NsfTrackInfo,
+    ExpansionChips, Nsf2Features, NsfDrvId, NsfDrvTag, NsfError, NsfHeader, NsfRegion,
+    NsfTrackInfo, parse_nsf,
 };
 pub use nsfe::{
     NsfeAuth, NsfeMetaError, NsfeMetadata, NsfeMixerEntry, NsfeRate, NsfeRegions, NsfeVrc7,
 };
 pub use player::NsfPlayer;
-pub use writer::{write_metadata_chunks, NsfWriteError};
+pub use writer::{NsfWriteError, write_metadata_chunks};
 
 #[cfg(feature = "registry")]
-pub use registry::{register_codecs, register_containers, CODEC_ID_STR};
+pub use registry::{CODEC_ID_STR, register_codecs, register_containers};
 
 /// Output sample rate that [`NsfPlayer::render`] resamples to.
 pub const OUTPUT_SAMPLE_RATE: u32 = 44_100;

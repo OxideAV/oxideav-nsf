@@ -2772,10 +2772,10 @@ mod tests {
         // Pick a non-zero base value and verify the four KSL shifts
         // line up with `(base) >> (3 - ksl)`.
         let synthetic_base: u32 = 48; // arbitrary positive base.
-                                      // KSL=0 → zero (per carve-out).
-                                      // KSL=1 → base >> 2.
-                                      // KSL=2 → base >> 1.
-                                      // KSL=3 → base >> 0 (passes through).
+        // KSL=0 → zero (per carve-out).
+        // KSL=1 → base >> 2.
+        // KSL=2 → base >> 1.
+        // KSL=3 → base >> 0 (passes through).
         assert_eq!(0, 0); // ksl=0 carve-out covered elsewhere
         assert_eq!(synthetic_base >> 2, 12); // ksl=1
         assert_eq!(synthetic_base >> 1, 24); // ksl=2
@@ -5023,7 +5023,7 @@ mod tests {
         ch.modulator.mul = 1;
         ch.modulator.tl = 63;
         ch.modulator.env.load_from_patch(15, 0, 0, 15, true); // instant attack, hold
-                                                              // Carrier: fast attack, sustained tone, AM/VIB per request.
+        // Carrier: fast attack, sustained tone, AM/VIB per request.
         ch.carrier.mul = 1;
         ch.carrier.am = am;
         ch.carrier.vib = vib;

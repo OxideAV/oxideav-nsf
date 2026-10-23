@@ -18,7 +18,7 @@
 //! the output buffer holds.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_nsf::{parse_nsf, NsfPlayer};
+use oxideav_nsf::{NsfPlayer, parse_nsf};
 
 fuzz_target!(|data: &[u8]| {
     let header = match parse_nsf(data) {

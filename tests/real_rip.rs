@@ -23,7 +23,7 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
-use oxideav_nsf::{parse_nsf, NsfPlayer, OUTPUT_SAMPLE_RATE};
+use oxideav_nsf::{NsfPlayer, OUTPUT_SAMPLE_RATE, parse_nsf};
 
 const FIXTURE_NAME: &str = "chibi-tech_-_miko_miko_nurse.nsf";
 const FIXTURE_URL: &str = "https://samples.oxideav.org/audio/nsf/chibi-tech_-_miko_miko_nurse.nsf";
@@ -216,7 +216,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         padded.push(0);
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
-    for block in padded.chunks_exact(64) {
+    for block in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([

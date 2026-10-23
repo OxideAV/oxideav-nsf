@@ -242,20 +242,12 @@ struct ScheduledDmcDma {
 
 /// First get (even) cycle at or after `c`.
 fn first_get(c: u64) -> u64 {
-    if c & 1 == 0 {
-        c
-    } else {
-        c + 1
-    }
+    if c & 1 == 0 { c } else { c + 1 }
 }
 
 /// First put (odd) cycle at or after `c`.
 fn first_put(c: u64) -> u64 {
-    if c & 1 == 1 {
-        c
-    } else {
-        c + 1
-    }
+    if c & 1 == 1 { c } else { c + 1 }
 }
 
 /// Whether cycle `offset` of an instruction with write-cycle bitmask
@@ -767,11 +759,11 @@ impl NesBus {
             0x5FF8..=0x5FFF => {
                 let window = (addr - 0x5FF8) as usize;
                 self.bank_select[window] = value;
-                if self.fds_enabled {
-                    if let Some(bank) = self.bank_pool.get(value as usize) {
-                        let dst = window * BANK_SIZE;
-                        self.fds_ram[dst..dst + BANK_SIZE].copy_from_slice(bank);
-                    }
+                if self.fds_enabled
+                    && let Some(bank) = self.bank_pool.get(value as usize)
+                {
+                    let dst = window * BANK_SIZE;
+                    self.fds_ram[dst..dst + BANK_SIZE].copy_from_slice(bank);
                 }
             }
             0x4018..=0x5FF7 => self.apu.write_expansion(addr, value),
@@ -867,10 +859,10 @@ impl NesBus {
                 }
             }
             // A $4014 write schedules the OAM halt for the next cycle.
-            if let Some(to) = oam_trigger {
-                if to == o {
-                    self.oam_halt_from = Some(self.cycles + 1);
-                }
+            if let Some(to) = oam_trigger
+                && to == o
+            {
+                self.oam_halt_from = Some(self.cycles + 1);
             }
             // Service any DMC DMA due before this CPU cycle executes:
             // the stall inserts ahead of the halted read, which the
@@ -879,14 +871,15 @@ impl NesBus {
             self.service_dmc_dma(read_cycle);
             // OAM DMA halts on the first read cycle at/after its
             // schedule point.
-            if let Some(hf) = self.oam_halt_from {
-                if read_cycle && self.cycles >= hf {
-                    self.oam_halt_from = None;
-                    self.run_oam_window();
-                    // The window may have left a DMC DMA scheduled
-                    // right past its end.
-                    self.service_dmc_dma(read_cycle);
-                }
+            if let Some(hf) = self.oam_halt_from
+                && read_cycle
+                && self.cycles >= hf
+            {
+                self.oam_halt_from = None;
+                self.run_oam_window();
+                // The window may have left a DMC DMA scheduled
+                // right past its end.
+                self.service_dmc_dma(read_cycle);
             }
             self.tick_machine(1);
             o += 1;

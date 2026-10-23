@@ -291,20 +291,24 @@ fn split_null_strings(body: &[u8]) -> Vec<String> {
 }
 
 fn parse_i32_array(body: &[u8]) -> Vec<i32> {
-    body.chunks_exact(4)
+    body.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
 
 fn parse_mixer(body: &[u8], tag: [u8; 4]) -> Result<Vec<NsfeMixerEntry>, NsfeMetaError> {
-    if body.len() % 3 != 0 {
+    if !body.len().is_multiple_of(3) {
         return Err(NsfeMetaError::BadChunkPayload {
             tag,
             len: body.len(),
         });
     }
     Ok(body
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| NsfeMixerEntry {
             device: c[0],
             millibel: i16::from_le_bytes([c[1], c[2]]),

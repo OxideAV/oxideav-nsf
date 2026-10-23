@@ -29,7 +29,7 @@
 //! minimisation; this test pins a fixed battery so a regression that
 //! reintroduces a panic path is caught in plain `cargo test`.
 
-use oxideav_nsf::{parse_nsf, NsfPlayer};
+use oxideav_nsf::{NsfPlayer, parse_nsf};
 
 // ----- deterministic byte generator ----------------------------------
 

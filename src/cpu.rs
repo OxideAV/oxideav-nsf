@@ -2091,8 +2091,8 @@ mod tests {
         cpu.pc = 0x8000;
         cpu.sp = 0xFD;
         cpu.p = FLAG_U; // I=0
-                        // Arm the NSF2 timer with a tiny period so an IRQ is pending
-                        // by the time we step.
+        // Arm the NSF2 timer with a tiny period so an IRQ is pending
+        // by the time we step.
         bus.write(0x401B, 1);
         bus.write(0x401C, 0);
         bus.write(0x401D, 1);

@@ -8,7 +8,7 @@
 
 use oxideav_nsf::header::NSF_HEADER_LEN;
 use oxideav_nsf::nsfe::{NsfeAuth, NsfeMixerEntry, NsfeRate, NsfeRegions, NsfeVrc7};
-use oxideav_nsf::{parse_nsf, NsfRegion, NsfWriteError};
+use oxideav_nsf::{NsfRegion, NsfWriteError, parse_nsf};
 
 /// Emit one `[u32 len][fourcc][body]` chunk.
 fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {

@@ -296,11 +296,7 @@ impl NsfHeader {
                     .as_ref()
                     .and_then(|r| r.dendy_us)
                     .unwrap_or(0);
-                if dendy != 0 {
-                    dendy
-                } else {
-                    self.pal_speed_us
-                }
+                if dendy != 0 { dendy } else { self.pal_speed_us }
             }
             NsfRegion::Ntsc | NsfRegion::Dual => self.ntsc_speed_us,
         }

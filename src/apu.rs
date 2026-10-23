@@ -307,11 +307,7 @@ impl PulseChannel {
             return 0;
         }
         let step = DUTY_TABLE[self.duty as usize][self.duty_step as usize];
-        if step == 0 {
-            0
-        } else {
-            self.envelope.output()
-        }
+        if step == 0 { 0 } else { self.envelope.output() }
     }
 }
 
@@ -1569,7 +1565,7 @@ mod tests {
         apu.write_register(0x4000, 0xBF); // duty 50%, halt, constant vol 15
         apu.write_register(0x4002, 0x10); // period lo
         apu.write_register(0x4003, 0x00); // period hi (timer = 0x010 = 16)
-                                          // Spin a few thousand CPU cycles; the duty step should rotate.
+        // Spin a few thousand CPU cycles; the duty step should rotate.
         for _ in 0..1000 {
             apu.tick_cpu_cycles(8);
         }
@@ -1741,7 +1737,7 @@ mod tests {
         apu.write_register(0x400C, 0x30); // halt + constant vol 0
         apu.write_register(0x400E, 0x00); // shortest period
         apu.write_register(0x400F, 0x08); // start
-                                          // Tick enough cycles to flip the LFSR.
+        // Tick enough cycles to flip the LFSR.
         for _ in 0..64 {
             apu.tick_cpu_cycles(8);
         }
@@ -1972,7 +1968,7 @@ mod tests {
         apu.write_register(0x4012, 0x00); // address = $C000
         apu.write_register(0x4013, 0x01); // length = 17 bytes
         apu.write_status(0x10); // enable DMC
-                                // Tick a few cycles; the channel should request a fetch.
+        // Tick a few cycles; the channel should request a fetch.
         for _ in 0..4 {
             apu.tick_cpu_cycles(1);
         }

@@ -19,7 +19,7 @@
 
 use core::fmt;
 
-use crate::header::{NsfHeader, NsfRegion, NSFE_MAGIC, NSF_HEADER_LEN, NSF_MAGIC};
+use crate::header::{NSF_HEADER_LEN, NSF_MAGIC, NSFE_MAGIC, NsfHeader, NsfRegion};
 use crate::nsfe::{NsfeAuth, NsfeMetadata, NsfeRate, NsfeRegions};
 
 /// Failures from the container writers.

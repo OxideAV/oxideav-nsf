@@ -16,7 +16,7 @@
 //!   re-parse + byte-idempotence guarantees.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_nsf::{parse_nsf, NsfWriteError};
+use oxideav_nsf::{NsfWriteError, parse_nsf};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(header) = parse_nsf(data) else {

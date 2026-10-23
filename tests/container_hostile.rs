@@ -10,7 +10,7 @@
 
 use oxideav_nsf::header::NSF_HEADER_LEN;
 use oxideav_nsf::nsfe::NsfeMetaError;
-use oxideav_nsf::{parse_nsf, NsfError, NsfWriteError};
+use oxideav_nsf::{NsfError, NsfWriteError, parse_nsf};
 
 fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -40,7 +40,7 @@ fn truncated_chunk_header_at_every_length_is_rejected() {
     // length + fourcc chunk header.
     for extra in 1..8usize {
         let mut out = b"NSFE".to_vec();
-        out.extend(std::iter::repeat(0xAAu8).take(extra));
+        out.extend(std::iter::repeat_n(0xAAu8, extra));
         assert_eq!(
             parse_nsf(&out).unwrap_err(),
             NsfError::NsfeTruncatedChunk,

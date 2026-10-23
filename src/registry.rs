@@ -9,9 +9,9 @@ use oxideav_core::{
     ReadSeek, Result, SampleFormat, StreamInfo, TimeBase,
 };
 
-use crate::header::{parse_nsf, NsfHeader};
-use crate::player::NsfPlayer;
 use crate::OUTPUT_SAMPLE_RATE;
+use crate::header::{NsfHeader, parse_nsf};
+use crate::player::NsfPlayer;
 
 /// Codec id string used for both the container codec parameters and
 /// the registered decoder. Mirrors the `s3m` / `mod` convention.
@@ -42,11 +42,7 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 fn probe(p: &ProbeData) -> u8 {
     let v1 = p.buf.len() >= 5 && &p.buf[..5] == b"NESM\x1a";
     let nsfe = p.buf.len() >= 4 && &p.buf[..4] == b"NSFE";
-    if v1 || nsfe {
-        100
-    } else {
-        0
-    }
+    if v1 || nsfe { 100 } else { 0 }
 }
 
 fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {

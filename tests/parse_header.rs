@@ -6,7 +6,7 @@
 //! at 1.789 MHz for ~93 ms of wall-clock time should yield non-trivial
 //! audio output.
 
-use oxideav_nsf::{parse_nsf, Nsf2Features, NsfPlayer, NsfRegion};
+use oxideav_nsf::{Nsf2Features, NsfPlayer, NsfRegion, parse_nsf};
 use oxideav_nsf::{NsfeAuth, NsfeMixerEntry};
 
 /// Manually-assembled NSF with all the documented header fields set so
