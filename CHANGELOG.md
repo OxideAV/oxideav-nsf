@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.5...v0.0.6) - 2026-11-07
+
+### Other
+
+- register(ctx) entry point + register! hook so oxideav-meta can dispatch it ([#8](https://github.com/OxideAV/oxideav-nsf/pull/8))
+- API hygiene: non_exhaustive header/metadata records and error enums, hide sound-chip internals
+- edition 2024, MSRV 1.95
+- ureq without default features — drop the flate2/miniz_oxide gzip layer
+
 ### Added
 
 - `register(ctx)` unified entry point plus `oxideav_core::register!("nsf", …)`,
