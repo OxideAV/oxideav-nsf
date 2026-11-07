@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `register(ctx)` unified entry point plus `oxideav_core::register!("nsf", …)`,
+  so `oxideav-meta` (and through it the `oxideav` CLI and `oxideplay`) can
+  pick up NSF / NSFe playback (#8).
+
 ### Changed
 
 - `#[non_exhaustive]` on the enums `NsfRegion`, `NsfDrvId`, `NsfError`,

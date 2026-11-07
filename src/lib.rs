@@ -41,5 +41,19 @@ pub use writer::{NsfWriteError, write_metadata_chunks};
 #[cfg(feature = "registry")]
 pub use registry::{CODEC_ID_STR, register_codecs, register_containers};
 
+/// Unified entry point: install the NSF demuxer and decoder into a
+/// [`oxideav_core::RuntimeContext`].
+///
+/// Also wired into `oxideav_meta::register_all` via the
+/// [`oxideav_core::register!`] macro below.
+#[cfg(feature = "registry")]
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
+}
+
+#[cfg(feature = "registry")]
+oxideav_core::register!("nsf", register);
+
 /// Output sample rate that [`NsfPlayer::render`] resamples to.
 pub const OUTPUT_SAMPLE_RATE: u32 = 44_100;
