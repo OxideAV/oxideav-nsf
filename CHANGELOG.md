@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `#[non_exhaustive]` on the enums `NsfRegion`, `NsfDrvId`, `NsfError`,
+  `NsfeMetaError` and `NsfWriteError`, and on the records `NsfHeader`,
+  `NsfTrackInfo`, `NsfDrvTag` and `NsfeMetadata`. The fixed-layout NSFe
+  chunk records (`NsfeAuth`, `NsfeRate`, `NsfeRegions`, `NsfeVrc7`,
+  `NsfeMixerEntry`) stay exhaustive.
+- `#[doc(hidden)]` on the internal `expansion` and `opll` sound-chip
+  modules.
+
+### Changed
+
 - edition 2024, MSRV 1.95
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-nsf/compare/v0.0.4...v0.0.5) - 2026-08-18

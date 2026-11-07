@@ -13,9 +13,11 @@
 pub mod apu;
 pub mod bus;
 pub mod cpu;
+#[doc(hidden)]
 pub mod expansion;
 pub mod header;
 pub mod nsfe;
+#[doc(hidden)]
 pub mod opll;
 pub mod player;
 pub mod writer;

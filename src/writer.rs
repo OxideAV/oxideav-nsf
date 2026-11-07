@@ -24,6 +24,7 @@ use crate::nsfe::{NsfeAuth, NsfeMetadata, NsfeRate, NsfeRegions};
 
 /// Failures from the container writers.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NsfWriteError {
     /// `total_songs` is zero — both container shapes require at least
     /// one song.

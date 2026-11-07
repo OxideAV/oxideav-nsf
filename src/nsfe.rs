@@ -111,6 +111,7 @@ pub struct NsfeVrc7 {
 /// Aggregated extended-metadata chunks. Every field defaults to "not
 /// present"; callers check `is_some` / `is_empty` / per-field defaults.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NsfeMetadata {
     pub auth: Option<NsfeAuth>,
     pub track_labels: Vec<String>,
@@ -147,6 +148,7 @@ impl NsfeMetadata {
 
 /// Errors specific to the extended-chunk parser.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NsfeMetaError {
     TruncatedChunk,
     ChunkOverflow,

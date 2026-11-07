@@ -48,6 +48,7 @@ pub const NSF_HEADER_LEN: usize = 0x80;
 /// Dendy is exclusively surfaced through the `regn` extended chunk per
 /// `docs/audio/nsf/nsfe-nesdev-wiki.html` §regn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NsfRegion {
     Ntsc,
     Pal,
@@ -159,6 +160,7 @@ impl Nsf2Features {
 /// rather than ripped from a ROM, and bug reports can pin the driver
 /// version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NsfDrvTag {
     /// 6-byte ASCII sound-driver ID (program bytes 0..=5, file
     /// `$0080-$0085`).
@@ -173,6 +175,7 @@ pub struct NsfDrvTag {
 /// §"List of NSFDRV sound driver IDs". Variants are named after the
 /// 6-byte ASCII tag itself, not after any product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NsfDrvId {
     /// `"OFGS  "` — binary `$4F $46 $47 $53 $20 $20`.
     Ofgs,
@@ -229,6 +232,7 @@ impl NsfDrvTag {
 
 /// Parsed NSF header + the raw program data tail.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NsfHeader {
     pub version: u8,
     pub total_songs: u8,
@@ -408,6 +412,7 @@ impl NsfHeader {
 /// — the aggregation of the NSFe `tlbl` / `taut` / `time` / `fade`
 /// per-track chunks for one track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NsfTrackInfo<'a> {
     /// 0-based track index (the base used by NSFe `INFO`/`plst`).
     pub index: u8,
@@ -428,6 +433,7 @@ pub struct NsfTrackInfo<'a> {
 
 /// Failures from the on-disk header parser.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NsfError {
     TooShort {
         needed: usize,
